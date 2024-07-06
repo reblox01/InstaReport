@@ -28,8 +28,8 @@ This script automates the process of reporting a user on Instagram for violating
 Clone this repository to your local machine:
 
 ```bash
-git clone https://github.com/reblox01/instagram-report-tool.git
-cd instagram-report-tool
+git clone https://github.com/reblox01/InstaReport.git
+cd InstaReport
 ```
 
 ### Step 2: Install Dependencies
