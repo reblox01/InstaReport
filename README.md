@@ -83,7 +83,7 @@ This project is licensed under the [MIT License](LICENSE).
 
 If you find this project helpful and would like to support its development, you can buy me a coffee:
 
-[![Buy Me a Coffee](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/arosck1)
+[![Buy Me a Coffee](https://www.buymeacoffee.com/assets/img/custom_images/purple_img.png)](https://www.buymeacoffee.com/arosck1)
 
 ## Acknowledgements
 
