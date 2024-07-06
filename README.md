@@ -79,13 +79,15 @@ Contributions are welcome! Feel free to open an issue or submit a pull request.
 
 This project is licensed under the [MIT License](LICENSE).
 
----
-
 ## Support
 
 If you find this project helpful and would like to support its development, you can buy me a coffee:
 
 [![Buy Me a Coffee](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/arosck1)
+
+## Acknowledgements
+
+Thank you to everyone who has supported and contributed to this project. Your feedback and assistance are invaluable.
 
 ---
 
