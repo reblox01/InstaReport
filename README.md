@@ -83,7 +83,7 @@ This project is licensed under the [MIT License](LICENSE).
 
 If you find this project helpful and would like to support its development, you can buy me a coffee:
 
-[![Buy Me a Coffee](https://www.buymeacoffee.com/assets/img/custom_images/purple_img.png)](https://www.buymeacoffee.com/arosck1)
+<a href="https://www.buymeacoffee.com/arosck1"><img src="https://img.buymeacoffee.com/button-api/?text=Buy me a coffee&emoji=☕&slug=arosck1&button_colour=BD5FFF&font_colour=ffffff&font_family=Cookie&outline_colour=000000&coffee_colour=FFDD00" /></a>
 
 ## Acknowledgements
 
