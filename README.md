@@ -6,89 +6,88 @@ This script automates the process of reporting a user on Instagram for violating
 
 ## Features
 
-- **Automation:** Automatically logs in to your Instagram account and reports a specified user multiple times.
-- **Customization:** Allows you to specify your Instagram credentials, the user ID of the account to report, and the number of reports to file.
-- **Ease of Use:** Simple setup with clear step-by-step instructions.
-- **Flexibility:** Supports running the script via different methods (`python igban.py`, `python -m igban`, or inline script execution).
-- **Educational Purpose:** Designed for learning about web scraping and API interaction with Instagram.
-- **Contributions:** Open to contributions and improvements from the community.
-- **License:** Released under the MIT License for open usage and modification.
-
+- **Automation:** Automatically reports a specified user multiple times.
+- **Login Methods:**
+  - **Username/Password:** Standard login (may trigger checkpoints/2FA).
+  - **Session ID:** Bypass login checkpoints by using your browser's session cookie (Recommended).
+- **Username Resolution:** Accepts either a username or numeric user ID — usernames are resolved automatically.
+- **Secure:** Supports environment variables or interactive prompts — no hardcoded credentials.
+- **Smart:** Uses random delays to avoid rate limiting.
 
 ## Prerequisites
 
-1. A valid Instagram account with the necessary permissions to report other users.
-2. Python installed on your system.
-3. `requests` library for Python installed (`pip install requests`).
+1. A valid Instagram account.
+2. Python 3.7+ installed.
+3. Dependencies installed (`pip install -r requirements.txt`).
 
-## Setup Instructions
+## Setup
 
-### Step 1: Clone the Repository
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/reblox01/InstaReport.git
+   cd InstaReport
+   ```
 
-Clone this repository to your local machine:
+2. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-```bash
-git clone https://github.com/reblox01/InstaReport.git
-cd InstaReport
-```
+## Usage
 
-### Step 2: Install Dependencies
-
-Install the required Python libraries:
-
-```bash
-pip install requests
-```
-
-### Step 3: Configure the Script
-
-Open the `igban.py` script in a text editor and modify the following variables with your information:
-
-- `your_username` and `your_password`: Your Instagram login credentials.
-- `user_id_to_report`: The Instagram user ID of the user you want to report.
-  - You can find the user ID by examining the URL of the user's profile page. For example, in the URL `https://www.instagram.com/username/`, the `user ID` is the number after `/p/`.
-- `num_reports`: The number of times you want to report the user.
-
-### Step 4: Run the Script
-
-Execute the script using one of the following methods:
+Run the script:
 
 ```bash
 python igban.py
 ```
+
+### Login Options
+
+The script will ask you to choose a login method:
+
+1. **Username / Password:** Enter your credentials. If you have 2FA enabled or get a "checkpoint required" error, use option 2.
+2. **Session ID (Recommended):** Use this if standard login fails.
+   - Open Instagram.com in your browser and log in.
+   - Press **F12** to open Developer Tools.
+   - Go to **Application** (Chrome) or **Storage** (Firefox) > **Cookies**.
+   - Find the cookie named `sessionid` and copy its value.
+   - Paste it into the script when prompted.
+
+### Environment Variables (Optional)
+
+You can skip prompts by setting variables:
+
 ```bash
-python -m igban
-```
-```bash
-python -c "import igban; igban.main()"
+# Linux / macOS
+export IG_USERNAME="your_user"
+export IG_PASSWORD="your_pass"
+# OR for session ID:
+export IG_SESSIONID="your_session_id_cookie"
+
+python igban.py
 ```
 
-## Usage
+## Report Reasons
 
-Upon execution, the script will log in to your Instagram account and report the specified user the number of times indicated.
+| # | Reason |
+|---|--------|
+| 1 | Spam |
+| 2 | Inappropriate content |
+| 3 | Violence or harm |
+| 4 | Impersonation |
+| 5 | Bullying |
+| 6 | False info |
+| 7 | Harmful orgs |
+| 8 | Illegal activity |
+| 9 | Private info |
+| 10 | Copyright |
+| 11 | Trademark |
+| 12 | Other |
 
 ## Disclaimer
 
-This tool is intended for educational purposes only. Misuse of this tool to harass or harm others is strictly prohibited. Always ensure your actions comply with Instagram's community guidelines and terms of service.
-
-## Contributing
-
-Contributions are welcome! Feel free to open an issue or submit a pull request.
+This tool is for educational purposes only. Misuse to harass or harm others is strictly prohibited. Use responsibly.
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
-
-## Support
-
-If you find this project helpful and would like to support its development, you can buy me a coffee:
-
-<a href="https://www.buymeacoffee.com/arosck1"><img src="https://img.buymeacoffee.com/button-api/?text=Buy me a coffee&emoji=☕&slug=arosck1&button_colour=BD5FFF&font_colour=ffffff&font_family=Cookie&outline_colour=000000&coffee_colour=FFDD00" /></a>
-
-## Acknowledgements
-
-Thank you to everyone who has supported and contributed to this project. Your feedback and assistance are invaluable.
-
----
-
-**Note:** Ensure you are fully aware of Instagram's community guidelines and terms of service before using this tool. Misuse may result in your account being suspended or banned.
+MIT License.
