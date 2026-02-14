@@ -232,9 +232,21 @@ REPORT_REASONS = {
 
 
 def main():
-    print("=" * 50)
+    print(r"""
+  _____           _        _____                       _ 
+ |_   _|         | |      |  __ \                     | |
+   | |  _ __  ___| |_ __ _| |__) |___ _ __   ___  _ __| |_ 
+   | | | '_ \/ __| __/ _` |  _  // _ \ '_ \ / _ \| '__| __|
+  _| |_| | | \__ \ || (_| | | \ \  __/ |_) | (_) | |  | |_ 
+ |_____|_| |_|___/\__\__,_|_|  \_\___| .__/ \___/|_|   \__|
+                                     | |                   
+                                     |_|                   
+    """)
     print("  InstaReport — Instagram Report Tool")
-    print("=" * 50)
+    print("  Made by: 0x8D")
+    print("  Repo: https://github.com/reblox01/InstaReport")
+    print("  Version: 1.7")
+    print("=" * 60)
     print()
 
     # --- Mode Selection ---
