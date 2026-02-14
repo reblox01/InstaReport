@@ -67,6 +67,17 @@ export IG_SESSIONID="your_session_id_cookie"
 python igban.py
 ```
 
+### Need a User ID?
+
+The script (`igban.py`) will automatically try to resolve usernames to IDs for you.
+
+If you want to manually get an ID, use the included helper script:
+
+```bash
+python get_id.py
+```
+This script will ask for a username and give you their numeric User ID.
+
 ## Report Reasons
 
 | # | Reason |
