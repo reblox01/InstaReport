@@ -1,5 +1,5 @@
 import requests
-import time
+import re
 import sys
 import os
 
@@ -10,9 +10,10 @@ WEB_USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# Instagram Web App ID (publicly visible in source code)
+# Instagram Web App ID
 IG_APP_ID = "936619743392459"
 IG_ASBD_ID = "198387"
+
 
 def get_web_headers(csrf_token=""):
     """Return standard headers for Instagram Web API requests."""
@@ -27,56 +28,47 @@ def get_web_headers(csrf_token=""):
         "Origin": "https://www.instagram.com",
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
     }
 
 
 def get_csrf_token(session):
-    """Fetch a CSRF token from Instagram by visiting the web page."""
+    """Fetch a CSRF token from Instagram."""
     headers = {
         "User-Agent": WEB_USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
     }
     try:
-        response = session.get("https://www.instagram.com/", headers=headers)
+        response = session.get("https://www.instagram.com/", headers=headers, timeout=10)
         csrf_token = session.cookies.get("csrftoken")
         if csrf_token:
             return csrf_token
-        # Try extracting from response headers
-        if "csrftoken" in response.headers.get("Set-Cookie", ""):
-            for cookie in response.cookies:
-                if cookie.name == "csrftoken":
-                    return cookie.value
     except requests.RequestException as e:
         print(f"[!] Failed to fetch CSRF token: {e}")
     return None
 
-def get_user_id_from_username(session, username):
-    """Resolve an Instagram username to a numeric user ID."""
-    print(f"[*] Resolving '{username}'...")
+
+def resolve_with_session(session, username):
+    """Resolve username to ID using an authenticated session."""
     csrf_token = session.cookies.get("csrftoken", "")
     headers = get_web_headers(csrf_token)
     headers["Referer"] = f"https://www.instagram.com/{username}/"
 
-    # Approach 1: Web profile info endpoint
+    # Method 1: web_profile_info API
     url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
     try:
-        response = session.get(url, headers=headers)
+        response = session.get(url, headers=headers, timeout=10)
         if response.status_code == 200:
             data = response.json()
             user_id = data.get("data", {}).get("user", {}).get("id")
             if user_id:
-                return user_id, "Web Profile Info"
+                return user_id, "Web Profile Info API"
     except (requests.RequestException, ValueError, KeyError):
         pass
 
-    # Approach 2: Profile page with ?__a=1&__d=dis
+    # Method 2: ?__a=1&__d=dis
     try:
         url2 = f"https://www.instagram.com/{username}/?__a=1&__d=dis"
-        headers["Accept"] = "*/*"
-        response = session.get(url2, headers=headers)
+        response = session.get(url2, headers=headers, timeout=10)
         if response.status_code == 200:
             data = response.json()
             user = data.get("graphql", {}).get("user", {})
@@ -88,60 +80,54 @@ def get_user_id_from_username(session, username):
     except (requests.RequestException, ValueError, KeyError):
         pass
 
-    # Approach 3: Embed Page (Low reliability, but sometimes works)
+    return None, None
+
+
+def resolve_anonymous(username):
+    """Resolve username to ID without a session, using HTML scraping."""
+    headers = {
+        "User-Agent": WEB_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    # Method 1: Profile page HTML scraping
     try:
-        url3 = f"https://www.instagram.com/{username}/embed/captioned/"
-        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9"
-        response = session.get(url3, headers=headers)
+        url = f"https://www.instagram.com/{username}/"
+        response = requests.get(url, headers=headers, timeout=10)
         if response.status_code == 200:
-            import re
-            match = re.search(r'"id":"(\d+)"', response.text)
+            text = response.text
+
+            match = re.search(r'"user_id":"(\d+)"', text)
             if match:
-                return match.group(1), "Embed Page Scrape"
-            match_owner = re.search(r'"owner_id":"(\d+)"', response.text)
-            if match_owner:
-                return match_owner.group(1), "Embed Page Owner ID"
-    except (requests.RequestException, ValueError, KeyError):
+                return match.group(1), "Profile HTML (user_id)"
+
+            match = re.search(r'profilePage_(\d+)', text)
+            if match:
+                return match.group(1), "Profile HTML (profilePage)"
+
+            ids = re.findall(r'"id":"(\d+)"', text)
+            for i in ids:
+                if len(i) > 5:
+                    return i, "Profile HTML (generic ID)"
+    except requests.RequestException:
         pass
 
-    # Approach 4: Main Profile Page HTML Scrape (Fallback)
+    # Method 2: Embed page
     try:
-        url4 = f"https://www.instagram.com/{username}/"
-        # Use a short timeout to fail fast if it hangs
-        response = session.get(url4, headers=headers, timeout=10)
+        url2 = f"https://www.instagram.com/{username}/embed/captioned/"
+        response = requests.get(url2, headers=headers, timeout=10)
         if response.status_code == 200:
-            import re
-            text = response.text
-            
-            # Pattern A: "user_id":"12345" (often in sharedData)
-            match_uid = re.search(r'"user_id":"(\d+)"', text)
-            if match_uid:
-                return match_uid.group(1), "Profile HTML (user_id)"
-
-            # Pattern B: profilePage_12345 (rare but possible in old scripts)
-            match_pp = re.search(r'profilePage_(\d+)', text)
-            if match_pp:
-                return match_pp.group(1), "Profile HTML (profilePage)"
-            
-            # Pattern C: "id":"12345" inside a user-like object
-            # e.g. {"username":"aroscki",...,"id":"12345"}
-            # We look for the username followed by "id"
-            try:
-                # Find all "id":"digits"
-                ids = re.findall(r'"id":"(\d+)"', text)
-                # If we found any, the first one is often the profile owner in new layouts
-                # But to be safe, we can check if it's near "username"
-                # For now, return the first one if it looks plausible (length > 5)
-                for i in ids:
-                    if len(i) > 5:
-                        return i, "Profile HTML (Generic ID match)"
-            except:
-                pass
-                
-    except (requests.RequestException, ValueError, KeyError):
+            match = re.search(r'"owner_id":"(\d+)"', response.text)
+            if match:
+                return match.group(1), "Embed Page"
+            match = re.search(r'"id":"(\d+)"', response.text)
+            if match:
+                return match.group(1), "Embed Page (generic)"
+    except requests.RequestException:
         pass
 
     return None, None
+
 
 def main():
     print(r"""
@@ -161,41 +147,76 @@ def main():
     print("=" * 60)
     print()
 
+    # --- Login Mode ---
+    print("Select mode:")
+    print("1. Session ID (Recommended — most reliable)")
+    print("2. Anonymous (may not work — Instagram blocks most requests)")
+    mode = input("\nEnter choice (1 or 2): ").strip()
+
     session = requests.Session()
+    use_session = False
 
-    # --- Session ID ---
-    print("[?] Ideally, provide a session ID to ensure reliable access.")
-    sessionid = os.environ.get("IG_SESSIONID")
-    if not sessionid:
-        print("[?] To get your sessionid: Open Instagram in a browser, press F12, go to Application > Cookies.")
-        sessionid = input("Enter your sessionid cookie (press Enter to try anonymously): ").strip()
-    
-    if sessionid:
+    if mode == "1":
+        sessionid = os.environ.get("IG_SESSIONID")
+        if not sessionid:
+            print("\n[?] To get your sessionid: Open Instagram > F12 > Application > Cookies > copy 'sessionid'.")
+            sessionid = input("Enter your sessionid cookie: ").strip()
+
+        if not sessionid:
+            print("[!] Session ID is required for this mode.")
+            sys.exit(1)
+
         session.cookies.set("sessionid", sessionid)
-        print("[*] Using session ID.")
+        print("[*] Fetching CSRF token...")
+        csrf = get_csrf_token(session)
+        if csrf:
+            print("[+] Session ready.")
+            use_session = True
+        else:
+            print("[!] Could not validate session. Continuing anyway...")
+            use_session = True
+    else:
+        print("\n[!] Anonymous mode — results may be unreliable.")
+        print("[!] If it fails, re-run with Session ID (option 1).\n")
 
-    # Get CSRF
-    print("[*] Fetching CSRF token...")
-    get_csrf_token(session)
-
+    # --- Resolve Loop ---
     while True:
-        username = input("\nEnter username to resolve (or 'q' to quit): ").strip()
+        username = input("Enter username to resolve (or 'q' to quit): ").strip()
         if username.lower() == 'q':
             break
-        
         if not username:
             continue
 
-        user_id, source = get_user_id_from_username(session, username)
-        
+        # Remove @ if user includes it
+        username = username.lstrip("@")
+
+        print(f"[*] Resolving '{username}'...")
+
+        user_id = None
+        source = None
+
+        if use_session:
+            user_id, source = resolve_with_session(session, username)
+
+        if not user_id:
+            # Try anonymous scraping as fallback
+            user_id, source = resolve_anonymous(username)
+
         if user_id:
-            print(f"\n[+] SUCCESS! User ID: {user_id}")
-            print(f"    (Source: {source})")
-            print(f"    Copy this ID and use it in igban.py")
+            print(f"\n    ╔══════════════════════════════════════╗")
+            print(f"    ║  Username:  {username:<25} ║")
+            print(f"    ║  User ID:   {user_id:<25} ║")
+            print(f"    ║  Source:    {source:<26} ║")
+            print(f"    ╚══════════════════════════════════════╝")
+            print(f"    Copy the User ID and use it in igban.py\n")
         else:
-            print(f"\n[-] FAILED. Could not resolve '{username}'.")
-            if not sessionid:
-                print("    Try running the script again and provide a valid session ID.")
+            print(f"\n[-] FAILED to resolve '{username}'.")
+            if not use_session:
+                print("    Instagram blocks most anonymous requests.")
+                print("    Re-run with Session ID (option 1) for reliable results.\n")
+            else:
+                print("    The account may not exist or is private.\n")
+
 
 if __name__ == "__main__":
     main()
