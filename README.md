@@ -101,4 +101,4 @@ This tool is for educational purposes only. Misuse to harass or harm others is s
 
 ## License
 
-MIT License.
+[MIT License](https://github.com/reblox01/InstaReport/blob/master/LICENSE)

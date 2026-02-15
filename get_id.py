@@ -88,6 +88,59 @@ def get_user_id_from_username(session, username):
     except (requests.RequestException, ValueError, KeyError):
         pass
 
+    # Approach 3: Embed Page (Low reliability, but sometimes works)
+    try:
+        url3 = f"https://www.instagram.com/{username}/embed/captioned/"
+        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9"
+        response = session.get(url3, headers=headers)
+        if response.status_code == 200:
+            import re
+            match = re.search(r'"id":"(\d+)"', response.text)
+            if match:
+                return match.group(1), "Embed Page Scrape"
+            match_owner = re.search(r'"owner_id":"(\d+)"', response.text)
+            if match_owner:
+                return match_owner.group(1), "Embed Page Owner ID"
+    except (requests.RequestException, ValueError, KeyError):
+        pass
+
+    # Approach 4: Main Profile Page HTML Scrape (Fallback)
+    try:
+        url4 = f"https://www.instagram.com/{username}/"
+        # Use a short timeout to fail fast if it hangs
+        response = session.get(url4, headers=headers, timeout=10)
+        if response.status_code == 200:
+            import re
+            text = response.text
+            
+            # Pattern A: "user_id":"12345" (often in sharedData)
+            match_uid = re.search(r'"user_id":"(\d+)"', text)
+            if match_uid:
+                return match_uid.group(1), "Profile HTML (user_id)"
+
+            # Pattern B: profilePage_12345 (rare but possible in old scripts)
+            match_pp = re.search(r'profilePage_(\d+)', text)
+            if match_pp:
+                return match_pp.group(1), "Profile HTML (profilePage)"
+            
+            # Pattern C: "id":"12345" inside a user-like object
+            # e.g. {"username":"aroscki",...,"id":"12345"}
+            # We look for the username followed by "id"
+            try:
+                # Find all "id":"digits"
+                ids = re.findall(r'"id":"(\d+)"', text)
+                # If we found any, the first one is often the profile owner in new layouts
+                # But to be safe, we can check if it's near "username"
+                # For now, return the first one if it looks plausible (length > 5)
+                for i in ids:
+                    if len(i) > 5:
+                        return i, "Profile HTML (Generic ID match)"
+            except:
+                pass
+                
+    except (requests.RequestException, ValueError, KeyError):
+        pass
+
     return None, None
 
 def main():
