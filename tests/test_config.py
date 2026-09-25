@@ -170,6 +170,147 @@ def test_enabled_api_requires_all_three_identities(base_config_toml, proxy_file,
         load_config(_write(body))
 
 
+# --- the [run] section ------------------------------------------------------
+
+
+def test_run_defaults_when_the_section_is_absent(base_config_toml, proxy_file, session_env):
+    """Omitting [run] is legal, and gives the documented defaults.
+
+    Not an error: a config that predates the section must still load, and a
+    default that only exists when the section is present would mean a config
+    file changes behaviour by gaining a comment.
+    """
+    config = load_config(_write(base_config_toml))
+    assert config.run.max_reports == 100
+    assert config.run.horizon_hours == 6.0
+    assert config.run.max_concurrent is None
+    assert config.run.horizon_seconds == 6.0 * 3600.0
+
+
+def test_run_values_are_read(base_config_toml, proxy_file, session_env):
+    body = base_config_toml + """
+[run]
+max_reports = 7
+horizon_hours = 0.25
+transient_retries = 5
+backoff_seconds = 2
+exit_rotations = 4
+channel_failure_threshold = 9
+floor_gap_seconds = 45
+jitter_fraction = 0.5
+horizon_fraction = 0.6
+narrative_seed = "seeded"
+max_detail_length = 120
+"""
+    run = load_config(_write(body)).run
+    assert run.max_reports == 7
+    assert run.horizon_hours == 0.25
+    assert run.transient_retries == 5
+    assert run.backoff_seconds == 2.0
+    assert run.exit_rotations == 4
+    assert run.channel_failure_threshold == 9
+    assert run.floor_gap_seconds == 45.0
+    assert run.jitter_fraction == 0.5
+    assert run.horizon_fraction == 0.6
+    assert run.narrative_seed == "seeded"
+    assert run.max_detail_length == 120
+
+
+def test_max_reports_zero_means_no_ceiling_not_no_reports(
+    base_config_toml, proxy_file, session_env
+):
+    """`max_reports = 0` is never a thing an operator means to type."""
+    body = base_config_toml + "\n[run]\nmax_reports = 0\n"
+    assert load_config(_write(body)).run.max_reports is None
+
+
+def test_run_max_concurrent_omitted_defers_to_the_browser(
+    base_config_toml, proxy_file, session_env
+):
+    """None, not a duplicated default.
+
+    A number here would be a second source of truth for "how many sessions at
+    once" that can silently disagree with [browser] max_concurrent.
+    """
+    assert load_config(_write(base_config_toml)).run.max_concurrent is None
+
+
+def test_run_max_concurrent_cannot_exceed_account_count(
+    base_config_toml, proxy_file, session_env
+):
+    body = base_config_toml + "\n[run]\nmax_concurrent = 4\n"
+    with pytest.raises(ConfigError, match="exceeds"):
+        load_config(_write(body))
+
+
+def test_a_pacing_floor_below_the_hard_minimum_is_refused_not_clamped(
+    base_config_toml, proxy_file, session_env
+):
+    """A config that reads "send every 2 seconds" while the tool sends every 8
+    is a lie in a file, so it is an error rather than a silent clamp."""
+    from insta_report.pacing import MIN_GAP_SECONDS
+
+    body = base_config_toml + "\n[run]\nfloor_gap_seconds = 2\n"
+    with pytest.raises(ConfigError, match="below the hard minimum"):
+        load_config(_write(body))
+    # And the boundary itself is accepted.
+    ok = base_config_toml + f"\n[run]\nfloor_gap_seconds = {MIN_GAP_SECONDS}\n"
+    assert load_config(_write(ok)).run.floor_gap_seconds == float(MIN_GAP_SECONDS)
+
+
+def test_a_pacing_floor_above_the_cap_is_refused(
+    base_config_toml, proxy_file, session_env
+):
+    from insta_report.pacing import MAX_GAP_SECONDS
+
+    body = base_config_toml + f"\n[run]\nfloor_gap_seconds = {MAX_GAP_SECONDS + 1}\n"
+    with pytest.raises(ConfigError, match="above MAX_GAP_SECONDS"):
+        load_config(_write(body))
+
+
+@pytest.mark.parametrize("key", ["jitter_fraction", "horizon_fraction"])
+def test_out_of_range_pacing_fractions_are_refused(
+    key, base_config_toml, proxy_file, session_env
+):
+    body = base_config_toml + f"\n[run]\n{key} = 1.5\n"
+    with pytest.raises(ConfigError, match="must be <="):
+        load_config(_write(body))
+
+
+def test_a_whole_number_of_seconds_is_not_a_typo(base_config_toml, proxy_file, session_env):
+    """`backoff_seconds = 5` is a TOML integer, and rejecting it would read as
+    an error when it is exactly what the operator meant."""
+    body = base_config_toml + "\n[run]\nbackoff_seconds = 5\n"
+    assert load_config(_write(body)).run.backoff_seconds == 5.0
+
+
+def test_a_string_where_a_number_belongs_names_the_key(
+    base_config_toml, proxy_file, session_env
+):
+    body = base_config_toml + '\n[run]\nhorizon_hours = "six"\n'
+    with pytest.raises(ConfigError, match="horizon_hours must be a number"):
+        load_config(_write(body))
+
+
+def test_a_bolean_where_a_number_belongs_is_refused(
+    base_config_toml, proxy_file, session_env
+):
+    """``True`` is an int in Python, and ``horizon_hours = true`` would become
+    1.0 without this check."""
+    body = base_config_toml + "\n[run]\nhorizon_hours = true\n"
+    with pytest.raises(ConfigError, match="must be a number"):
+        load_config(_write(body))
+
+
+def test_a_zero_channel_failure_threshold_is_refused(
+    base_config_toml, proxy_file, session_env
+):
+    """Zero would mean "disable the channel before its first failure"."""
+    body = base_config_toml + "\n[run]\nchannel_failure_threshold = 0\n"
+    with pytest.raises(ConfigError, match="channel_failure_threshold must be >= 1"):
+        load_config(_write(body))
+
+
 # --- paths ------------------------------------------------------------------
 
 
@@ -200,6 +341,153 @@ max_concurrent = 1
     with pytest.raises(PathContainmentError, match="outside the work tree"):
         load_config(_write(body))
     assert not inside.exists()
+
+
+# --- config-relative paths --------------------------------------------------
+
+
+def test_a_relative_proxy_path_resolves_against_the_config_not_the_cwd(tmp_path, session_env):
+    """A config that means different things in different shells has a blast
+    radius the operator never wrote down.
+
+    This is the whole reason: the proxy list sits next to the config, the
+    command is run from somewhere else entirely, and the file is still found.
+    """
+    import os
+
+    home = tmp_path / "project"
+    home.mkdir()
+    (home / "proxies.txt").write_text("10.0.0.1:8080\n", encoding="utf-8")
+    (home / "insta-report.toml").write_text(
+        """
+[accounts.alpha]
+username = "reporter.one"
+sessionid_env = "IG_SESSIONID_ALPHA"
+
+[proxies]
+source = "file"
+file_path = "proxies.txt"
+
+[browser]
+max_concurrent = 1
+""",
+        encoding="utf-8",
+    )
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    previous = os.getcwd()
+    os.chdir(elsewhere)
+    try:
+        config = load_config(home / "insta-report.toml")
+    finally:
+        os.chdir(previous)
+    assert config.proxies.file_path == home / "proxies.txt"
+
+
+def test_a_relative_data_dir_resolves_against_the_config_not_the_cwd(tmp_path, session_env):
+    home = tmp_path / "project"
+    home.mkdir()
+    (home / "proxies.txt").write_text("10.0.0.1:8080\n", encoding="utf-8")
+    (home / "insta-report.toml").write_text(
+        """
+data_dir = "runtime"
+
+[accounts.alpha]
+username = "reporter.one"
+sessionid_env = "IG_SESSIONID_ALPHA"
+
+[proxies]
+source = "file"
+file_path = "proxies.txt"
+
+[browser]
+max_concurrent = 1
+""",
+        encoding="utf-8",
+    )
+    config = load_config(home / "insta-report.toml")
+    assert config.paths.data_dir == home / "runtime"
+
+
+def test_an_absolute_path_is_left_exactly_as_written(tmp_path, session_env):
+    """Nothing that already worked may change."""
+    elsewhere = tmp_path / "somewhere-else"
+    elsewhere.mkdir()
+    (tmp_path / "proxies.txt").write_text("10.0.0.1:8080\n", encoding="utf-8")
+    (tmp_path / "insta-report.toml").write_text(
+        f"""
+[accounts.alpha]
+username = "reporter.one"
+sessionid_env = "IG_SESSIONID_ALPHA"
+
+[proxies]
+source = "file"
+file_path = "{elsewhere.as_posix()}"
+
+[browser]
+max_concurrent = 1
+""",
+        encoding="utf-8",
+    )
+    config = load_config(tmp_path / "insta-report.toml")
+    assert config.proxies.file_path == elsewhere
+
+
+def test_a_tilde_path_stays_a_tilde_path(tmp_path, session_env, monkeypatch):
+    """``~`` is expanded before the absolutise pass, so a home-relative path
+    still lands in the user's home rather than in the config's directory."""
+    (tmp_path / "proxies.txt").write_text("10.0.0.1:8080\n", encoding="utf-8")
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    (fake_home / "proxies.txt").write_text("10.0.0.2:8080\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+
+    (tmp_path / "insta-report.toml").write_text(
+        """
+[accounts.alpha]
+username = "reporter.one"
+sessionid_env = "IG_SESSIONID_ALPHA"
+
+[proxies]
+source = "file"
+file_path = "~/proxies.txt"
+
+[browser]
+max_concurrent = 1
+""",
+        encoding="utf-8",
+    )
+    config = load_config(tmp_path / "insta-report.toml")
+    assert config.proxies.file_path == fake_home / "proxies.txt"
+
+
+def test_a_missing_relative_proxy_file_reports_the_resolved_path(tmp_path, session_env):
+    """The error must name the file it looked for, not the spelling in the TOML.
+
+    An operator who typed ``file_path = "proxies.txt"`` and gets told
+    ``proxies.txt does not exist`` looks in the working directory. The path
+    that was actually consulted is the only useful thing to print.
+    """
+    (tmp_path / "insta-report.toml").write_text(
+        """
+[accounts.alpha]
+username = "reporter.one"
+sessionid_env = "IG_SESSIONID_ALPHA"
+
+[proxies]
+source = "file"
+file_path = "not-here.txt"
+
+[browser]
+max_concurrent = 1
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="not-here.txt") as excinfo:
+        load_config(tmp_path / "insta-report.toml")
+    assert str(tmp_path) in str(excinfo.value)
 
 
 # --- malformed input --------------------------------------------------------

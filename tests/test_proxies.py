@@ -183,6 +183,220 @@ def test_a_block_marker_inside_a_json_body_still_wins():
     assert verdict.usable is False
 
 
+@pytest.mark.parametrize("status", [400, 403, 404, 429, 500, 502, 503])
+def test_a_non_2xx_is_never_healthy_however_its_body_reads(status):
+    """The status is the first question, asked before the body is read.
+
+    ``classify_body``'s definition of a healthy answer is "an address literal
+    appears in the body", and error pages contain address literals: a
+    provider's 404 says which upstream it could not reach, a captive portal
+    names the address it redirected to, a CDN edge error prints a peer
+    address. Without this gate a failed request is graded as a working exit and
+    the pool binds a lease to it.
+    """
+    verdict, reason = classify_body("upstream 203.0.113.5 unreachable", status)
+    assert verdict is ProbeVerdict.STATUS_ERROR
+    assert verdict.usable is False
+    assert str(status) in reason
+
+
+def test_a_407_is_still_about_credentials_and_not_about_the_status():
+    """407 is a status error, but the useful message names the remedy.
+
+    Ordering matters: the auth check is first, so a 407 whose body happens to
+    contain an address still reports the credential problem, which is the only
+    thing the operator can act on.
+    """
+    verdict, reason = classify_body("203.0.113.5 is not authorised", 407)
+    assert verdict is ProbeVerdict.AUTH_FAILED
+    assert "credential" in reason
+
+
+def test_a_2xx_containing_an_out_of_range_dotted_quad_is_still_ok_but_yields_nothing():
+    """The gap the transport re-checks for, pinned where the two sides live.
+
+    ``_IPV4`` is satisfied by ``999.1.1.1``; ``ipaddress`` rejects it. So
+    ``classify_body`` can say OK where ``parse_ip_echo`` returns ``None``,
+    which is why :func:`~insta_report.transport.fetch` downgrades rather than
+    trusting the classifier alone.
+    """
+    verdict, _ = classify_body("999.1.1.1", 200)
+    assert verdict is ProbeVerdict.OK
+    assert parse_ip_echo("999.1.1.1") is None
+
+
+def test_the_benchmarking_range_counts_as_reserved():
+    """RFC 2544. Not documentation, same conclusion: no residential provider
+    has an address here, so one in a probe means something invented it."""
+    assert parse_ip_echo("198.18.0.1") is not None
+    assert parse_ip_echo("198.18.0.1").is_documentation_range is True
+    assert parse_ip_echo("198.19.255.255").is_documentation_range is True
+    # Just outside the /15, and just outside TEST-NET-2.
+    assert parse_ip_echo("198.20.0.1").is_documentation_range is False
+    assert parse_ip_echo("198.51.101.7").is_documentation_range is False
+
+
+def test_a_reserved_egress_is_never_bound_even_though_the_verdict_says_ok():
+    """The rule the pool owes, independent of what the transport graded.
+
+    An earlier version logged a warning here and returned the lease anyway --
+    a warning whose own text said "the probe was intercepted rather than
+    reaching the echo service", followed by handing that address to a report.
+    So the pool, not the transport, is where the refusal belongs: the
+    transport is injected, and a pool that trusted whatever verdict it was
+    given had no defence of its own.
+
+    The observation is still returned on the result, so the refusal is
+    explainable in a log rather than a silent quarantine.
+    """
+    endpoints = [ProxyEndpoint(url="http://10.0.0.1:8080", source="file", label="t")]
+    pool = ProxyPool(
+        endpoints,
+        fetch=lambda url, proxy: ProbeResult(
+            verdict=ProbeVerdict.OK,
+            status=200,
+            body='{"ip":"198.51.100.7"}',
+            egress=EgressObservation(ip="198.51.100.7", is_documentation_range=True),
+        ),
+        enforce_asn_diversity=False,
+    )
+    with pytest.raises(ProxyUnavailable, match="reserved range"):
+        pool.acquire()
+
+
+def test_a_documentation_egress_does_not_even_become_health():
+    """Quarantined, not merely unranked.
+
+    The distinction is between "we tried this one and it was busy" and "this
+    one lied to us". A report sent through it would come from a fabricated
+    address, and the operator's exit log would name an address that never
+    existed.
+    """
+    endpoints = [ProxyEndpoint(url="http://10.0.0.1:8080", source="file", label="t")]
+    pool = ProxyPool(
+        endpoints,
+        fetch=lambda url, proxy: ProbeResult(
+            verdict=ProbeVerdict.OK,
+            status=200,
+            egress=EgressObservation(ip="2001:db8::1", is_documentation_range=True),
+        ),
+        enforce_asn_diversity=False,
+    )
+    with pytest.raises(ProxyUnavailable):
+        pool.acquire()
+    health = next(iter(pool._health.values()))
+    assert health.last_verdict is not None
+    assert health.last_verdict.usable is False
+
+
+def test_a_benchmarking_egress_is_refused_like_any_other_reserved_range():
+    endpoints = [ProxyEndpoint(url="http://10.0.0.1:8080", source="file", label="t")]
+    pool = ProxyPool(
+        endpoints,
+        fetch=lambda url, proxy: ProbeResult(
+            verdict=ProbeVerdict.OK,
+            status=200,
+            egress=EgressObservation(ip="198.18.4.4", is_documentation_range=True),
+        ),
+        enforce_asn_diversity=False,
+    )
+    with pytest.raises(ProxyUnavailable, match="198.18.4.4"):
+        pool.acquire()
+
+
+def test_an_observation_whose_ip_is_not_an_address_is_refused():
+    """A placeholder echoed straight back, with no reserved range to catch it.
+
+    ``198.51.100.x`` is recognised as a fixture because it is reserved.
+    ``"unknown"``, ``""`` or ``"0.0.0.0"`` is not reserved and is not an
+    address either, and every other field of the observation looks fine -- so
+    nothing else in the pool would notice.
+    """
+    for fake in ("unknown", "0.0.0.0", "127.0.0.1-hostname", "::1", "127.0.0.1"):
+        endpoints = [ProxyEndpoint(url="http://10.0.0.1:8080", source="file", label="t")]
+        pool = ProxyPool(
+            endpoints,
+            fetch=lambda url, proxy, fake=fake: ProbeResult(
+                verdict=ProbeVerdict.OK,
+                status=200,
+                egress=EgressObservation(ip=fake, is_documentation_range=False),
+            ),
+            enforce_asn_diversity=False,
+        )
+        with pytest.raises(ProxyUnavailable) as excinfo:
+            pool.acquire()
+        # "not an address" for a string, "not a routable address" for a valid
+        # loopback or the unspecified address. Both refusals, and the operator
+        # can tell which kind of nonsense the provider returned.
+        assert "not an address" in str(excinfo.value) or "not a routable" in str(
+            excinfo.value
+        ), fake
+
+
+def test_carrier_grade_nat_is_not_treated_as_a_fake_exit():
+    """The error a too-broad check would make.
+
+    RFC 6598 (100.64.0.0/10) is ``is_private`` in Python and is precisely what
+    a residential mobile exit looks like: an address on the subscriber side of
+    a carrier's NAT. Refusing ``is_private`` would reject the exits this tool
+    exists to use, which is why the check lists three specific properties
+    instead.
+    """
+    endpoints = [ProxyEndpoint(url="http://10.0.0.1:8080", source="file", label="t")]
+    pool = ProxyPool(
+        endpoints,
+        fetch=lambda url, proxy: ProbeResult(
+            verdict=ProbeVerdict.OK,
+            status=200,
+            egress=EgressObservation(ip="100.110.3.7", asn=6167),
+        ),
+    )
+    lease = pool.acquire()
+    assert lease.egress is not None
+    assert lease.egress.ip == "100.110.3.7"
+
+
+def test_a_genuine_egress_is_still_bound_after_all_of_that():
+    """The refusals above are worthless if they broke the working case."""
+    endpoints = [ProxyEndpoint(url="http://10.0.0.1:8080", source="file", label="t")]
+    pool = ProxyPool(
+        endpoints,
+        fetch=lambda url, proxy: ProbeResult(
+            verdict=ProbeVerdict.OK,
+            status=200,
+            egress=EgressObservation(ip="45.9.148.99", asn=21408),
+        ),
+    )
+    lease = pool.acquire()
+    assert lease.egress is not None
+    assert lease.egress.ip == "45.9.148.99"
+
+
+def test_a_nested_asn_object_is_read_rather_than_dropped():
+    """ipinfo and several other echo services answer with a nested object.
+
+    Dropping it is not a neutral outcome: a missing ASN silently disables the
+    diversity check the operator believes is running.
+    """
+    for payload in (
+        {"ip": "8.8.8.8", "asn": {"asn": "AS15169"}},
+        {"ip": "8.8.8.8", "asn": {"number": 15169}},
+        {"ip": "8.8.8.8", "asn": {"asn": "15169 Google LLC"}},
+    ):
+        observed = parse_ip_echo(json.dumps(payload))
+        assert observed is not None, payload
+        assert observed.asn == 15169, payload
+
+
+def test_an_unreadable_asn_is_absent_rather_than_wrong():
+    """A wrong ASN defeats the diversity check worse than a missing one,
+    because it looks like it is being enforced."""
+    for value in ({"asn": {"asn": "unknown"}}, {"asn": "n/a"}, {"asn": {}}, True):
+        observed = parse_ip_echo(json.dumps({"ip": "8.8.8.8", "asn": value}))
+        assert observed is not None, value
+        assert observed.asn is None, value
+
+
 def test_every_non_ok_2xx_verdict_looks_healthy_to_a_naive_check():
     """Makes the trap explicit: these are the verdicts status-only checking misses."""
     misleading = {
@@ -291,6 +505,71 @@ def test_proxy_file_skips_unparseable_lines_without_dying(tmp_path: Path):
     path.write_text("10.0.0.1:8080\nnot-a-proxy\n10.0.0.2:8080\n", encoding="utf-8")
     parsed = parse_proxy_file(path)
     assert [e.host for e in parsed] == ["10.0.0.1", "10.0.0.2"]
+
+
+def test_a_non_numeric_port_skips_the_line_instead_of_raising(tmp_path: Path):
+    """``urlparse(...).port`` *raises* rather than returning None.
+
+    Without its own guard it took the whole file down with a traceback from
+    urllib that named no line and no file, so one typo cost every exit the
+    operator had. A malformed port is also the single most likely way a
+    hand-written list is wrong.
+    """
+    path = tmp_path / "proxies.txt"
+    path.write_text(
+        "http://127.0.0.1:9:1\n10.0.0.1:8080\nhost:port\n10.0.0.2:8080\n",
+        encoding="utf-8",
+    )
+    parsed = parse_proxy_file(path)
+    assert [e.host for e in parsed] == ["10.0.0.1", "10.0.0.2"]
+
+
+def test_a_skipped_line_is_reported_with_its_line_number(tmp_path: Path):
+    """An operator who wrote twenty addresses and got fifteen back has fifteen
+    exits where they believed they had twenty, and the only way to know is to
+    be told which lines went missing."""
+    path = tmp_path / "proxies.txt"
+    path.write_text("10.0.0.1:8080\nrubbish\nhttp://h:9:1\n", encoding="utf-8")
+    problems: list[str] = []
+    parse_proxy_file(path, problems=problems)
+    assert len(problems) == 2
+    assert ":2:" in problems[0]
+    assert ":3:" in problems[1]
+    assert "proxies.txt" in problems[0]
+
+
+def test_build_pool_says_how_many_lines_it_had_to_skip(tmp_path, caplog):
+    """The count is the point. A per-line warning nobody reads is not."""
+    from insta_report.config import ProxyConfig
+    from insta_report.proxies import build_pool
+
+    proxies = tmp_path / "proxies.txt"
+    proxies.write_text("10.0.0.1:8080\nrubbish\n", encoding="utf-8")
+    config = ProxyConfig(source="file", file_path=proxies)
+
+    with caplog.at_level("ERROR", logger="insta_report.proxies"):
+        pool = build_pool(config, fetch=lambda url, proxy: None)  # type: ignore[arg-type]
+
+    assert len(pool.endpoints) == 1
+    messages = " ".join(record.getMessage() for record in caplog.records)
+    assert "1 line(s)" in messages
+    assert "leaving 1 address" in messages
+
+
+def test_no_secret_appears_in_a_skip_report(tmp_path, caplog):
+    """The skip message names the file and line, never the line's contents --
+    a malformed credentials line is exactly the one carrying a password."""
+    from insta_report.config import ProxyConfig
+    from insta_report.proxies import build_pool
+
+    proxies = tmp_path / "proxies.txt"
+    proxies.write_text("user:hunter2supersecret@host:notaport\n", encoding="utf-8")
+    config = ProxyConfig(source="file", file_path=proxies)
+
+    with caplog.at_level("WARNING", logger="insta_report.proxies"):
+        build_pool(config, fetch=lambda url, proxy: None)  # type: ignore[arg-type]
+
+    assert "hunter2supersecret" not in caplog.text
 
 
 def test_proxy_file_never_exposes_credentials_in_its_own_repr(tmp_path: Path):

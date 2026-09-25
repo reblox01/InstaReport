@@ -52,7 +52,7 @@ import logging
 import random
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Protocol, Sequence
@@ -173,6 +173,12 @@ _DOCUMENTATION_NETS = (
     ipaddress.ip_network("198.51.100.0/24"),
     ipaddress.ip_network("203.0.113.0/24"),
     ipaddress.ip_network("2001:db8::/32"),
+    # RFC 2544 benchmarking. Not documentation, but the same conclusion: no
+    # residential provider has an address here, so one appearing in a probe
+    # means something between us and the echo service invented it. Listed here
+    # rather than in a second table elsewhere, because the question "is this
+    # address real and distinct" must have exactly one answer in the codebase.
+    ipaddress.ip_network("198.18.0.0/15"),
 )
 
 
@@ -226,6 +232,15 @@ def classify_body(
     """
     if status == 407:
         return ProbeVerdict.AUTH_FAILED, "proxy rejected the supplied credentials"
+    if not 200 <= status < 300:
+        # Gate first, and before anything looks at the body. A 404 page from a
+        # captive portal or a provider's error page routinely contains an IP
+        # literal in its diagnostic text, and an address literal is this
+        # function's definition of a healthy answer -- so without this gate a
+        # failed request with a hostname in its body is graded as a working
+        # exit. Checked before the body is even stripped, because the question
+        # "did this succeed" is not the body's to answer.
+        return ProbeVerdict.STATUS_ERROR, f"the probe answered with HTTP {status}"
 
     stripped = body.strip()
     if not stripped:
@@ -323,6 +338,15 @@ def _coerce_asn(value: Any) -> int | None:
         match = re.search(r"\d+", value)
         if match:
             return int(match.group())
+    if isinstance(value, dict):
+        # The nested shape: ipinfo and several others answer
+        # ``{"asn": {"asn": "AS15169", "name": "Google LLC", ...}}``. Handled
+        # here rather than in a caller because the field is called "asn" in
+        # both the flat and the nested form, and a caller that reaches for
+        # ``value["asn"]`` on a flat int is a TypeError at the worst moment.
+        for key in ("asn", "as", "number", "autonomous_system_number"):
+            if key in value:
+                return _coerce_asn(value[key])
     return None
 
 
@@ -331,6 +355,82 @@ def _first_key(data: dict[str, Any], keys: Sequence[str]) -> Any:
         if key in data and data[key] not in (None, ""):
             return data[key]
     return None
+
+
+def _grade_egress(result: ProbeResult) -> ProbeResult:
+    """Downgrade an ``OK`` probe whose address we cannot report from.
+
+    Returns a new result; the input is untouched, because the verdict a
+    transport produced is a fact about the transport and this is a fact about
+    the pool's willingness to use the answer.
+
+    The verdict answers "did the body read like a working answer?". Three
+    cases say the body read fine and the answer is still unusable, and all
+    three are why this is not simply ``verdict.usable`` at the call site:
+
+    * **No address in it.** A pool that returned this would hand out an exit it
+      has never identified, which is how two sessions silently share one IP.
+    * **A reserved range.** ``198.51.100.x``, ``2001:db8::x``,
+      ``198.18.0.0/15``. Proof the probe was intercepted rather than reaching
+      the echo service -- a transparent proxy answering for the provider, a DNS
+      hijack, a captive portal. Binding it means a report leaving from a
+      fabricated address while the diversity accounting records a distinct ASN
+      it never saw.
+    * **Not an address at all.** ``"unknown"``, ``""``, ``"0.0.0.0"``. No
+      reserved range to catch these, and every other field of the observation
+      looks perfectly usable.
+
+    Graded here rather than in :func:`~insta_report.transport.fetch` because the
+    transport is injected: a pool that trusted whatever verdict it was handed
+    had no defence of its own, and a second transport would reintroduce the
+    hole. Downgrading to ``UNPARSEABLE`` rather than a new verdict keeps the
+    enum closed -- the caller already treats it as "do not use this", and a
+    distinct member would invite a fourth implementation to handle it.
+    """
+    if result.verdict is not ProbeVerdict.OK or result.egress is None:
+        if result.verdict is ProbeVerdict.OK and result.egress is None:
+            return replace(
+                result,
+                verdict=ProbeVerdict.UNPARSEABLE,
+                detail="the probe did not identify the exit address",
+            )
+        return result
+
+    ip = result.egress.ip
+    if result.egress.is_documentation_range:
+        return replace(
+            result,
+            verdict=ProbeVerdict.UNPARSEABLE,
+            detail=(
+                f"egress {ip} is a reserved range: the probe was intercepted "
+                "rather than reaching the echo service"
+            ),
+        )
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return replace(
+            result,
+            verdict=ProbeVerdict.UNPARSEABLE,
+            detail=f"egress {ip!r} is not an address at all",
+        )
+    if address.is_unspecified or address.is_loopback or address.is_link_local:
+        # ``0.0.0.0``, ``127.0.0.1``, ``::1``, ``fe80::``. Valid addresses,
+        # so ``ip_address`` accepts them, and ``is_documentation_range`` is
+        # False for all of them -- but no residential provider has an exit on
+        # the loopback interface or at the unspecified address. A provider
+        # answering with one is telling us it never actually connected.
+        #
+        # Deliberately the narrow list. ``is_private`` is *not* refused:
+        # RFC 6598 carrier-grade NAT (100.64.0.0/10) is ``is_private`` in
+        # Python and is exactly what a residential mobile exit looks like, so
+        # refusing it would reject the addresses this tool exists to use.
+        return replace(
+            result,
+            verdict=ProbeVerdict.UNPARSEABLE,
+            detail=f"egress {ip} is not a routable address for a remote peer",
+        )
+    return result
 
 
 def _observation_from_mapping(data: dict[str, Any]) -> EgressObservation | None:
@@ -435,6 +535,7 @@ def parse_proxy_file(
     *,
     scheme: str = "http",
     label: str = "",
+    problems: list[str] | None = None,
 ) -> list[ProxyEndpoint]:
     """Read an operator proxy list, tolerantly and without ever logging secrets.
 
@@ -447,6 +548,14 @@ def parse_proxy_file(
     Duplicates are removed, preserving order, because a list with a repeated
     address would make the pool's diversity accounting think it has more
     capacity than it does.
+
+    ``problems`` collects one message per line that had to be skipped. Passed
+    in rather than returned, so this stays a plain list: the callers that care
+    about skips already have a list to append to, and the ones that do not
+    should not have to unpack a tuple to get the endpoints. A skipped line is
+    not a small thing to lose -- an operator who wrote twenty addresses and
+    gets fifteen back has fifteen exits where they believed they had twenty,
+    and the only way to find out is to be told.
     """
     text = path.read_text(encoding="utf-8", errors="replace")
 
@@ -459,7 +568,10 @@ def parse_proxy_file(
             continue
         url = _normalise_line(line, scheme=scheme)
         if url is None:
-            log.warning("%s:%d: unparseable proxy line skipped", path, lineno)
+            message = f"{path}:{lineno}: skipped, not a proxy address"
+            if problems is not None:
+                problems.append(message)
+            log.warning("%s", message)
             continue
         key = _dedupe_key(url)
         if key in seen:
@@ -471,6 +583,11 @@ def parse_proxy_file(
 
 
 def _normalise_line(line: str, *, scheme: str) -> str | None:
+    """One proxy line to a URL, or ``None`` if it cannot be one.
+
+    Nothing here raises. Every rejection is a line in an operator's file, and
+    a list with one bad line must not take the other nineteen down with it.
+    """
     if "://" in line:
         candidate = line
     elif "@" in line:
@@ -488,18 +605,40 @@ def _normalise_line(line: str, *, scheme: str) -> str | None:
         parsed = urlparse(candidate)
     except ValueError:
         return None
-    if not parsed.hostname or parsed.port is None:
+    if not parsed.hostname:
+        return None
+    # ``.port`` is a property that *raises* on a non-numeric port rather than
+    # returning None, so it cannot be read inside the try above -- and a
+    # malformed port is the most likely way an operator's line is wrong.
+    # Guarded on its own, because without it a line like ``http://host:9:1``
+    # takes the whole file down with a traceback from urllib that names no
+    # line and no file.
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is None:
         return None
     return candidate
 
 
 def _dedupe_key(url: str) -> str:
-    """Dedupe on origin + credentials, ignoring incidental spelling."""
+    """Dedupe on origin + credentials, ignoring incidental spelling.
+
+    Total by construction -- it is only called on URLs
+    :func:`_normalise_line` already accepted -- and defensive anyway, because
+    a crash inside the function that exists to stop duplicates turning into
+    capacity is a bad trade.
+    """
     parsed = urlparse(url)
     creds = ""
     if parsed.username:
         creds = f"{parsed.username}:{parsed.password or ''}"
-    return f"{parsed.scheme}://{creds}@{parsed.hostname}:{parsed.port}"
+    try:
+        port = parsed.port
+    except ValueError:
+        return url
+    return f"{parsed.scheme}://{creds}@{parsed.hostname}:{port}"
 
 
 # --- providers --------------------------------------------------------------
@@ -1048,17 +1187,20 @@ class ProxyPool:
             f", AS{result.egress.asn}" if result.egress and result.egress.asn else "",
             self._sticky_ttl / 60,
         )
-        if result.egress and result.egress.is_documentation_range:
-            log.warning(
-                "egress %s is a documentation range: the probe was intercepted "
-                "rather than reaching the echo service",
-                result.egress.ip,
-            )
         return lease
 
     def _probe(self, endpoint: ProxyEndpoint) -> ProbeResult:
+        """Ask *endpoint* what it is, and grade the answer.
+
+        Every result passes through :func:`_grade_egress` on the way out, so
+        the check that a lease is never bound to an unidentifiable or reserved
+        address is in one place rather than at each call site that might forget
+        it. Grading here rather than in ``acquire`` also means the downgrade
+        reaches ``record_failure`` and lands in the health record, so a pool
+        that refuses an address can say why in its exhaustion report.
+        """
         try:
-            return self._fetch(self._probe_url, endpoint.url)
+            return _grade_egress(self._fetch(self._probe_url, endpoint.url))
         except ProxyUnavailable:
             raise
         except Exception as exc:  # noqa: BLE001 - transport errors are data here
@@ -1071,16 +1213,32 @@ class ProxyPool:
             )
 
     def _exhausted_report(self, now: float) -> str:
+        """Why every address is unavailable, one line each.
+
+        Carries the last *detail*, not just the verdict name, and that is the
+        difference between a report an operator can act on and a shrug. Ten
+        addresses all reading ``unparseable`` is a provider problem; one
+        reading ``unparseable`` and the rest reading ``egress 198.51.100.7 is
+        a reserved range`` is a provider serving fixtures, and the two need
+        completely different responses. A bare verdict enum cannot tell them
+        apart, because the detail is where the difference lives.
+        """
         lines = ["no proxy address is currently available:"]
         for health in self._health.values():
             remaining = max(0.0, (health.quarantined_until or now) - now)
             verdict = health.last_verdict.value if health.last_verdict else "untried"
             if remaining > 0:
                 state = f"cooling down {remaining:.0f}s (last: {verdict})"
-            elif health.last_used_monotonic is not None and now - health.last_used_monotonic < self._min_cooldown:
+            elif (
+                health.last_used_monotonic is not None
+                and now - health.last_used_monotonic < self._min_cooldown
+            ):
                 state = f"used {(now - health.last_used_monotonic):.0f}s ago"
             else:
                 state = verdict
+            detail = health.last_detail
+            if detail and detail != verdict:
+                state = f"{state} -- {detail}"
             lines.append(f"  {health.endpoint.origin}: {state}")
         return "\n".join(lines)
 
@@ -1280,6 +1438,7 @@ def build_pool(
     """
     source = getattr(config, "source", "file")
     label = "operator file"
+    skipped: list[str] = []
 
     endpoints: list[ProxyEndpoint]
     if source == "file":
@@ -1288,7 +1447,7 @@ def build_pool(
             log.error("[proxies] source = 'file' but no file_path is configured")
             endpoints = []
         else:
-            endpoints = parse_proxy_file(file_path, label=label)
+            endpoints = parse_proxy_file(file_path, label=label, problems=skipped)
     elif source == "provider":
         key = config.resolved_key() if hasattr(config, "resolved_key") else None
         if not key:
@@ -1313,6 +1472,21 @@ def build_pool(
     else:
         log.error("[proxies] unknown source %r; expected 'file' or 'provider'", source)
         endpoints = []
+
+    if skipped:
+        # An operator who wrote a list of exits and got a shorter one back has
+        # fewer exits than they believe, which is the kind of thing that only
+        # surfaces later as an unexplained "no addresses available". Counted
+        # loudly, and named, rather than left to a per-line warning nobody
+        # reads.
+        log.error(
+            "[proxies] %d line(s) in the proxy file were skipped as unparseable, "
+            "leaving %d address(es). Fix the lines or the pool will run out of "
+            "exits mid-run. First problem: %s",
+            len(skipped),
+            len(endpoints),
+            skipped[0],
+        )
 
     if not endpoints:
         log.error(

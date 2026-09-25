@@ -18,12 +18,24 @@ from pathlib import Path
 
 __all__ = [
     "PathContainmentError",
+    "RunIdError",
+    "check_run_id",
     "find_repo_root",
     "default_data_dir",
     "assert_outside_repo",
     "Paths",
     "resolve_paths",
 ]
+
+
+class RunIdError(ValueError):
+    """Raised when a run id is not usable as a single path segment.
+
+    Its own type rather than a bare ``ValueError`` so a caller can turn it into
+    a refusal with a message, instead of it escaping as a traceback. The CLI
+    needs exactly that: a mistyped ``--run-id`` is bad usage, and bad usage is
+    exit code 2 with a sentence, not a stack trace about a string.
+    """
 
 
 class PathContainmentError(ValueError):
@@ -99,12 +111,73 @@ class Paths:
         return self
 
     def run_dir(self, run_id: str) -> Path:
-        """Per-run state directory. Separate run ids never share a checkpoint."""
-        if not run_id or "/" in run_id or "\\" in run_id or run_id in {".", ".."}:
-            raise ValueError(f"run_id must be a single safe path segment, got {run_id!r}")
+        """Per-run state directory. Separate run ids never share a checkpoint.
+
+        Creates the directory as a side effect, so the check runs first and
+        separately: a caller that wants to know whether an id is usable cannot
+        get that answer from a function that has already made a directory for
+        it. See :func:`check_run_id`.
+        """
+        check_run_id(run_id)
         path = self.state_dir / run_id
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+
+def check_run_id(run_id: str) -> str:
+    """Refuse a run id that is not one safe path segment. Returns it unchanged.
+
+    **Refused, never repaired.** A sanitised id points at a *different run's*
+    directory, and the consequence of resuming the wrong run is double-reporting
+    a target whose report already landed -- which is the one outcome this whole
+    design exists to prevent. So there is no replacement character, no
+    stripping, no "best effort" branch: an id that needs fixing is an id the
+    operator fixes.
+
+    The rules, and the reason each is here rather than assumed:
+
+    * **Non-empty, and not ``.`` or ``..``** -- both are directories that
+      already exist, and both would silently reuse a different run's state.
+    * **No ``/`` or ``\\``** -- a separator turns one segment into a tree, and
+      on Windows ``a\\b`` is the same as ``a/b`` while on POSIX it is a
+      perfectly legal *filename*. Checking both keeps a config portable between
+      the two, which matters because a run started on one platform and resumed
+      on another would otherwise diverge.
+    * **No leading or trailing space, and no trailing dot** -- Windows silently
+      strips both, so ``"r1 "`` and ``"r1."`` address the same directory that
+      ``"r1"`` does. Three ids, one checkpoint. The refusal is the only thing
+      that stops the second and third from being read as a settled run.
+    * **No control characters** -- they are invisible in a terminal, in a log
+      line, and in a directory listing, so a corrupted id is undiagnosable
+      exactly when it is most expensive to debug.
+    * **No NUL** -- rejected by the OS on write, which is a late and confusing
+      failure for something knowable here.
+    """
+    if not run_id:
+        raise RunIdError("a run id cannot be empty")
+    if run_id in {".", ".."}:
+        raise RunIdError(
+            f"a run id of {run_id!r} is a directory that already exists, so it "
+            "would reuse another run's state. Pass an explicit id."
+        )
+    if "/" in run_id or "\\" in run_id:
+        raise RunIdError(
+            f"a run id cannot contain a path separator, got {run_id!r}. A run id "
+            "is one directory name; the state directory is already chosen for you."
+        )
+    if run_id != run_id.strip() or run_id.endswith("."):
+        raise RunIdError(
+            f"a run id cannot begin or end with a space, or end with a dot: "
+            f"{run_id!r}. Windows strips both, so it would address a different "
+            "directory than it looks like."
+        )
+    if any(ord(char) < 32 or ord(char) == 127 for char in run_id):
+        raise RunIdError(
+            f"a run id cannot contain control characters: {run_id!r}. They are "
+            "invisible in a log and in a directory listing, so a corrupted id "
+            "cannot be diagnosed after the fact."
+        )
+    return run_id
 
 
 def resolve_paths(data_dir: str | Path | None = None) -> Paths:

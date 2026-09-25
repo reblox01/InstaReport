@@ -8,7 +8,15 @@
 #   export IG_SESSIONID_ALPHA='...'              # keep secrets out of the file
 
 data_dir = "~/.insta-report"          # must be OUTSIDE the working tree
-anchors_path = "insta_report/data/anchors.toml"
+
+# Every path in this file is resolved relative to THIS file, not to the
+# directory you happen to run from. A config that means different things in
+# different shells has a blast radius the operator never wrote down.
+#
+# anchors_path is omitted on purpose: the anchors ship inside the package and
+# the default finds them wherever it is installed. Only set this to point at
+# your own copy, and then use an absolute path.
+# anchors_path = "/absolute/path/to/anchors.toml"
 
 [accounts.alpha]
 username = "your.reporting.account"
@@ -55,3 +63,43 @@ enabled = false
 # mobile_user_agent = "Instagram 3xx.y.z Android (24/7.0; 640dpi; 1440x2560; samsung; SM-G930F; herolte; samsungexynos8890; en_US; 138226743)"
 # web_user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 # app_id = "936619743392459"
+
+# ---------------------------------------------------------------------------
+# How a run is scheduled. Every value here is overridable per invocation
+# (insta-report run --max-reports 3 --horizon-hours 1); the file is the
+# durable default, so "what did the flag do" and "what did the file say"
+# stay separately answerable.
+# ---------------------------------------------------------------------------
+[run]
+# A ceiling on dispatches, NOT on targets. 0 means "no ceiling", which the
+# CLI allows but never defaults to: an uncapped run's blast radius is
+# whatever the account's daily budget happens to be.
+max_reports = 100
+horizon_hours = 6                     # attended run (D12), hours
+transient_retries = 2                 # per target, per channel
+backoff_seconds = 5                   # multiplied by the attempt number
+exit_rotations = 2                    # replace an expired exit before blaming the channel
+channel_failure_threshold = 3         # consecutive no-dispatch failures before a channel is retired
+# max_concurrent omitted => [browser] max_concurrent. One number for "how many
+# sessions at once", not two that can disagree.
+# max_concurrent = 2
+
+# -- pacing ----------------------------------------------------------------
+# The gap before the next report is derived from how much of the budget is
+# left and how much of the horizon is left, so an account slows down before it
+# stops instead of hitting a wall. floor_gap_seconds is the floor of that
+# arithmetic, not a target: the tool sends further apart than this as the
+# budget runs down. It cannot be set below 8s, which is the hard minimum
+# because a burst is the shape of a challenge.
+floor_gap_seconds = 30
+jitter_fraction = 0.25                # 0..1, randomness on top of the derived gap
+horizon_fraction = 0.85               # per-step damping factor, NOT a utilisation target.
+                                     # It compounds, because the gap is recomputed
+                                     # against a shrinking horizon at each step.
+
+# -- narrative -------------------------------------------------------------
+# Reports are filed under whatever category the live dialog offers, chosen
+# from these as a hint. An empty seed is already deterministic; set one only
+# to hold a rotation stable across runs against different target files.
+narrative_seed = ""
+max_detail_length = 400               # characters of note sent with a report

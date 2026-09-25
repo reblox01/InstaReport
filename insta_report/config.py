@@ -32,6 +32,7 @@ __all__ = [
     "BrowserConfig",
     "ApiConfig",
     "AnchorsConfig",
+    "RunConfig",
     "Config",
     "load_config",
 ]
@@ -96,12 +97,69 @@ class AnchorsConfig:
 
 
 @dataclass(frozen=True)
+class RunConfig:
+    """How a run is scheduled, and how loudly it narrates.
+
+    Split from the runner's own :class:`~insta_report.runner.RunOptions` on
+    purpose. ``RunOptions`` is per-invocation and the CLI builds it from these
+    values plus the flags; this is the durable half an operator edits once. The
+    two are kept separate so "what did the flag do" and "what did the file say"
+    are answerable separately, which is the same reason ``plan()`` and the run
+    share their work-queue computation instead of each having its own idea.
+    """
+
+    #: Hard cap on dispatches for one run. ``None`` means "spend the budget",
+    #: which the CLI allows but never defaults to: a run with no ceiling is a
+    #: run whose blast radius is whatever the account's daily budget happens to
+    #: be, decided by a file the operator may not remember editing.
+    max_reports: int | None = 100
+    #: Wall time after which no new work starts. An attended run (D12): a stop
+    #: condition, not a schedule to fill.
+    horizon_hours: float = 6.0
+    transient_retries: int = 2
+    backoff_seconds: float = 5.0
+    #: Times an expired exit is replaced before the channel is blamed for it.
+    exit_rotations: int = 2
+    channel_failure_threshold: int = 3
+    #: ``None`` defers to ``[browser] max_concurrent``, which is the ceiling the
+    #: browser can actually honour. A separate number here would be a second
+    #: source of truth for "how many sessions at once".
+    max_concurrent: int | None = None
+
+    # -- pacing ----------------------------------------------------------
+    # Defaults are :data:`insta_report.pacing.PacingConfig`'s, restated here so
+    # the example config can show an operator the whole surface. Validated
+    # against MIN_GAP_SECONDS and MAX_GAP_SECONDS on load: a floor below the
+    # hard minimum is silently raised by the pacer, and a config that reads as
+    # "send every 2 seconds" while the tool sends every 8 is a lie in a file.
+    floor_gap_seconds: float = 30.0
+    jitter_fraction: float = 0.25
+    #: Per-step damping factor, NOT the fraction of the horizon the run will
+    #: use. It compounds, because the gap is recomputed against a shrinking
+    #: horizon each step. See :class:`insta_report.pacing.PacingConfig`.
+    horizon_fraction: float = 0.85
+
+    # -- narrative -------------------------------------------------------
+    #: Extra string mixed into narrative selection so a retried target produces
+    #: byte-identical text. Empty means "derive from the target", which is
+    #: already deterministic; setting it is for an operator who needs the same
+    #: rotation to hold across a re-run of a different target file.
+    narrative_seed: str = ""
+    max_detail_length: int = 400
+
+    @property
+    def horizon_seconds(self) -> float:
+        return self.horizon_hours * 3600.0
+
+
+@dataclass(frozen=True)
 class Config:
     accounts: tuple[AccountConfig, ...]
     proxies: ProxyConfig
     browser: BrowserConfig
     api: ApiConfig
     anchors: AnchorsConfig
+    run: RunConfig
     paths: Paths
     source_path: Path
 
@@ -143,6 +201,31 @@ class _Reader:
         if required and not value.strip():
             raise ConfigError(f"{self._where(key)} must not be empty")
         return value
+
+    def float_(
+        self,
+        key: str,
+        default: float,
+        *,
+        minimum: float | None = None,
+        maximum: float | None = None,
+    ) -> float:
+        if key not in self._table:
+            return default
+        value = self._table[key]
+        # A TOML integer is a perfectly reasonable thing to write for a
+        # seconds-valued key, and rejecting it would make `backoff_seconds = 5`
+        # an error that reads like a typo when it is not.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigError(
+                f"{self._where(key)} must be a number, got {type(value).__name__}"
+            )
+        number = float(value)
+        if minimum is not None and number < minimum:
+            raise ConfigError(f"{self._where(key)} must be >= {minimum}, got {number}")
+        if maximum is not None and number > maximum:
+            raise ConfigError(f"{self._where(key)} must be <= {maximum}, got {number}")
+        return number
 
     def int_(self, key: str, default: int, *, minimum: int | None = None) -> int:
         if key not in self._table:
@@ -258,6 +341,62 @@ def _load_browser(reader: _Reader, paths: Paths) -> BrowserConfig:
     )
 
 
+def _load_run(reader: _Reader) -> RunConfig:
+    """Read ``[run]``.
+
+    The pacing numbers are validated against the pacer's own constants here
+    rather than inside the pacer, because the failure an operator needs to see
+    is "your config says 2 seconds and the tool will use 8", and that is a
+    config error. A silent clamp to the floor would leave a file that reads one
+    way and behaves another, which is the class of bug this project exists to
+    stop committing.
+    """
+    from .pacing import MAX_GAP_SECONDS, MIN_GAP_SECONDS
+
+    max_reports_raw = reader.int_("max_reports", 100, minimum=0)
+    floor_gap = reader.float_("floor_gap_seconds", 30.0, minimum=0.0)
+    if floor_gap < MIN_GAP_SECONDS:
+        raise ConfigError(
+            f"[run] floor_gap_seconds={floor_gap} is below the hard minimum of "
+            f"{MIN_GAP_SECONDS:.0f}s. Two reports are never sent closer than that "
+            "because a burst is the shape of a challenge; raise the floor rather "
+            "than the tool ignoring you."
+        )
+    if floor_gap > MAX_GAP_SECONDS:
+        raise ConfigError(
+            f"[run] floor_gap_seconds={floor_gap} is above MAX_GAP_SECONDS="
+            f"{MAX_GAP_SECONDS:.0f}s, so every gap would be clamped down to a value "
+            "your config did not ask for. Lower it, or raise the cap deliberately."
+        )
+    jitter = reader.float_("jitter_fraction", 0.25, minimum=0.0, maximum=1.0)
+    horizon_fraction = reader.float_("horizon_fraction", 0.85, minimum=0.01, maximum=0.99)
+
+    # None rather than a default, so the CLI can tell "not set here" from "set
+    # to the same number the browser section would have said". The alternative
+    # -- a duplicated default in two places that must be kept in step -- is
+    # exactly how a config ends up with two max_concurrent values that disagree.
+    max_concurrent: int | None = None
+    if "max_concurrent" in reader.raw:
+        max_concurrent = reader.int_("max_concurrent", 1, minimum=1)
+
+    return RunConfig(
+        # 0 is the one value that means "no ceiling" rather than "no reports",
+        # because `max_reports = 0` is never a thing an operator means to type.
+        max_reports=None if max_reports_raw == 0 else max_reports_raw,
+        horizon_hours=reader.float_("horizon_hours", 6.0, minimum=0.01, maximum=168.0),
+        transient_retries=reader.int_("transient_retries", 2, minimum=0),
+        backoff_seconds=reader.float_("backoff_seconds", 5.0, minimum=0.0),
+        exit_rotations=reader.int_("exit_rotations", 2, minimum=0),
+        channel_failure_threshold=reader.int_("channel_failure_threshold", 3, minimum=1),
+        max_concurrent=max_concurrent,
+        floor_gap_seconds=floor_gap,
+        jitter_fraction=jitter,
+        horizon_fraction=horizon_fraction,
+        narrative_seed=reader.str_("narrative_seed") or "",
+        max_detail_length=reader.int_("max_detail_length", 400, minimum=1),
+    )
+
+
 def _load_api(reader: _Reader) -> ApiConfig:
     enabled = reader.bool_("enabled", False)
     mobile_ua = reader.str_("mobile_user_agent")
@@ -288,6 +427,53 @@ def _load_api(reader: _Reader) -> ApiConfig:
     )
 
 
+#: Every path a config may name, as ``(section, key)`` where a section of ``""``
+#: is the root table. Listed rather than discovered, because a path that is
+#: resolved against the wrong base is a path that means something different in
+#: a different directory -- and the whole point of naming them here is that the
+#: list is short enough to be checked by reading it.
+CONFIG_PATH_KEYS: tuple[tuple[str, str], ...] = (
+    ("", "data_dir"),
+    ("", "anchors_path"),
+    ("proxies", "file_path"),
+    ("browser", "user_data_dir"),
+)
+
+
+def _absolutise_paths(data: dict[str, Any], base: Path) -> None:
+    """Rewrite every relative path in *data* so it is relative to *base*.
+
+    Relative to the **config file's directory**, not the working directory.
+
+    ```
+        ~/tools/insta-report/
+          config.toml        <- says  file_path = "proxies.txt"
+          proxies.txt        <- what the operator meant
+
+        $ cd /tmp && insta-report run --config ~/tools/insta-report/config.toml
+        cwd-relative:  /tmp/proxies.txt          (not found, or worse: found)
+        config-relative: ~/tools/insta-report/proxies.txt   (what was meant)
+    ```
+
+    The failure this prevents is not a crash. It is a run that picks up a
+    *different* proxy list, a different data directory or a different browser
+    profile depending on which shell it was launched from, and therefore a run
+    whose blast radius depends on something the operator never wrote down.
+    Absolute paths are left alone, so nothing that already worked changes.
+    """
+    for section, key in CONFIG_PATH_KEYS:
+        table = data if section == "" else data.get(section)
+        if not isinstance(table, dict) or key not in table:
+            continue
+        raw = table[key]
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        candidate = Path(raw).expanduser()
+        if candidate.is_absolute():
+            continue
+        table[key] = str((base / candidate).resolve())
+
+
 def load_config(path: str | Path) -> Config:
     """Read, validate, and register secrets for a config file."""
     config_path = Path(path).expanduser().resolve()
@@ -300,6 +486,8 @@ def load_config(path: str | Path) -> Config:
         except tomllib.TOMLDecodeError as exc:
             raise ConfigError(f"{config_path} is not valid TOML: {exc}") from exc
 
+    _absolutise_paths(data, config_path.parent)
+
     root = _Reader(data, "")
     paths = resolve_paths(root.path_("data_dir"))
 
@@ -309,6 +497,7 @@ def load_config(path: str | Path) -> Config:
     proxies = _load_proxies(root.table("proxies"))
     browser = _load_browser(root.table("browser"), paths)
     api = _load_api(root.table("api"))
+    run = _load_run(root.table("run"))
     anchors = AnchorsConfig(
         path=root.path_("anchors_path", Path(__file__).parent / "data" / "anchors.toml")
     )
@@ -320,6 +509,13 @@ def load_config(path: str | Path) -> Config:
             "account, so this semaphore can never be satisfied. Add accounts or lower it."
         )
 
+    if run.max_concurrent is not None and run.max_concurrent > len(accounts):
+        raise ConfigError(
+            f"[run] max_concurrent={run.max_concurrent} exceeds the "
+            f"{len(accounts)} configured account(s). The workers are bounded by "
+            "eligible accounts anyway, so this number can only be wrong."
+        )
+
     paths.ensure()
 
     return Config(
@@ -328,6 +524,7 @@ def load_config(path: str | Path) -> Config:
         browser=browser,
         api=api,
         anchors=anchors,
+        run=run,
         paths=paths,
         source_path=config_path,
     )

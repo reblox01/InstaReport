@@ -1596,12 +1596,12 @@ class BrowserChannel:
     async def aclose(self) -> None:
         """Release the browser. Part of the runner's channel protocol.
 
-        Thin on purpose. :meth:`PageDriver.close` is already synchronous and
-        already idempotent, and a second shutdown path here would be a second
-        place for the "did we actually stop the browser" question to be answered
-        differently from the one in the driver.
+        Delegates straight to the driver rather than adding a second shutdown
+        path: there is already exactly one place that answers "did we actually
+        stop the browser", and duplicating it here is how the two drift apart
+        and one of them starts leaking a process.
         """
-        self.driver.close()
+        await self.driver.close()
 
     async def _capture_evidence(
         self,
