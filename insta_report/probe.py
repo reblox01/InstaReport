@@ -1,0 +1,498 @@
+"""T0: the discriminating probe.
+
+Everything about the API channel is currently unobservable. The first probe
+returned 429 with zero bytes, which flags the source IP. Every later probe came
+from that same burned address, and a 404 from ``i.instagram.com`` without a
+valid ``Authorization`` header is indistinguishable between three very
+different worlds:
+
+    1. the route is gone
+    2. the route exists and this is the right response
+    3. the request never got far enough to mean anything
+
+The wrong conclusion was drawn from this earlier: "the endpoints are gone."
+The honest conclusion is "unobservable from a burned IP." The API channel
+(decision D5) is gated on resolving that, and this module is the resolution.
+
+**The control call is the whole design.** A known-good authenticated request to
+the *same host* runs first, from the *same* exit. If the control does not answer,
+the probe reports ``INCONCLUSIVE`` and refuses to interpret anything else --
+because a 404 next to a failed control tells you about your proxy, not about
+Instagram. Skipping the control is the specific mistake that produced the
+original wrong answer, so it is not optional and not skippable by flag.
+
+Run it with::
+
+    python -m insta_report.probe --config ~/insta-report.toml
+
+It reads proxies from the config's ``[proxies]`` section and requires a
+``[probe]`` section naming the control. It reports, it never acts: no target is
+reported, nothing is written to a checkpoint, no account is touched.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import sys
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable, Iterable, Mapping, Sequence
+
+import httpx
+
+from .outcomes import NetworkVerdict, classify_network
+from .support.redaction import get_registry
+
+__all__ = [
+    "ProbeVerdict",
+    "ProbeResult",
+    "ProbeReport",
+    "run_probe",
+    "DEFAULT_PROBES",
+]
+
+log = logging.getLogger(__name__)
+
+DEFAULT_TIMEOUT = 20.0
+
+#: Only a last-resort default. Real user agents live in the config, because
+#: Instagram's accepted strings move and a pinned default goes stale silently.
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+class ProbeVerdict(str, Enum):
+    """What a probe run can honestly conclude."""
+
+    #: Control answered and the endpoint answered readably. A real signal.
+    OBSERVABLE = "observable"
+    #: Control answered, endpoint gave something readable that is not success.
+    #: The route exists; the request was refused or the shape is wrong.
+    ANSWERED_NOT_OK = "answered_not_ok"
+    #: Control answered, endpoint returned nothing interpretable. Cannot say
+    #: whether the route exists.
+    UNOBSERVABLE = "unobservable"
+    #: The control itself failed. Nothing else in this run means anything.
+    #: This is the outcome a burned IP produces, and it is the one that caused
+    #: the original misdiagnosis.
+    INCONCLUSIVE = "inconclusive"
+
+
+@dataclass
+class ProbeResult:
+    """One HTTP call and everything needed to judge it."""
+
+    name: str
+    url: str
+    status: int | None = None
+    body: str = ""
+    content_type: str | None = None
+    elapsed_ms: int = 0
+    egress_ip: str | None = None
+    error: str | None = None
+    #: Snippet of the body, redacted, for a human to eyeball.
+    excerpt: str = ""
+
+    @property
+    def network_verdict(self) -> NetworkVerdict:
+        return classify_network(
+            status=self.status,
+            body=self.body,
+            content_type=self.content_type,
+            timed_out=self.error == "timeout",
+        )
+
+    def to_row(self) -> dict[str, Any]:
+        return {
+            "probe": self.name,
+            "status": self.status,
+            "bytes": len(self.body),
+            "content_type": self.content_type,
+            "elapsed_ms": self.elapsed_ms,
+            "egress_ip": self.egress_ip,
+            "network_verdict": self.network_verdict.value,
+            "error": self.error,
+        }
+
+
+@dataclass
+class ProbeReport:
+    """A full run: one exit, one control, N probes."""
+
+    exit_ip: str | None
+    control: ProbeResult | None
+    results: list[ProbeResult] = field(default_factory=list)
+
+    @property
+    def control_ok(self) -> bool:
+        """Did the known-good call answer readably?
+
+        The single gate. False means every other row is noise.
+        """
+        if self.control is None:
+            return False
+        return self.control.network_verdict is NetworkVerdict.OK
+
+    @property
+    def verdict(self) -> ProbeVerdict:
+        if not self.control_ok:
+            return ProbeVerdict.INCONCLUSIVE
+        verdicts = {r.network_verdict for r in self.results}
+        if not verdicts:
+            return ProbeVerdict.UNOBSERVABLE
+        if verdicts <= {NetworkVerdict.OK, NetworkVerdict.REJECTED}:
+            # Every route answered with something readable. The endpoints are
+            # real, which is the question D5 was gated on.
+            return (
+                ProbeVerdict.OBSERVABLE
+                if NetworkVerdict.OK in verdicts
+                else ProbeVerdict.ANSWERED_NOT_OK
+            )
+        return ProbeVerdict.UNOBSERVABLE
+
+    def summary(self) -> str:
+        lines = [
+            f"exit ip          : {self.exit_ip or 'unknown'}",
+            f"control          : {_control_line(self.control)}",
+            f"OVERALL VERDICT  : {self.verdict.value.upper()}",
+            "",
+            f"{'probe':<22} {'status':>7} {'bytes':>7} {'ms':>6}  verdict",
+            "-" * 62,
+        ]
+        for result in self.results:
+            lines.append(
+                f"{result.name:<22} {str(result.status or '-'):>7} "
+                f"{len(result.body):>7} {result.elapsed_ms:>6}  "
+                f"{result.network_verdict.value}"
+            )
+        lines.append("")
+        lines.append(_interpretation(self.verdict))
+        return "\n".join(lines)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "egress_ip": self.exit_ip,
+            "control_ok": self.control_ok,
+            "verdict": self.verdict.value,
+            "control": self.control.to_row() if self.control else None,
+            "results": [r.to_row() for r in self.results],
+        }
+
+
+def _control_line(control: ProbeResult | None) -> str:
+    if control is None:
+        return "NOT RUN -- this is why the run is inconclusive"
+    return (
+        f"{control.status} {len(control.body)}B "
+        f"{control.network_verdict.value} "
+        f"({control.elapsed_ms}ms)"
+        + (f" error={control.error}" if control.error else "")
+    )
+
+
+def _interpretation(verdict: ProbeVerdict) -> str:
+    if verdict is ProbeVerdict.INCONCLUSIVE:
+        return (
+            "INCONCLUSIVE. The known-good control call did not answer, so these\n"
+            "results say nothing about whether the routes exist. The usual cause is a\n"
+            "flagged source IP -- an earlier probe returned 429 with zero bytes, which\n"
+            "is what flags one. Re-run from clean residential exits. Do not conclude\n"
+            "the endpoints are gone; that was the original misdiagnosis."
+        )
+    if verdict is ProbeVerdict.OBSERVABLE:
+        return (
+            "OBSERVABLE. The control answered and at least one route answered\n"
+            "readably, from the same exit. The mobile API channel is real and worth\n"
+            "building. Re-run from a second clean exit before committing, in case this\n"
+            "one is unusual."
+        )
+    if verdict is ProbeVerdict.ANSWERED_NOT_OK:
+        return (
+            "ANSWERED, NOT OK. Every route returned something readable that is not a\n"
+            "success. The routes exist. Whether the request is shaped correctly is a\n"
+            "separate question this probe does not answer -- it makes no authenticated\n"
+            "report call against a real target."
+        )
+    return (
+        "UNOBSERVABLE. The control answered, but the routes returned nothing this can\n"
+        "read. That is consistent with a moved route and with a shape we are sending\n"
+        "wrong. It is not evidence of absence."
+    )
+
+
+# --- probe definitions ------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Probe:
+    """One request to make. Read-only by construction -- no report is filed."""
+
+    name: str
+    url: str
+    method: str = "GET"
+    headers: Mapping[str, str] = field(default_factory=dict)
+    body: str | None = None
+
+
+#: Endpoints whose liveness T0 is trying to establish. Deliberately read-only:
+#: nothing here submits a report, so a run cannot harm a target.
+DEFAULT_PROBES: tuple[Probe, ...] = (
+    Probe(
+        name="web_profile_info",
+        url="https://i.instagram.com/api/v1/users/web_profile_info/?username={username}",
+    ),
+    Probe(
+        name="mobile_user_by_name",
+        url="https://i.instagram.com/api/v1/users/web_profile_info/?username={username}",
+        headers={"X-IG-App-ID": "936619743392459"},
+    ),
+    Probe(
+        name="flag_user",
+        url="https://www.instagram.com/api/v1/users/{user_id}/flag_user/",
+        method="POST",
+        body="source_name=profile",
+    ),
+    Probe(
+        name="profile_html",
+        url="https://www.instagram.com/{username}/",
+    ),
+    Probe(
+        name="root",
+        url="https://www.instagram.com/",
+    ),
+)
+
+
+def _egress_ip(client: httpx.Client, timeout: float) -> str | None:
+    """The address the world sees, so a 'clean exit' claim can be checked.
+
+    A proxy pool that silently hands back the same flagged address is the reason
+    the original probe burned itself, and it is invisible without asking.
+    """
+    for service in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        try:
+            response = client.get(service, timeout=timeout)
+            if response.status_code == 200:
+                candidate = response.text.strip()
+                if candidate:
+                    return candidate
+        except httpx.HTTPError:
+            continue
+    return None
+
+
+def _do(
+    client: httpx.Client, probe: Probe, substitutions: Mapping[str, str]
+) -> ProbeResult:
+    """Execute one probe and record what came back."""
+    url = probe.url
+    for key, value in substitutions.items():
+        url = url.replace("{" + key + "}", value)
+
+    headers = dict(probe.headers)
+    # Registered secrets are scrubbed from anything surfaced to a human.
+    for key, value in list(headers.items()):
+        headers[key] = get_registry().scrub(value)
+
+    result = ProbeResult(name=probe.name, url=url)
+    started = time.monotonic()
+    try:
+        response = client.request(
+            probe.method,
+            url,
+            headers=headers,
+            content=probe.body,
+        )
+        result.status = response.status_code
+        result.body = response.text
+        result.content_type = response.headers.get("content-type")
+    except httpx.TimeoutException:
+        result.error = "timeout"
+    except httpx.HTTPError as exc:
+        result.error = type(exc).__name__
+        log.debug("probe %s failed: %s", probe.name, exc)
+    result.elapsed_ms = int((time.monotonic() - started) * 1000)
+    result.excerpt = get_registry().scrub(result.body[:200]).replace("\n", " ")
+    return result
+
+
+def run_probe(
+    *,
+    proxy: str | None,
+    control_url: str,
+    probes: Sequence[Probe] = DEFAULT_PROBES,
+    substitutions: Mapping[str, str] | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    user_agent: str = DEFAULT_USER_AGENT,
+    extra_headers: Mapping[str, str] | None = None,
+) -> ProbeReport:
+    """Run the control, then the probes, from a single exit.
+
+    Order matters and is not rearranged: the control establishes that this exit
+    can get a readable answer at all. Running the probes first and checking the
+    control afterwards would let a burned IP produce four confident-looking 404s
+    and one failure, and the four are the ones that mislead.
+    """
+    subs = dict(substitutions or {})
+    headers = {"User-Agent": user_agent, **dict(extra_headers or {})}
+
+    with httpx.Client(
+        proxy=proxy,
+        timeout=timeout,
+        follow_redirects=True,
+        headers=headers,
+    ) as client:
+        report = ProbeReport(exit_ip=_egress_ip(client, timeout), control=None)
+
+        control = Probe(
+            name="CONTROL (known-good)",
+            url=control_url,
+            headers=dict(extra_headers or {}),
+        )
+        report.control = _do(client, control, subs)
+
+        if not report.control_ok:
+            log.error(
+                "control call failed (status=%s verdict=%s error=%s); "
+                "remaining probes will be run for completeness but their results "
+                "cannot be interpreted",
+                report.control.status,
+                report.control.network_verdict.value,
+                report.control.error,
+            )
+
+        report.results = [_do(client, probe, subs) for probe in probes]
+        return report
+
+
+def run_across_exits(
+    exits: Iterable[str | None],
+    **kwargs: Any,
+) -> list[ProbeReport]:
+    """Same probe from several addresses.
+
+    One exit is an anecdote. The T0 decision needs at least two clean
+    residential addresses, because a single unusual exit is exactly what a
+    burned IP looks like from the inside.
+    """
+    return [run_probe(proxy=exit, **kwargs) for exit in exits]
+
+
+# --- entry point ------------------------------------------------------------
+
+#: Authenticated, read-only, and known to answer when credentials are good. This
+#: is the control: if it does not answer, nothing else in the run means anything.
+DEFAULT_CONTROL_URL = "https://i.instagram.com/api/v1/accounts/current_v2/"
+
+#: A username the operator controls. Probing an account you do not own is both
+#: rude and less informative, since a genuine block looks like a missing one.
+DEFAULT_PROBE_USERNAME = "instagram"
+
+
+def _main(argv: Sequence[str] | None = None) -> int:
+    import argparse
+
+    from .config import ConfigError, load_config
+    from .support.logging import setup_logging
+
+    parser = argparse.ArgumentParser(
+        prog="python -m insta_report.probe",
+        description=(
+            "Decide whether the mobile API channel is observable. Reports only; "
+            "files no reports and touches no target's state."
+        ),
+    )
+    parser.add_argument(
+        "--config", required=True, type=Path, help="path to the operator config"
+    )
+    parser.add_argument(
+        "--control",
+        default=DEFAULT_CONTROL_URL,
+        help="known-good authenticated URL used to prove the exit works",
+    )
+    parser.add_argument(
+        "--username",
+        default=DEFAULT_PROBE_USERNAME,
+        help="an account you control, used as the {username} substitution",
+    )
+    parser.add_argument(
+        "--proxy",
+        action="append",
+        default=[],
+        metavar="URL",
+        help="repeat per exit; omit to probe the direct connection",
+    )
+    parser.add_argument(
+        "--account",
+        help="account ref supplying the sessionid for the control call",
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON, not a table")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    args = parser.parse_args(argv)
+
+    setup_logging(verbose=False)
+
+    try:
+        config = load_config(args.config)
+    except (ConfigError, OSError) as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 2
+
+    accounts = [a for a in config.accounts if a.enabled]
+    if not accounts:
+        print("no enabled accounts in config", file=sys.stderr)
+        return 2
+    chosen = next((a for a in accounts if a.ref == args.account), accounts[0])
+
+    # Reading sessionid here is what registers it with the redactor, so any
+    # excerpt printed below has already been scrubbed.
+    headers = {"Cookie": f"sessionid={chosen.sessionid}"}
+    if config.api.app_id:
+        headers["X-IG-App-ID"] = config.api.app_id
+
+    exits: list[str | None] = list(args.proxy) or [None]
+    if len(exits) < 2:
+        print(
+            f"warning: probing {len(exits)} exit. The T0 decision needs at least "
+            "two clean residential addresses -- pass --proxy more than once.",
+            file=sys.stderr,
+        )
+
+    reports = run_across_exits(
+        exits,
+        control_url=args.control,
+        substitutions={"username": args.username},
+        timeout=args.timeout,
+        user_agent=(
+            config.api.mobile_user_agent
+            or config.api.web_user_agent
+            or DEFAULT_USER_AGENT
+        ),
+        extra_headers=headers,
+    )
+
+    if args.json:
+        print(json.dumps([r.to_json() for r in reports], indent=2))
+    else:
+        for index, report in enumerate(reports):
+            if len(reports) > 1:
+                print(f"\n{'=' * 64}\nEXIT {index + 1} of {len(reports)}\n{'=' * 64}")
+            print(report.summary())
+
+    # Exit code mirrors the strongest signal seen: 0 only if some exit was
+    # OBSERVABLE, which is the only outcome that unblocks building the channel.
+    best = {r.verdict for r in reports}
+    if ProbeVerdict.OBSERVABLE in best:
+        return 0
+    if ProbeVerdict.ANSWERED_NOT_OK in best:
+        return 1
+    return 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

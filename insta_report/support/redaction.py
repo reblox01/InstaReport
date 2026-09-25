@@ -122,22 +122,92 @@ def scrub(text: str) -> str:
 
 
 class RedactingFilter(logging.Filter):
-    """Scrubs ``record.msg`` and ``record.args`` before any handler sees them."""
+    """Scrubs ``record.msg`` and ``record.args`` before any handler sees them.
+
+    Kept as defence in depth, but note what it does **not** cover: a filter
+    attached to a logger only runs for records logged to that logger directly.
+    Records from ``logging.getLogger("insta_report.probe")`` propagate to the
+    root's handlers without passing through the root's filters, so a filter
+    here alone would miss essentially every record this project emits. That is
+    why :func:`install_record_factory` exists -- see its docstring.
+    """
 
     def __init__(self, registry: SecretRegistry | None = None) -> None:
         super().__init__()
         self._registry = registry or get_registry()
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.msg, str):
-            record.msg = self._registry.scrub(record.msg)
-        if record.args:
-            if isinstance(record.args, dict):
-                record.args = self._registry.scrub_any(record.args)
-            else:
-                record.args = tuple(self._registry.scrub_any(a) for a in record.args)
+        _scrub_record(record, self._registry)
         # True: redaction must never silently drop a log record.
         return True
+
+
+def _scrub_record(record: logging.LogRecord, registry: SecretRegistry) -> None:
+    """Mutate a record's message and arguments in place, in place-safe order.
+
+    ``args`` may be a mapping, a tuple, or a single non-tuple value; logging
+    accepts all three. ``record.msg`` is scrubbed before ``args`` so a secret
+    embedded in the format string is caught even when no args are supplied.
+    """
+    if isinstance(record.msg, str):
+        record.msg = registry.scrub(record.msg)
+    if record.args:
+        if isinstance(record.args, dict):
+            record.args = registry.scrub_any(record.args)
+        else:
+            record.args = tuple(registry.scrub_any(a) for a in record.args)
+
+
+def install_record_factory(registry: SecretRegistry | None = None) -> None:
+    """Scrub every LogRecord in the process at the moment it is created.
+
+    ``logging.setLogRecordFactory`` is the only choke point that genuinely
+    covers everything. Two facts about the standard library make the usual
+    approaches insufficient:
+
+    * A ``Filter`` on a logger runs only for records logged to that logger.
+      Child loggers propagate to ancestors' *handlers* without passing through
+      ancestors' *filters*, so a root filter misses every record emitted by a
+      named module -- which is all of them.
+    * A ``Handler`` filter runs, but only for handlers that carry it. Any
+      handler added later, by a library or by a future line of this project,
+      would arrive unfiltered.
+
+    Installing at the factory means the record is already clean before any
+    logger, filter, or handler in the process can observe it. The handler in
+    :func:`install_redaction` that captures the wrong secret is now impossible
+    by construction rather than by convention.
+
+    Idempotent, and reversible with :func:`uninstall_record_factory`, which
+    tests need in order not to leak a wrapped factory into other test files.
+    """
+    reg = registry or get_registry()
+    previous = _FACTORY_STATE["previous"]
+    if previous is not None and _FACTORY_STATE["registry"] is reg:
+        return  # already wrapping
+
+    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = previous(*args, **kwargs) if previous else logging.LogRecord(*args, **kwargs)
+        _scrub_record(record, reg)
+        return record
+
+    _FACTORY_STATE["previous"] = factory
+    _FACTORY_STATE["registry"] = reg
+    logging.setLogRecordFactory(factory)
+
+
+def uninstall_record_factory() -> None:
+    """Restore the default factory. Used by tests; harmless elsewhere."""
+    previous = _FACTORY_STATE["previous"]
+    if previous is None:
+        return
+    logging.setLogRecordFactory(_BASE_FACTORY)
+    _FACTORY_STATE["previous"] = None
+    _FACTORY_STATE["registry"] = None
+
+
+_BASE_FACTORY = logging.getLogRecordFactory()
+_FACTORY_STATE: dict[str, Any] = {"previous": None, "registry": None}
 
 
 class ScrubbingFormatter(logging.Formatter):
@@ -168,6 +238,10 @@ def install_redaction(
     """
     target = logger or logging.getLogger()
     reg = registry or get_registry()
+
+    # The factory is the layer that actually covers every record; the filter
+    # below is defence in depth for records built before installation.
+    install_record_factory(reg)
 
     for existing in list(target.filters):
         if isinstance(existing, RedactingFilter):
