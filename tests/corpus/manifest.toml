@@ -1,0 +1,130 @@
+# Golden response corpus
+#
+# Every response shape this tool has been observed to receive, pinned as a
+# file. The point is that the exact bug in igban.py:122 -- HTTP 200 carrying an
+# HTML login shell, treated as success -- is now a test case that cannot be
+# deleted without someone noticing.
+#
+# Each entry records provenance and a capture date. A corpus with no stated
+# provenance is a guess wearing a test's clothes.
+#
+# `verdict` is what classify_network() returns. It is deliberately NOT a
+# TerminalState: the corpus pins the network reader, and test_outcomes.py owns
+# the separate question of how a verdict becomes a report outcome. Collapsing
+# the two would let a policy change masquerade as a response-shape change.
+#
+# REFRESH PROCEDURE
+#   1. Run the tool against a target you control, with artifacts enabled.
+#   2. Copy the raw response body into tests/corpus/<name>.<ext>.
+#   3. Add the case here with content_type, status, and the verdict you
+#      observed it produce.
+#   4. Run pytest tests/test_corpus.py -- the case is asserted, not decorative.
+#
+# Last live capture: 2026-09-25, unauthenticated, from a single IP.
+# CAUTION: that capture began with a 429, which flags the source IP. Every
+# later case from the same run is "unobservable from a burned IP" rather than
+# proof of absence. See the T0 probe, which re-tests from clean exits with a
+# known-good control call.
+
+[meta]
+captured_at = "2026-09-25"
+capture_note = "Single IP, first request returned 429. Statuses below are the observed values, not verified-as-genuine 404s."
+
+# --- the bug itself ---------------------------------------------------------
+
+[[case]]
+name = "browser_200_html_login_shell"
+file = "browser_200_html_login_shell.html"
+source = "POST /frontend_reg/ (the endpoint igban.py posted to)"
+status = 200
+content_type = "text/html; charset=utf-8"
+verdict = "unreadable"
+# NOT "ok". igban.py treated exactly this shape as a completed report.
+why = "Instagram serves the logged-out login page with HTTP 200 for unmatched paths. A 200 here means the path no longer exists, and once dispatched it can only be UNKNOWN."
+
+[[case]]
+name = "browser_200_html_login_shell_no_content_type"
+file = "browser_200_html_login_shell.html"
+source = "same response, Content-Type absent (some edges drop it)"
+status = 200
+content_type = ""
+verdict = "unreadable"
+why = "Same body, no declared type. A classifier that trusts the status code alone still calls this a success."
+
+# --- rate limiting ----------------------------------------------------------
+
+[[case]]
+name = "browser_429_empty"
+file = "browser_429_empty.txt"
+source = "GET /api/v1/users/web_profile_info/"
+status = 429
+content_type = "text/html; charset=utf-8"
+verdict = "unreadable"
+why = "Zero-byte body. The 429 that flagged the source IP, and the reason every later probe from it is uninterpretable."
+
+[[case]]
+name = "browser_429_json_retry_after"
+file = "browser_429_json_retry_after.json"
+source = "mobile API, rate limited with a structured body"
+status = 429
+content_type = "application/json"
+verdict = "rejected"
+why = "Readable, explicit rejection. Distinct from unreadable: we know what Instagram said."
+
+# --- missing ----------------------------------------------------------------
+
+[[case]]
+name = "browser_404_empty"
+file = "browser_404_empty.txt"
+source = "POST /users/{id}/report/"
+status = 404
+content_type = "text/html; charset=utf-8"
+verdict = "unreadable"
+why = "Zero-byte 404. Unreadable in both directions -- indistinguishable from a missing user from a missing route."
+
+# --- structured results -----------------------------------------------------
+
+[[case]]
+name = "api_ok"
+file = "api_ok.json"
+source = "mobile API, success shape"
+status = 200
+content_type = "application/json"
+verdict = "ok"
+why = "The only shape that legitimately reads as accepted. Still describes the request, not the account."
+
+[[case]]
+name = "api_json_fail"
+file = "api_json_fail.json"
+source = "mobile API, structured rejection"
+status = 200
+content_type = "application/json"
+verdict = "rejected"
+why = "HTTP 200 carrying status=fail. A status-code-only classifier calls this success; it is not."
+
+[[case]]
+name = "api_json_fail_5xx"
+file = "api_json_fail_5xx.json"
+source = "mobile API, structured rejection on a 5xx"
+status = 500
+content_type = "application/json"
+verdict = "rejected"
+why = "Readable rejection. Instagram is telling us no, which is different from telling us nothing."
+
+[[case]]
+name = "api_non_json"
+file = "api_non_json.txt"
+source = "mobile API behind a proxy interstitial"
+status = 200
+content_type = "text/html; charset=utf-8"
+verdict = "unreadable"
+why = "A 200 carrying a proxy error page. Health checks that only read the status code pass on this."
+
+[[case]]
+name = "api_non_json_declared_json"
+file = "api_non_json.txt"
+source = "same body, but the edge mislabels it"
+status = 200
+content_type = "application/json"
+verdict = "unreadable"
+why = "Content-Type lies and the body will not parse. Treated as unreadable, never optimistically as ok."

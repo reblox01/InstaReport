@@ -1,0 +1,6 @@
+{
+  "status": "fail",
+  "message": "Report could not be submitted. Try again later.",
+  "error_type": "report_rejected",
+  "spike_is_case_conversion": "default"
+}
