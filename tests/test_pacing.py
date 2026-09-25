@@ -486,14 +486,51 @@ def test_computing_a_gap_never_sleeps_or_reads_the_clock():
 
 def test_the_injected_sleeper_is_the_only_thing_that_waits():
     """A default ``time.sleep`` anywhere else would make tests slow and the
-    schedule un-replayable."""
+    schedule un-replayable.
+
+    Walks the AST rather than counting substrings, because a docstring is
+    allowed to *name* ``time.sleep`` -- the prose explaining why a blocking wait
+    is wrong here must not be mistaken for one. What this forbids is a real
+    reference in executable code, wherever it is nested.
+    """
+    import ast
     import inspect
 
     from insta_report import pacing
 
+    tree = ast.parse(inspect.getsource(pacing))
+
+    # Every ``time.sleep`` reference, with the function it lives in. A default
+    # argument is executable code as far as the AST is concerned, so counting
+    # alone cannot tell an allowed default from a stray call -- the location
+    # can.
+    sites: list[str] = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Attribute)
+            and node.attr == "sleep"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "time"
+        ):
+            continue
+        owner = next(
+            (
+                n.name
+                for n in ast.walk(tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node in ast.walk(n)
+            ),
+            "<module>",
+        )
+        sites.append(owner)
+
+    # Exactly one, and it is the default argument of __init__ -- the seam every
+    # other call site is required to go through. A second one is a real blocking
+    # wait that no test clock controls.
+    assert sites == ["__init__"], (
+        f"time.sleep referenced in {sites}; only the __init__ default is allowed"
+    )
     source = inspect.getsource(pacing)
-    # The only bare time.sleep is the default argument of __init__.
-    assert source.count("time.sleep") == 1
     assert "sleeper: Callable[[float], None] = time.sleep" in source
 
 

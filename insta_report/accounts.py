@@ -34,7 +34,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Callable, Iterable, Iterator
+from typing import Callable, Collection, Iterable, Iterator
 
 from .errors import NoEligibleAccount, ReportBudgetExhausted
 from .outcomes import Outcome, TerminalState
@@ -303,8 +303,24 @@ class AccountPool:
 
     # -- leasing --------------------------------------------------------
 
-    def lease(self, proxy_for: Callable[[Account], str | None] | None = None) -> Lease:
+    def lease(
+        self,
+        proxy_for: Callable[[Account], str | None] | None = None,
+        *,
+        exclude: Collection[str] = (),
+    ) -> Lease:
         """Acquire the least-recently-used eligible account and bind it.
+
+        *exclude* names accounts a concurrent caller already holds. It exists
+        because ``eligible()`` deliberately knows nothing about leases -- an
+        account with a live lease is perfectly healthy -- so two workers leasing
+        back to back both get the same account, and ``max_concurrent`` silently
+        becomes 1 while the operator believes they asked for 3. The runner holds
+        its per-worker accounts in this set.
+
+        The error distinguishes "held by another worker, try again shortly" from
+        "every account is out of budget or quarantined", because the two need
+        opposite handling: one waits, the other stops.
 
         LRU rather than least-used-count: two accounts with equal counts should
         alternate, and picking by count alone would keep choosing whichever one
@@ -318,8 +334,18 @@ class AccountPool:
         self._roll_day()
         now = self._monotonic()
 
-        candidates = self.eligible(now)
+        blocked = {r for r in exclude}
+        candidates = [a for a in self.eligible(now) if a.ref not in blocked]
         if not candidates:
+            if blocked:
+                # Distinct from "all spent", and the caller must be able to tell
+                # them apart: a held account frees up in seconds, a spent one
+                # frees up tomorrow.
+                held = ", ".join(sorted(blocked))
+                raise NoEligibleAccount(
+                    f"every eligible account is already leased by another worker "
+                    f"({held}). Wait for one to finish or lower max_concurrent."
+                )
             raise NoEligibleAccount(self._ineligibility_report(now))
 
         def lru_key(account: Account) -> tuple[float, int, str]:

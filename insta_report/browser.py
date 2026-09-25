@@ -68,7 +68,7 @@ import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, ClassVar, Protocol, runtime_checkable
 
 from .anchors import AnchorSet
 from .artifacts import ArtifactStore, FailureContext
@@ -1334,6 +1334,14 @@ class BrowserChannel:
     one rung of it.
     """
 
+    #: The name this channel is filed under, in the ladder, in the checkpoint,
+    #: and in the per-channel accounting. Part of the runner's channel
+    #: protocol, so it is declared here rather than passed in -- a channel that
+    #: had to be told its own name would eventually disagree with itself. A
+    #: ClassVar rather than a field, because it is a constant of the channel
+    #: type and not a per-run choice.
+    name: ClassVar[str] = "browser"
+
     driver: PageDriver
     anchors: AnchorSet
     policy: SubmitPolicy
@@ -1584,6 +1592,16 @@ class BrowserChannel:
     async def _settle(self) -> None:
         if self.poll_interval:
             await asyncio.sleep(self.poll_interval)
+
+    async def aclose(self) -> None:
+        """Release the browser. Part of the runner's channel protocol.
+
+        Thin on purpose. :meth:`PageDriver.close` is already synchronous and
+        already idempotent, and a second shutdown path here would be a second
+        place for the "did we actually stop the browser" question to be answered
+        differently from the one in the driver.
+        """
+        self.driver.close()
 
     async def _capture_evidence(
         self,

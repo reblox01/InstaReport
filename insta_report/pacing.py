@@ -28,11 +28,13 @@ injectable so the tests can run years of schedule in microseconds.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 import random
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 __all__ = ["Pacer", "PacingConfig", "MIN_GAP_SECONDS"]
 
@@ -183,24 +185,78 @@ class Pacer:
         Returns immediately when enough time has already elapsed, so pacing
         never adds delay on top of work that was slow anyway.
         """
+        due = self._due(
+            budget_remaining=budget_remaining,
+            budget_total=budget_total,
+            horizon_remaining=horizon_remaining,
+        )
+        if due is None:
+            return 0.0
+        target_gap, remaining = due
+        if remaining > 0:
+            (sleeper or self._sleep)(remaining)
+            self._gaps.append(target_gap)
+        self._last_computed = target_gap
+        return max(0.0, remaining)
+
+    async def async_wait(
+        self,
+        *,
+        budget_remaining: int,
+        budget_total: int,
+        horizon_remaining: float | None = None,
+        sleeper: Callable[[float], Any] | None = None,
+    ) -> float:
+        """Await the gap instead of blocking on it.
+
+        Same arithmetic and the same return contract as :meth:`wait`, because
+        the runner is asyncio end to end and a ``time.sleep`` here would freeze
+        every other worker for the length of the gap. With a derived gap that
+        can reach :data:`MAX_GAP_SECONDS`, that is not a rounding error -- it is
+        every other lease sitting idle for an hour.
+
+        *sleeper* may be a coroutine function, in which case it is awaited, so a
+        test can run a whole schedule without real time passing.
+        """
+        due = self._due(
+            budget_remaining=budget_remaining,
+            budget_total=budget_total,
+            horizon_remaining=horizon_remaining,
+        )
+        if due is None:
+            return 0.0
+        target_gap, remaining = due
+        if remaining > 0:
+            if sleeper is not None:
+                result = sleeper(remaining)
+                if inspect.isawaitable(result):
+                    await result
+            else:
+                await asyncio.sleep(remaining)
+            self._gaps.append(target_gap)
+        self._last_computed = target_gap
+        return max(0.0, remaining)
+
+    def _due(
+        self,
+        *,
+        budget_remaining: int,
+        budget_total: int,
+        horizon_remaining: float | None,
+    ) -> tuple[float, float] | None:
+        """Shared due-time arithmetic. ``None`` means "do not report at all".
+
+        Both wait paths call this so the sync and async versions cannot drift
+        into disagreeing about when a report is due.
+        """
         target_gap = self.compute_gap(
             budget_remaining=budget_remaining,
             budget_total=budget_total,
             horizon_remaining=horizon_remaining,
         )
         if target_gap == float("inf"):
-            return 0.0
-
-        elapsed = self.time_since_dispatch()
-        remaining = target_gap - elapsed
-        if remaining <= 0:
-            self._last_computed = target_gap
-            return 0.0
-
-        (sleeper or self._sleep)(remaining)
-        self._last_computed = target_gap
-        self._gaps.append(target_gap)
-        return remaining
+            return None
+        return target_gap, target_gap - self.time_since_dispatch()
 
     def note_dispatch(self) -> None:
         """Called immediately after a report goes out.
