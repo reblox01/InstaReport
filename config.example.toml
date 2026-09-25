@@ -1,0 +1,57 @@
+# instareport -- example configuration
+#
+# Copy to a location OUTSIDE the repo and edit. The tool refuses to start if
+# data_dir resolves inside the working tree, because runtime artifacts contain
+# live session cookies.
+#
+#   cp config.example.toml ~/insta-report.toml   # then edit
+#   export IG_SESSIONID_ALPHA='...'              # keep secrets out of the file
+
+data_dir = "~/.insta-report"          # must be OUTSIDE the working tree
+anchors_path = "insta_report/data/anchors.toml"
+
+[accounts.alpha]
+username = "your.reporting.account"
+# Preferred: name the env var holding the value, so no credential is ever
+# written to disk in this file.
+sessionid_env = "IG_SESSIONID_ALPHA"
+daily_budget = 20                    # reports per 24h before cooldown (D4)
+
+[accounts.bravo]
+username = "your.second.account"
+sessionid_env = "IG_SESSIONID_BRAVO"
+daily_budget = 20
+enabled = true
+
+# ---------------------------------------------------------------------------
+# Proxies. source = "provider" uses a residential provider API; "file" reads
+# an operator-supplied list. Open-proxy harvesting is deliberately unsupported:
+# those addresses are pre-scorched by every scraper on the internet and a
+# session bound to one is dead before the first request lands.
+# ---------------------------------------------------------------------------
+[proxies]
+source = "file"                      # "file" | "provider"
+file_path = "~/proxies.txt"          # required when source = "file"
+# provider = "brightdata"            # required when source = "provider"
+# provider_key_env = "IG_PROXY_KEY"
+sticky_ttl_minutes = 240             # must exceed your lease length (F10)
+
+[browser]
+headless = true
+max_concurrent = 2                   # must be <= number of accounts
+locale = "en-US"
+# timezone omitted => derived from the egress IP geolocation. A Frankfurt exit
+# paired with an America/New_York timezone is one loud correlation across three
+# signals at once.
+# timezone = "Europe/Berlin"
+navigation_timeout_ms = 30000
+confirmation_timeout_ms = 10000
+
+[api]
+# Stays false until the T0 probe confirms these endpoints exist. The previous
+# version of this tool shipped against unverified endpoints and reported
+# success while sending nothing.
+enabled = false
+# mobile_user_agent = "Instagram 3xx.y.z Android (24/7.0; 640dpi; 1440x2560; samsung; SM-G930F; herolte; samsungexynos8890; en_US; 138226743)"
+# web_user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+# app_id = "936619743392459"

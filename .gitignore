@@ -1,1 +1,41 @@
-__pycache__
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- SECRETS: never commit any of these ---
+# Live session cookies, provider keys, local config with inline secrets.
+.env
+.env.*
+*.env
+secrets/
+credentials/
+config.local.toml
+*.sessionid
+
+# --- RUNTIME STATE: checkpoints, artifacts, traces ---
+# NOTE: the tool defaults its data directory OUTSIDE the working tree
+# (see insta_report/support/paths.py). These entries are a second line of
+# defence, not the primary one -- support.paths.assert_outside_repo() is.
+state/
+artifacts/
+traces/
+checkpoints/
+runs/
+*.checkpoint.jsonl
+*.trace.zip
+*.png
+*.html
+
+# --- reference repo scratch (not part of this build) ---
+/vendor/
+/tmp/
