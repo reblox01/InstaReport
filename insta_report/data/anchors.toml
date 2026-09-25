@@ -115,9 +115,25 @@ require_enabled = true
 # to SUBMITTED_UNCONFIRMED. See classify_browser in outcomes.py.
 # ---------------------------------------------------------------------------
 [confirmation]
+# Two selectors, and both are specific on purpose.
+#
+# A bare `div[role='dialog']` was here and it was wrong in the most expensive
+# way available: the *pre-submit* reason dialog is also a div[role='dialog'],
+# so that selector matched the working form. Every report would then have
+# opened onto a page that already looked confirmed, and the channel would
+# grade all of them CHANNEL_FAILED as leftover UI without ever sending a
+# single one. The fixture in tests/golden/report_dialog.html reproduces exactly
+# that shape, and tests/test_anchor_drift.py now pins the full anchor set each
+# golden page must and must not hit, so an over-broad selector cannot come
+# back.
+#
+# The resilient half of this anchor is its text, not its selector. Instagram
+# ships testids; wording is what survives them, and the alternates below exist
+# because wording has already changed once.
 selectors = [
   "[data-testid='report-confirmation']",
-  "div[role='dialog']",
+  "[data-testid='report-confirmation-dialog']",
+  "[role='status'] [data-testid*='confirm']",
 ]
 # The visible confirmation text, normalised. This exact string is pinned by
 # tests/test_anchor_drift.py against the golden fixture.

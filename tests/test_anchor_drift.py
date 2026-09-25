@@ -23,14 +23,29 @@ What is pinned, and why each direction matters:
       ``tests/test_paths.py`` covers the .gitignore backstop; this is the check
       on the content itself.
 
-CSS selector matching is *approximated* here by looking for the distinguishing
-token of each selector (a ``data-testid``, an ``aria-label``, a form action) as a
-substring of the fixture. That is not a CSS engine and does not claim to be.
-What it does catch is the failure that actually happens in practice: an anchor
-pointing at an attribute that the page no longer has, or an anchor added with no
-corresponding representation in the corpus at all. Real CSS matching against a
-real browser is ``tests/test_browser_channel.py`` (T7), which is the only test
-in the project allowed to need Playwright.
+What this file is, precisely
+---------------------------
+
+It is a **text** oracle and a **coverage** oracle. It extracts the visible text
+of each golden page and asks whether an anchor's configured strings appear in
+it. That catches the drift that actually happens in practice -- Instagram
+renaming the wording -- and it does so in milliseconds with no browser.
+
+It does **not** evaluate CSS selectors. ``selector_tokens`` is used only to
+answer "does the corpus mention this attribute anywhere at all", so an anchor
+added with no representation in the corpus is visible. It never claims a
+selector matches a page.
+
+That boundary is not a nicety. ``div[role='dialog']`` sat in the confirmation
+anchor's selector list, and the pre-submit reason dialog is also a
+``div[role='dialog']`` -- so on a real page the confirmation anchor fired on the
+working form, every report was graded CHANNEL_FAILED as leftover UI, and not one
+was ever sent. This file was green throughout: the confirmation *wording* is not
+on the form, so no text assertion could see it. Real selector matching against a
+real browser is ``tests/test_browser_channel.py`` (T7), which is the only place
+in the project allowed to need Playwright, and which pins the exact anchor set
+per golden page. Neither oracle subsumes the other, and each fails quietly when
+asked the other's question.
 """
 
 from __future__ import annotations

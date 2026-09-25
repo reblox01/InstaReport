@@ -183,6 +183,21 @@ class BrowserEvidence:
     timed_out: bool = False
     #: A challenge or logged-out wall was hit. Not an HTTP condition.
     interstitial: bool = False
+    #: Did the confirmation *persist*, or did it appear and go?
+    #:
+    #: This is a separate question from whether the confirmation anchor is in
+    #: :attr:`post_submit_anchors`, and it has to be: those are cumulative sets,
+    #: so a toast that appeared for one reading and then vanished is
+    #: indistinguishable from a finished wizard. Instagram shows exactly that
+    #: toast, and grading it as a filed report is the optimistic-UI failure this
+    #: tool exists to stop.
+    #:
+    #: Only the wizard can answer it, because only the wizard sees consecutive
+    #: readings. The default is therefore the pessimistic one: evidence that
+    #: does not say it was stable is not treated as stable. Defaulting the other
+    #: way would mean a producer that forgot the field silently claimed a
+    #: confirmation it had not established.
+    confirmation_stable: bool = False
 
     @property
     def dom_advanced(self) -> bool:
@@ -232,6 +247,10 @@ def classify_browser(evidence: BrowserEvidence, confirm_anchor: str) -> Terminal
             and confirm_anchor in evidence.post_submit_anchors
             and confirm_anchor not in evidence.pre_submit_anchors
             and evidence.submit_affordance_gone is True
+            # Last, and not optional: a confirmation that was on the page for
+            # one reading and then gone is a toast, and a toast is what
+            # Instagram shows to a reporter it has not confirmed anything to.
+            and evidence.confirmation_stable
         )
         if confirmed:
             return TerminalState.SUBMITTED_ACKED

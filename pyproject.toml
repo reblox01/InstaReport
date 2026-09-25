@@ -38,3 +38,10 @@ insta_report = ["data/*.toml"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 filterwarnings = ["error::DeprecationWarning:insta_report.*"]
+markers = [
+  # The only tests allowed to need a real browser. They are the selector
+  # oracle, and the selector is the half of anchor matching no offline test can
+  # see -- so they run by default, but CI can deselect them with -m "not
+  # browser" on a machine without the browser download.
+  "browser: launches Chromium against a committed golden fixture",
+]

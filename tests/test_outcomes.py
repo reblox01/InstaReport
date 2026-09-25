@@ -7,6 +7,8 @@ are structural, so they are tested structurally.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from insta_report.errors import AccountChallenged
@@ -125,11 +127,49 @@ def _acked_evidence() -> BrowserEvidence:
         network_status=200,
         network_body='{"status": "ok"}',
         network_content_type="application/json",
+        # Said out loud rather than left to the default. Every other condition
+        # for ACKED is present in this value, so it is exactly the case where a
+        # forgotten flag would matter -- and the default is deliberately the
+        # pessimistic one, so leaving it out would fail here.
+        confirmation_stable=True,
     )
 
 
 def test_both_signals_present_is_acked():
     assert classify_browser(_acked_evidence(), CONFIRM) is TerminalState.SUBMITTED_ACKED
+
+
+def test_a_confirmation_that_did_not_persist_is_not_acked():
+    """The toast race, at the classifier.
+
+    ``post_submit_anchors`` is cumulative, so a confirmation that was on the
+    page for one reading and then gone looks identical to a finished wizard.
+    Only the wizard can see that, which is why stability travels as its own
+    fact and gates ACKED.
+    """
+    evidence = replace(_acked_evidence(), confirmation_stable=False)
+    assert (
+        classify_browser(evidence, CONFIRM)
+        is TerminalState.SUBMITTED_UNCONFIRMED
+    )
+
+
+def test_evidence_that_says_nothing_about_stability_is_not_treated_as_stable():
+    # The default is the pessimistic one on purpose. Evidence assembled by
+    # something that never watched two readings must not claim it watched any.
+    evidence = BrowserEvidence(
+        dispatched=True,
+        post_submit_anchors=frozenset({CONFIRM}),
+        submit_affordance_gone=True,
+        network_status=200,
+        network_body='{"status": "ok"}',
+        network_content_type="application/json",
+    )
+    assert evidence.confirmation_stable is False
+    assert (
+        classify_browser(evidence, CONFIRM)
+        is TerminalState.SUBMITTED_UNCONFIRMED
+    )
 
 
 def test_dom_confirmation_without_network_confirmation_is_unknown():
