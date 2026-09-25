@@ -18,6 +18,11 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    # Cheapest static check that catches the class of defect this suite is
+    # built around: code that is written, imported, and never reached. It found
+    # two duplicate test functions whose names shadowed each other, so one of
+    # the two had never run in the life of the suite.
+    "pyflakes>=3.0",
 ]
 
 [project.scripts]

@@ -11,7 +11,6 @@ import pytest
 
 from insta_report.errors import (
     AccountChallenged,
-    ChannelFailError,
     CheckpointCorrupt,
     ErrorScope,
     FatalError,

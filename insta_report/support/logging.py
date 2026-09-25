@@ -22,7 +22,6 @@ leak by omission.
 from __future__ import annotations
 
 import logging
-import sys
 from typing import Any, TextIO
 
 from .redaction import get_registry, install_redaction

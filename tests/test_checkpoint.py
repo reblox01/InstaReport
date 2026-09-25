@@ -24,7 +24,7 @@ from insta_report.checkpoint import (
     OrphanOutcome,
     SkipReason,
 )
-from insta_report.errors import CheckpointCorrupt, RunAborted
+from insta_report.errors import CheckpointCorrupt
 from insta_report.outcomes import Outcome, TerminalState, utc_now
 
 RUN = "test-run"

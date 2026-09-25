@@ -7,7 +7,6 @@ that it refuses to conclude. Everything here tests the refusal.
 from __future__ import annotations
 
 import httpx
-import pytest
 
 from insta_report.outcomes import NetworkVerdict
 from insta_report.probe import (

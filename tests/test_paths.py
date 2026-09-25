@@ -4,7 +4,6 @@ import pytest
 
 from insta_report.support.paths import (
     PathContainmentError,
-    Paths,
     assert_outside_repo,
     default_data_dir,
     find_repo_root,

@@ -361,13 +361,6 @@ def test_a_blocked_address_is_never_bound():
         pool.acquire()
 
 
-def test_a_blocked_address_cooling_down_can_be_reported_before_giving_up():
-    pool = make_pool(fetch=lambda u, p: blocked_200())
-    with pytest.raises(ProxyUnavailable) as excinfo:
-        pool.acquire()
-    assert "cooling down" in str(excinfo.value)
-
-
 def test_a_working_address_is_used_even_when_others_are_broken():
     """One good address among three bad ones is still a working pool."""
 

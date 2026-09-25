@@ -26,7 +26,6 @@ from insta_report.accounts import (
     Lease,
 )
 from insta_report.errors import (
-    AccountChallenged,
     NoEligibleAccount,
     ReportBudgetExhausted,
 )
@@ -577,13 +576,3 @@ def test_summary_marks_an_eligible_account_as_eligible():
 def test_status_reports_every_account():
     pool = make_pool(make_account("a"), make_account("b"))
     assert {row["ref"] for row in pool.status()} == {"a", "b"}
-
-
-def test_rolled_account_becomes_eligible_again_uses_pool_clock():
-    pool = make_pool(make_account("a", budget=1))
-    lease = pool.lease()
-    pool.note_dispatch(lease)
-    with pytest.raises(NoEligibleAccount):
-        pool.lease()
-    pool._wall_clock = lambda: date(2026, 9, 26)  # noqa: SLF001 - drives the clock
-    assert pool.lease() is not None

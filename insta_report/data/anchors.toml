@@ -1,0 +1,240 @@
+# instareport -- Instagram-facing anchors (D7)
+#
+# Everything in this file is something Instagram can change without telling us.
+# It lives here, in TOML, rather than in Python so that a UI change is a config
+# edit made by someone who can read the page -- not a code change made by
+# someone reasoning about a stack trace.
+#
+# Two rules govern this file:
+#
+# 1. Nothing here may be *inferred*. Every string is either copied from a
+#    captured page or is a structural selector. If a value is a guess, it is not
+#    a value. A wrong anchor that matches nothing is loud; a wrong anchor that
+#    matches the wrong thing is silent, and silent is the failure mode this
+#    whole design exists to avoid.
+#
+# 2. Selectors are ordered most-specific-first. The first match wins, so a
+#    stable test id goes above a class name above a structural path. Instagram's
+#    obfuscated class names churn weekly; anything anchored to one is a bug with
+#    a timer on it.
+#
+# `python -m insta_report.anchors --check` reports which anchors still match a
+# captured page, and `tests/test_anchor_drift.py` fails CI when the confirmation
+# string in this file stops appearing in the golden fixture.
+
+# ---------------------------------------------------------------------------
+# Normalization applied to every observed string before it is compared.
+#
+# This is not cosmetic. Instagram renders the same visible text as three
+# different byte sequences depending on how the string was assembled, and a
+# naive equality check fails on all three.
+# ---------------------------------------------------------------------------
+[normalization]
+# Non-breaking space. The single most common cause of a text anchor that
+# "obviously" is in the page but is not found.
+nbsp = " "
+# Bi-directional overrides and isolates. They are invisible, they change byte
+# length, and they appear inside category labels on the report dialog.
+bidi_controls = "strip"
+# Zero-width characters used for layout.
+zero_width = "strip"
+# Any run of whitespace, including newlines and tabs, becomes one space.
+collapse_whitespace = true
+# Comparisons are casefolded so a capitalisation change is not a drift alert.
+casefold = true
+
+# ---------------------------------------------------------------------------
+# Opening the report dialog.
+# ---------------------------------------------------------------------------
+[report_dialog]
+# The overflow menu on a profile. Instagram has used both an aria-label and a
+# test id for this; both are listed because either may be present.
+trigger_selectors = [
+  "[data-testid='option-button']",
+  "[aria-label='Option']",
+  "div[role='button'][aria-label='More options']",
+]
+# Menu items are announced by their text; matched against normalised text.
+menu_item_text = "Report"
+
+[report_dialog.reason_list]
+# The list of categories. Items are read from THIS at runtime -- the 12-entry
+# hardcoded table in the original is gone, because a new category silently
+# disappearing is worse than a category being added.
+container_selectors = [
+  "div[role='dialog'] div[role='menu']",
+  "div[role='dialog'] ul",
+]
+item_selectors = [
+  "div[role='menuitem']",
+  "div[role='dialog'] li",
+  "button[role='menuitem']",
+]
+# The dialog must contain this before a category is trusted as the real list.
+# Without it we could be reading a login wall's menu, and filing a report
+# against whatever menu happened to be on screen.
+required_dialog_text = "Why are you reporting this account?"
+
+[report_dialog.subdialog]
+# Some categories open a second step (e.g. a reason within "Spam").
+heading_selectors = [
+  "div[role='dialog'] h2",
+  "div[role='dialog'] span[role='heading']",
+]
+item_selectors = [
+  "div[role='dialog'] [role='radio']",
+  "div[role='dialog'] [role='menuitem']",
+  "div[role='dialog'] li",
+]
+
+[submit]
+selectors = [
+  "[data-testid='submit-report-button']",
+  "div[role='dialog'] button[type='submit']",
+  "div[role='dialog'] div[role='button']:has-text('Submit')",
+]
+# The button must be enabled. Clicking a disabled button produces a screenshot
+# of a report that was never sent, which is precisely how the original code came
+# to report success on a request that never left.
+require_enabled = true
+
+# ---------------------------------------------------------------------------
+# Post-submit confirmation.
+#
+# THIS IS CORROBORATION ONLY, NEVER EVIDENCE.
+#
+# Instagram renders success optimistically, to any reporter, including
+# unauthenticated and flagged identities. It cannot be distinguished from a
+# genuine success by anything we can observe. The primary evidence is the
+# network response to the submit request; this text only tells us the UI
+# transitioned, which catches the case where the request was sent but the
+# dialog never closed.
+#
+# If this string drifts, the run does NOT become more optimistic -- it becomes
+# less corroborating, and every outcome that relied on it alone is downgraded
+# to SUBMITTED_UNCONFIRMED. See classify_browser in outcomes.py.
+# ---------------------------------------------------------------------------
+[confirmation]
+selectors = [
+  "[data-testid='report-confirmation']",
+  "div[role='dialog']",
+]
+# The visible confirmation text, normalised. This exact string is pinned by
+# tests/test_anchor_drift.py against the golden fixture.
+text = "Thanks for reporting this account"
+# Substrings that also count as a transitioned dialog. Listed as alternatives
+# because Instagram has shipped wording changes, and a confirmation we can
+# recognise under two phrasings is better than a report we cannot corroborate.
+alternate_texts = [
+  "Thanks for reporting",
+  "We appreciate you letting us know",
+  "Your report has been submitted",
+  "Thanks for letting us know",
+]
+# How long to wait for the dialog to transition before calling it a no-op.
+timeout_ms = 10_000
+
+# ---------------------------------------------------------------------------
+# Negative anchors: states that look like progress but are not.
+#
+# Each of these arrived as HTTP 200 in the original investigation, which is why
+# they are here rather than being left to status-code handling.
+# ---------------------------------------------------------------------------
+[challenge]
+# F7: challenge interstitials arrive as DOM events or as a 200 carrying a
+# challenge field. Not as a status code. Any of these means the account is
+# being challenged and the report did not go out.
+selectors = [
+  "[data-testid='challenge-dialog']",
+  "form[action*='/challenge/']",
+  "iframe[src*='recaptcha']",
+]
+texts = [
+  "It was us, not you",
+  "confirm it's you",
+  "Enter the characters you see",
+  "Solve the challenge",
+  "Please verify",
+]
+
+[login_wall]
+selectors = [
+  "form[action*='/accounts/login/']",
+  "input[name='username']",
+]
+texts = [
+  "Log in to Instagram",
+  "Phone number, username, or email",
+]
+
+[rate_limited]
+# 429 with a 200 body is not a thing that happens; this is the 200-with-a-
+# retry-after body. Recorded separately from the probe's 429 handling because
+# the recovery is different: wait, do not rebind.
+texts = [
+  "You're temporarily blocked",
+  "Too many requests",
+  "Try again later",
+]
+selectors = ["[data-testid='rate-limit-notice']"]
+
+[not_found]
+# The old code's real failure mode: an unmatched path serves the logged-out
+# login shell with HTTP 200, so a 200 here means nothing whatsoever.
+texts = [
+  "Sorry, this page isn't available",
+  "The page you were looking for doesn't exist",
+]
+
+# ---------------------------------------------------------------------------
+# The account's own identity as the page presents it.
+#
+# Read back after binding (adopted #10). If the logged-in account is not the one
+# we leased, every report in the run is filed from the wrong identity, and the
+# only way to know is to have looked.
+# ---------------------------------------------------------------------------
+[identity]
+logged_in_marker_selectors = [
+  "a[href^='/'][data-testid='-username']",
+  "div[data-testid='-username'] a",
+]
+# The href value that identifies the account's own profile link, relative form.
+own_profile_href_pattern = "^/([^/]+)/?$"
+
+# ---------------------------------------------------------------------------
+# Handle normalisation.
+#
+# F8: confusable handles -- characters that render identically but are not
+# identical codepoints -- resolve to a *different real account*. Filing a report
+# against the wrong account is a harm vector, not just a miss, so the exact
+# handle is recorded and compared by codepoint rather than by appearance.
+# ---------------------------------------------------------------------------
+[handle]
+# Codepoints that render like ASCII but are not. Recorded on every target so a
+# reviewer can see them; a target containing one is flagged, not rejected,
+# because legitimate names do contain them (e.g. Cyrillic lookalikes in a
+# handle someone actually owns).
+#
+# A sub-table rather than an inline one because multi-line inline tables are
+# TOML 1.1 and Python's tomllib implements 1.0 -- the parse error for that is
+# "invalid initial character for a key part" pointing at the brace, which is
+# nowhere near the actual mistake.
+# Single-line inline tables, because multi-line ones are TOML 1.1 and
+# tomllib implements 1.0. The `ascii` field is the character this looks like on
+# screen, used to answer "did you mean <this>?" when a target contains a
+# lookalike. It is data about the confusable rather than something to infer from
+# the name -- deriving "CYRILLIC_A maps to a" from a string is exactly the kind
+# of guess that is wrong quietly.
+[handle.confusable_codepoints]
+CYRILLIC_A = { codepoint = "U+0430", ascii = "a" }
+CYRILLIC_C = { codepoint = "U+0441", ascii = "c" }
+CYRILLIC_E = { codepoint = "U+0435", ascii = "e" }
+CYRILLIC_O = { codepoint = "U+043E", ascii = "o" }
+CYRILLIC_P = { codepoint = "U+0440", ascii = "p" }
+CYRILLIC_X = { codepoint = "U+0445", ascii = "x" }
+CYRILLIC_Y = { codepoint = "U+0443", ascii = "y" }
+GREEK_OMEGA = { codepoint = "U+03C9", ascii = "o" }
+CYRILLIC_IE = { codepoint = "U+0435", ascii = "e" }
+LATIN_A_WITH_RING = { codepoint = "U+00E5", ascii = "a" }
+DOTLESS_I = { codepoint = "U+0131", ascii = "i" }
+TURKISH_I = { codepoint = "U+0130", ascii = "i" }

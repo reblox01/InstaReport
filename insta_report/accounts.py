@@ -34,9 +34,9 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Callable, Iterable, Iterator, Sequence
+from typing import Callable, Iterable, Iterator
 
-from .errors import AccountChallenged, NoEligibleAccount, ReportBudgetExhausted
+from .errors import NoEligibleAccount, ReportBudgetExhausted
 from .outcomes import Outcome, TerminalState
 
 __all__ = [

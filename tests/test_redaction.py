@@ -200,7 +200,7 @@ def test_install_redaction_wires_both_choke_points():
     install_redaction(logger, stream=stream, level=logging.DEBUG)
 
     register_secret(SECRET)
-    logger.info(f"leaking %s here", SECRET)
+    logger.info("leaking %%s here: %s", SECRET)
     try:
         raise ValueError(f"boom {SECRET}")
     except ValueError:

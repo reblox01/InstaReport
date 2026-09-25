@@ -31,10 +31,9 @@ import json
 import logging
 import os
 import sys
-import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator, Mapping

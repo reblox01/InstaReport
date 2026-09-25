@@ -94,6 +94,31 @@ class SecretRegistry:
                 text = text.replace(secret, REDACTED)
         return text
 
+    def scrub_bytes(self, data: bytes) -> bytes:
+        """Redact secrets inside raw bytes.
+
+        For binary artifacts -- screenshots, traces. Honest limitation, stated
+        here because the limitation is the reason the ordering of artifacts
+        matters: a PNG stores its pixel payload deflated, so a secret visible in
+        the image usually does not appear in the bytes at all. Scrubbing bytes
+        therefore catches only what is stored uncompressed (chunk metadata, a
+        base64 payload) and will not catch a session rendered as pixels.
+
+        That is precisely why the DOM snapshot, which is text and therefore
+        reliably scrubbable, is the primary artifact and the screenshot is
+        secondary. Applied regardless, because "usually does nothing" is not a
+        reason to skip it, and because a caller may pass a format that is not
+        compressed.
+        """
+        if not self._secrets:
+            return data
+        out = data
+        for secret in self._ordered:
+            needle = secret.encode("utf-8", "ignore")
+            if needle and needle in out:
+                out = out.replace(needle, REDACTED.encode("utf-8", "ignore"))
+        return out
+
     def scrub_any(self, value: Any) -> Any:
         """Scrub strings inside arbitrarily nested log arguments."""
         if isinstance(value, str):
