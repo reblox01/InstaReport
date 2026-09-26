@@ -24,10 +24,23 @@ username = "your.reporting.account"
 # written to disk in this file.
 sessionid_env = "IG_SESSIONID_ALPHA"
 daily_budget = 20                    # reports per 24h before cooldown (D4)
+# The account's own numeric ds_user_id. Not a secret, so unlike sessionid it lives
+# here rather than in the environment.
+#
+# The T0 probe addresses the reporting route by numeric id, and it refuses to run
+# without this rather than send a path containing a literal "{user_id}" -- such a
+# path is malformed, and a malformed path's 404 cannot be distinguished from a
+# route that is genuinely absent. The finding would be indistinguishable from
+# evidence while being evidence of nothing.
+#
+# This identifies the *reporting* account. The id a report is filed AGAINST comes
+# from the target record, not from here.
+user_id = "00000000000"
 
 [accounts.bravo]
 username = "your.second.account"
 sessionid_env = "IG_SESSIONID_BRAVO"
+user_id = "00000000001"
 daily_budget = 20
 enabled = true
 

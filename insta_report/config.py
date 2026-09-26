@@ -49,6 +49,17 @@ class AccountConfig:
     sessionid: str
     enabled: bool = True
     daily_budget: int = 20
+    #: The account's own numeric ``ds_user_id``.
+    #:
+    #: Optional, and deliberately so. It is needed to address *this* account by id
+    #: -- which the T0 probe requires, because a request path containing an
+    #: unsubstituted ``{user_id}`` is a malformed URL, and a malformed URL's 404 is
+    #: indistinguishable from a missing route. It is not a secret, so unlike
+    #: ``sessionid`` it is not read from the environment.
+    #:
+    #: It is the *target's* id that a report is filed against, and that comes from
+    #: the target record, not from here. This one identifies the reporting account.
+    user_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -311,6 +322,7 @@ def _load_accounts(raw: Mapping[str, Any]) -> tuple[AccountConfig, ...]:
                 sessionid=sessionid,
                 enabled=reader.bool_("enabled", True),
                 daily_budget=reader.int_("daily_budget", 20, minimum=1),
+                user_id=reader.str_("user_id"),
             )
         )
     return tuple(accounts)

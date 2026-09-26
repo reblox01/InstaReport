@@ -6,6 +6,8 @@ that it refuses to conclude. Everything here tests the refusal.
 
 from __future__ import annotations
 
+import re
+
 import httpx
 import pytest
 
@@ -18,6 +20,7 @@ from insta_report.probe import (
     Probe,
     ProbeResult,
     ProbeVerdict,
+    _assert_placeholders,
     _egress_ip,
     _main,
     _interpretation,
@@ -295,6 +298,58 @@ def test_a_state_changing_probe_set_is_refused_before_any_request(monkeypatch):
                 )
             ],
         )
+
+
+def test_a_malformed_probe_url_is_refused_before_any_request(monkeypatch):
+    """The unsubstituted-placeholder refusal, on the same terms as the method one.
+
+    Before the network, not after -- asserted by making the client unconstructable,
+    so a check that ran one step too late would surface as a construction error
+    rather than a silent pass. This is the defect that let a malformed
+    ``{user_id}`` path report as evidence about a route.
+    """
+    def _unconstructable(**kwargs):  # pragma: no cover - must not be reached
+        raise AssertionError("a client was built despite the refusal")
+
+    monkeypatch.setattr("insta_report.probe.httpx.Client", _unconstructable)
+
+    with pytest.raises(ValueError, match="malformed"):
+        run_probe(
+            proxy=None,
+            control_url=CONTROL_URL,
+            probes=[
+                Probe(
+                    name="flag_user_route_exists",
+                    url="https://i.instagram.com/api/v1/users/{user_id}/flag_user/",
+                )
+            ],
+        )
+
+
+def test_the_placeholder_check_names_every_missing_value():
+    """One wrong answer is a nuisance; a partial one teaches the wrong lesson.
+
+    Naming only the first missing placeholder would send a reader off to fix one
+    key, re-run, and be wrong again -- and the re-run would produce another
+    plausible-looking 404.
+    """
+    probes = [
+        Probe(name="two", url="https://h.test/{alpha}/{beta}"),
+    ]
+    with pytest.raises(ValueError) as excinfo:
+        _assert_placeholders(probes, {})
+    message = str(excinfo.value)
+    assert "'alpha'" in message and "'beta'" in message, message
+    assert "two" in message, message
+
+
+def test_a_fully_substituted_probe_set_is_accepted():
+    """The guard must not refuse valid input, or it gets switched off.
+
+    A check that fires on good configuration is a check operators learn to
+    work around, and a worked-around check protects nothing.
+    """
+    _assert_placeholders(DEFAULT_PROBES, {"username": "u", "user_id": "1"})
 
 
 def test_the_read_only_check_does_not_depend_on_the_caller_being_authenticated(
@@ -756,7 +811,16 @@ def test_a_burned_exit_reports_inconclusive_end_to_end(monkeypatch):
 
     install_transport(monkeypatch, handler)
 
-    r = run_probe(proxy=None, control_url=CONTROL_URL, probes=DEFAULT_PROBES)
+    r = run_probe(
+        proxy=None,
+        control_url=CONTROL_URL,
+        probes=DEFAULT_PROBES,
+        # Supplied, because the shipped table needs them. This call used to pass
+        # none and relied on the resulting malformed paths -- which is the defect
+        # _assert_placeholders now refuses. That the refusal surfaced here, in a
+        # test written before it, is the check earning its place.
+        substitutions={"username": "reporter.one", "user_id": "555000111"},
+    )
     assert r.verdict is ProbeVerdict.INCONCLUSIVE
     assert "flagged source IP" in r.summary()
 
@@ -849,11 +913,36 @@ def test_every_api_probe_targets_the_same_tier_as_the_control():
     assert api_probes, "expected at least one API route in the default set"
     for probe in api_probes:
         host = probe.url.split("/")[2]
-        if probe.name != "flag_user_route_exists":
-            assert host == control_host, (
-                f"{probe.name!r} targets {host} but the control and the shipped "
-                f"identity address {control_host}"
-            )
+        assert host == control_host, (
+            f"{probe.name!r} targets {host} but the control and the shipped "
+            f"identity address {control_host}"
+        )
+
+
+def test_every_shipped_probe_url_can_be_fully_substituted():
+    """No shipped probe may depend on a substitution nobody supplies.
+
+    This is the invariant that was missing, and its absence is why the reporting
+    route read as nonexistent. ``flag_user_route_exists`` needed ``{user_id}``,
+    ``_main`` supplied only ``{username}``, and the resulting malformed path 404'd
+    -- indistinguishable, from the response, from a route that is genuinely gone.
+
+    The list below is written out by hand rather than derived, on purpose. Derived
+    from the table it would agree with the table by construction and could never
+    fail; a reviewer adding a probe with a new placeholder is the event this is
+    supposed to catch, and that only works if the expectation is written
+    separately. ``_assert_placeholders`` is the backstop that refuses at runtime;
+    this is the check that says so at review time.
+    """
+    supplied = {"username", "user_id"}
+    for probe in DEFAULT_PROBES:
+        needed = set(re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", probe.url))
+        assert needed <= supplied, (
+            f"{probe.name!r} needs {sorted(needed - supplied)}, which _main does "
+            f"not supply. Add it to the substitution table and to the set above, "
+            f"or the probe will send a malformed path and its 404 will be read as "
+            f"evidence about the route."
+        )
 
 
 # --- _main: which identity actually gets sent --------------------------------
@@ -870,7 +959,11 @@ def _run_main_capturing_identity(tmp_path, monkeypatch, api_block: str) -> str:
         f'data_dir = "{data_dir.as_posix()}"\n\n'
         '[accounts.alpha]\n'
         'username = "reporter.one"\n'
-        'sessionid_env = "IG_SESSIONID_TEST"\n\n'
+        'sessionid_env = "IG_SESSIONID_TEST"\n'
+        # The reporting account's own numeric id. The default probe set addresses
+        # the reporting route with it, and _main refuses to run without it rather
+        # than send a malformed path -- see _assert_placeholders.
+        'user_id = "555000111"\n\n'
         f'[proxies]\nsource = "file"\nfile_path = "{proxies.as_posix()}"\n\n'
         # One account, so the concurrency ceiling has to be one. Omitting this
         # is not a default: [browser] max_concurrent defaults to 3 and the

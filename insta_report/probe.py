@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -345,7 +346,14 @@ DEFAULT_PROBES: tuple[Probe, ...] = (
     ),
     Probe(
         name="flag_user_route_exists",
-        url="https://www.instagram.com/api/v1/users/{user_id}/flag_user/",
+        # The *mobile* host, deliberately. This probe used to target
+        # ``www.instagram.com``, which is the web tier -- so the one probe that
+        # spoke to the reporting route was measuring a different tier from the one
+        # D5 claims as primary, and the tier-consistency test had grown a carve-out
+        # by name to hide the contradiction. D5's entire claim is that the mobile
+        # identity on the mobile host is the primary path; a liveness check aimed
+        # anywhere else cannot support it.
+        url="https://i.instagram.com/api/v1/users/{user_id}/flag_user/",
         # GET, and asserted. See the note above -- a 405 here still proves the
         # route is real, and nothing here can report anyone.
         method="GET",
@@ -380,6 +388,43 @@ def _assert_read_only(probes: Sequence[Probe]) -> None:
                 f"state on {probe.url.split('?')[0]!r}. This module reports; it "
                 f"does not act. If a state-changing call is genuinely needed, it "
                 f"is not a probe and does not belong in DEFAULT_PROBES."
+            )
+
+
+#: ``{name}`` as it appears in a probe URL. Deliberately narrow: it must not match
+#: a percent-encoded brace, or a URL that legitimately contains one would be
+#: rejected for a reason that does not apply.
+_PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _assert_placeholders(
+    probes: Sequence[Probe], substitutions: Mapping[str, str]
+) -> None:
+    """Refuse a probe whose URL still has an unsubstituted ``{name}`` in it.
+
+    The shipped table had exactly this bug. ``flag_user_route_exists`` addressed
+    ``.../users/{user_id}/flag_user/`` and nothing ever supplied ``user_id`` -- the
+    only substitution made was ``username`` -- so the request went out with a
+    literal brace in the path and came back 404. That 404 then sat in the report
+    next to a healthy control, looking like evidence the reporting route does not
+    exist. It might not. It might be a malformed path. **Nothing in the response
+    can tell those apart**, which is the whole reason the control exists -- and the
+    control cannot help here, because the control is a different route.
+
+    So the check refuses instead. Same shape as ``_assert_read_only`` and for the
+    same reason: a probe's value is that its output can be trusted, and a 404
+    nobody can interpret is not output.
+    """
+    for probe in probes:
+        missing = sorted(set(_PLACEHOLDER.findall(probe.url)) - set(substitutions))
+        if missing:
+            raise ValueError(
+                f"probe {probe.name!r} addresses {probe.url!r}, which needs "
+                f"{', '.join(repr(name) for name in missing)} and no substitution "
+                "was supplied for it. A URL with an unsubstituted placeholder is "
+                "malformed, and a malformed URL's 404 is indistinguishable from a "
+                "missing route -- so this would be reported as evidence when it is "
+                "evidence of nothing. Supply the value or drop the probe."
             )
 
 
@@ -505,6 +550,7 @@ def run_probe(
     could report someone fails without having reported them.
     """
     _assert_read_only(probes)
+    _assert_placeholders(probes, substitutions or {})
 
     subs = dict(substitutions or {})
     headers = {"User-Agent": user_agent, **dict(extra_headers or {})}
@@ -678,10 +724,27 @@ def _main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
 
+    # The reporting route is addressed by numeric id, and the reporting account's
+    # own id is what identifies it here. Checked with a config-shaped message
+    # rather than left to ``_assert_placeholders``: the generic guard says "a
+    # substitution is missing", this says which key in which file to edit. Both
+    # exist -- the generic one is the invariant, this one is the instruction.
+    if not chosen.user_id:
+        print(
+            f"config error: [accounts.{chosen.ref}] has no user_id, and the "
+            "default probe set addresses the reporting route by numeric id. "
+            "Add user_id = \"<ds_user_id>\" to that account. It is the account's "
+            "own id and is not a secret. It is needed because a request path "
+            "with an unsubstituted {user_id} is malformed, and a malformed "
+            "path's 404 cannot be told apart from a missing route.",
+            file=sys.stderr,
+        )
+        return 2
+
     reports = run_across_exits(
         exits,
         control_url=args.control,
-        substitutions={"username": args.username},
+        substitutions={"username": args.username, "user_id": chosen.user_id},
         timeout=args.timeout,
         user_agent=probe_ua,
         extra_headers=headers,
