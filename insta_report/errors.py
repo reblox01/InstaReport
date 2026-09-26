@@ -22,6 +22,7 @@ same kind of fatal.
 from __future__ import annotations
 
 from enum import Enum
+from typing import Any
 
 __all__ = [
     "ErrorScope",
@@ -115,7 +116,19 @@ class SelectorDrift(ChannelFailError):
     so the operator can fix it with a config edit rather than a code change.
     """
 
-    def __init__(self, message: str, *, missing: tuple[str, ...] = (), **kwargs) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        missing: tuple[str, ...] = (),
+        **kwargs: Any,
+    ) -> None:
+        # ``**kwargs: Any`` rather than a named ``scope`` parameter, because
+        # every typed failure in this module takes a scope and spelling it out
+        # here would mean this subclass silently stops accepting it the day
+        # someone adds a second. Annotated at all, though: unannotated
+        # ``**kwargs`` makes the whole signature unchecked, so a caller can pass
+        # anything at all and the constructor takes it.
         super().__init__(message, **kwargs)
         self.missing = missing
 

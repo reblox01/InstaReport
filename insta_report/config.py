@@ -350,7 +350,7 @@ def _load_browser(reader: _Reader, paths: Paths) -> BrowserConfig:
         max_concurrent=max_concurrent,
         locale=reader.str_("locale", default="en-US") or "en-US",
         timezone=reader.str_("timezone"),
-        user_data_dir=user_data_dir,  # type: ignore[arg-type]
+        user_data_dir=user_data_dir,
         navigation_timeout_ms=reader.int_("navigation_timeout_ms", 30_000, minimum=1_000),
         confirmation_timeout_ms=reader.int_("confirmation_timeout_ms", 10_000, minimum=500),
     )

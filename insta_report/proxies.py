@@ -946,6 +946,20 @@ class ProxyPool:
         # narrowing is restated here as two casts rather than scattered as three
         # ``type: ignore`` comments that suppress whatever the line happens to
         # be doing that week.
+        # The two shapes a caller can pass -- a live provider, or a plain list
+        # of addresses -- are told apart structurally, because both are
+        # legitimate and there is no base class to inherit.
+        #
+        # The one cast below is load-bearing and the two ignores it replaces
+        # were not. ``hasattr`` narrows the expression for member access -- so
+        # ``provider.fetch(64)`` and ``for endpoint in endpoints`` both check
+        # without help -- but it does not narrow an *assignment* to a variable
+        # that already has a declared type, which is why storing it needs
+        # saying out loud. Under ``warn_unused_ignores`` the two ignores this
+        # replaced were reported as suppressing nothing, which is the check
+        # earning its place in the config: a suppression that no longer
+        # suppresses anything is either dead code or a leftover from a fix
+        # nobody reverted.
         if hasattr(endpoints, "fetch"):
             provider = cast("ProviderAdapter", endpoints)
             self._provider = provider
@@ -953,7 +967,7 @@ class ProxyPool:
                 self._register(endpoint)
         else:
             self._provider = None
-            for endpoint in cast("Iterable[ProxyEndpoint]", endpoints):
+            for endpoint in endpoints:
                 self._register(endpoint)
 
         if not self._health:

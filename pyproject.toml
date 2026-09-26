@@ -23,6 +23,14 @@ dev = [
     # two duplicate test functions whose names shadowed each other, so one of
     # the two had never run in the life of the suite.
     "pyflakes>=3.0",
+    # Type checking. It found a declaration that lied -- BrowserDriver typed
+    # `_anchors: AnchorSet` while defaulting it to None -- and following that lie
+    # turned up five methods reading it with no guard, any of which raised an
+    # AttributeError that the runner grades as CHANNEL_FAILED, which an operator
+    # reads as "Instagram rejected the session". Declared here because
+    # tests/test_static_gates.py asserts this list, so removing it is a test
+    # failure rather than a silent loss of the check.
+    "mypy>=1.8",
 ]
 
 [project.scripts]
@@ -44,4 +52,45 @@ markers = [
   # see -- so they run by default, but CI can deselect them with -m "not
   # browser" on a machine without the browser download.
   "browser: launches Chromium against a committed golden fixture",
+  # Static analysis, run as tests so that "the suite is green" and "the code
+  # type checks" cannot drift apart. Costs about twenty seconds, so it is a
+  # marker: `-m "not static"` for a fast inner loop, and no marker in CI.
+  "static: runs pyflakes or mypy over the package",
 ]
+
+[tool.mypy]
+# Scoped to the package. The tests are deliberately not type checked: they build
+# fakes of Protocols, assert on dict shapes, and reach into privates with
+# noqa, and checking them would mean typing the fakes rather than the thing
+# under test. That trade is worth naming rather than leaving implicit.
+files = ["insta_report"]
+python_version = "3.11"
+
+# Untyped third-party packages are not this project's to fix, and a check that
+# fails on someone else's annotations is a check people disable.
+ignore_missing_imports = true
+
+# The settings below are the ones that found real defects, so they are on rather
+# than on-by-default-and-off-in-practice:
+#
+#   disallow_untyped_defs      a function with no annotations is a function whose
+#                              contract is a comment
+#   disallow_incomplete_defs   same, for partially annotated ones -- the worst
+#                              case, because it looks annotated
+#   no_implicit_optional       `def f(x: int = None)` is a lie with a type on it
+#   warn_redundant_casts       a cast that does nothing is either dead code or a
+#                              leftover from a fix that is no longer needed
+#   warn_unused_ignores        `# type: ignore` that suppresses nothing rots
+#                              silently; every one in this repo is load-bearing
+#                              and this is what keeps it that way
+#   strict_equality            1 == True and 0 == False both being quietly true
+#                              is how a counter and a flag get swapped
+#   check_untyped_defs         otherwise the four above apply only to annotated
+#                              code, which defeats the point
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+strict_equality = true
+check_untyped_defs = true
