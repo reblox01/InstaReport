@@ -1,0 +1,256 @@
+{
+  "tasks": {
+    "task-1790358425875-e54m66": {
+      "taskId": "task-1790358425875-e54m66",
+      "type": "feature",
+      "description": "T0 Discriminating re-probe: 2-3 clean residential exits + MANDATORY known-good authenticated control call to the same host. Determines whether the API channel (T9) is buildable. Without the control, 404 is uninterpretable. BLOCKS T9.",
+      "priority": "critical",
+      "status": "completed",
+      "progress": 0,
+      "assignedTo": [],
+      "tags": [
+        "instaReport",
+        "rebuild",
+        "T0"
+      ],
+      "createdAt": "2026-09-25T17:47:05.875Z",
+      "startedAt": null,
+      "completedAt": null
+    },
+    "task-1790358425894-yvdus9": {
+      "taskId": "task-1790358425894-yvdus9",
+      "type": "feature",
+      "description": "T1 Skeleton + config + secrets: pyproject, TOML config schema with env overrides, redacting logger (redact at logger not call site), 0600 perms, replace 2-line .gitignore, move artifact root OUTSIDE the working tree.",
+      "priority": "critical",
+      "status": "completed",
+      "progress": 0,
+      "assignedTo": [],
+      "tags": [
+        "instaReport",
+        "rebuild",
+        "T1"
+      ],
+      "createdAt": "2026-09-25T17:47:05.894Z",
+      "startedAt": null,
+      "completedAt": null
+    },
+    "task-1790358425906-yndt7q": {
+      "taskId": "task-1790358425906-yndt7q",
+      "type": "feature",
+      "description": "T2 outcomes.py + errors.py + golden corpus (P0 false-success fix): tests first. Terminal vocabulary SUBMITTED_ACKED / SUBMITTED_UNCONFIRMED / UNKNOWN / NOT_REPORTABLE / CHANNEL_FAILED / QUARANTINED. Corpus pins all 5 known-bad response shapes. Scoped errors AccountFatal vs RunFatal.",
+      "priority": "critical",
+      "status": "completed",
+      "progress": 0,
+      "assignedTo": [],
+      "tags": [
+        "instaReport",
+        "rebuild",
+        "T2"
+      ],
+      "createdAt": "2026-09-25T17:47:05.906Z",
+      "startedAt": null,
+      "completedAt": null
+    },
+    "task-1790358425933-6gca1y": {
+      "taskId": "task-1790358425933-6gca1y",
+      "type": "feature",
+      "description": "T3 Checkpoint store: JSONL, flush()+fsync() per record, intent appended BEFORE dispatch, resume rule (intent without terminal = UNKNOWN, never auto-resubmitted), dedup key run_id+target, OS lock file + PID check, per-run state dirs.",
+      "priority": "critical",
+      "status": "completed",
+      "progress": 0,
+      "assignedTo": [],
+      "tags": [
+        "instaReport",
+        "rebuild",
+        "T3"
+      ],
+      "createdAt": "2026-09-25T17:47:05.933Z",
+      "startedAt": null,
+      "completedAt": null
+    },
+    "task-1790358425946-1t83pj": {
+      "taskId": "task-1790358425946-1t83pj",
+      "type": "feature",
+      "description": "T4 Proxy pool: provider adapter + file parser behind one interface, health scoring that inspects the BODY not just status (F9), ASN diversity across concurrent leases, egress assertion (adopted #6), sticky TTL recorded per lease (F10).",
+      "priority": "normal",
+      "status": "completed",
+      "progress": 100,
+      "assignedTo": [],
+      "tags": [
+        "instaReport",
+        "rebuild",
+        "T4"
+      ],
+      "createdAt": "2026-09-25T17:47:05.946Z",
+      "startedAt": null,
+      "completedAt": "2026-09-25T18:58:24.381Z",
+      "result": {
+        "commit": "b47975c",
+        "note": "proxies.py, 75 tests"
+      }
+    },
+    "task-1790358425958-hb2gts": {
+      "taskId": "task-1790358425958-hb2gts",
+      "type": "feature",
+      "description": "T5 Crash-consistency matrix: kill at each of 5 checkpoint write points, resume, assert no target is ever resubmitted unattended. Deterministic, fast, impossible to fake. BLOCKS T13.",
+      "priority": "high",
+      "status": "completed",
+      "progress": 0,
+      "assignedTo": [],
+      "tags": [
+        "instaReport",
+        "rebuild",
+        "T5"
+      ],
+      "createdAt": "2026-09-25T17:47:05.958Z",
+      "startedAt": null,
+      "completedAt": null
+    },
+    "task-1790358425968-b09w3a": {
+      "taskId": "task-1790358425968-b09w3a",
+      "type": "feature",
+      "description": "T6 Account model + pool: per-account budget on monotonic clock, LRU among eligible, quarantine 2^n with per-lane scoring, pool.lease() enforcing account-to-IP affinity with rebind-before-release ordering.",
+      "priority": "normal",
+      "status": "completed",
+      "progress": 0,
+      "assignedTo": [],
+      "tags": [
+        "instaReport",
+        "rebuild",
+        "T6"
+      ],
+      "createdAt": "2026-09-25T17:47:05.968Z",
+      "startedAt": null,
+      "completedAt": null
+    },
+    "task-1790358425991-won13m": {
+      "taskId": "task-1790358425991-won13m",
+      "type": "feature",
+      "description": "T7 Browser channel: wizard state machine against local HTML fixture. NETWORK-FIRST classification (capture submit XHR, validate status+body; DOM corroborates). State-transition assertion not bare string match. Handle pre-submit anchor trap, multi-step transition trap, toast race, nbsp/bidi normalization.",
+      "priority": "critical",
+      "status": "completed",
+      "progress": 100,
+      "assignedTo": [],
+      "tags": [
+        "instaReport",
+        "rebuild",
+        "T7"
+      ],
+      "createdAt": "2026-09-25T17:47:05.991Z",
+      "startedAt": null,
+      "completedAt": "2026-09-25T20:59:39.825Z",
+      "result": {
+        "summary": "Browser channel complete. 659 passed, 0 skipped, pyflakes clean. Committed 910b705."
+      }
+    },
+    "task-1790358426008-i55o63": {
+      "taskId": "task-1790358426008-i55o63",
+      "type": "feature",
+      "description": "T8 Anchors + artifacts + narrative: TOML anchor table incl. confirmation string, DOM diff + screenshot on every failure (redacted, written outside repo), narrative templates + per-target detail, categories resolved against live dialog, structured target records.",
+      "priority": "normal",
+      "status": "completed",
+      "progress": 100,
+      "assignedTo": [],
+      "tags": [
+        "instaReport",
+        "rebuild",
+        "T8"
+      ],
+      "createdAt": "2026-09-25T17:47:06.008Z",
+      "startedAt": null,
+      "completedAt": "2026-09-25T18:58:24.402Z",
+      "result": {
+        "commit": "a1f1c6b",
+        "tests": 525
+      }
+    },
+    "task-1790358426023-jjj35b": {
+      "taskId": "task-1790358426023-jjj35b",
+      "type": "feature",
+      "description": "T9 API channel -- CONDITIONAL ON T0 PASSING: mobile identity (IGT:2) primary, web identity internal fallback, preflight.py proves the channel answers before it is ever relied on.",
+      "priority": "normal",
+      "status": "pending",
+      "progress": 0,
+      "assignedTo": [],
+      "tags": [
+        "instaReport",
+        "rebuild",
+        "T9",
+        "gated-on-T0"
+      ],
+      "createdAt": "2026-09-25T17:47:06.023Z",
+      "startedAt": null,
+      "completedAt": null
+    },
+    "task-1790358426044-6k2936": {
+      "taskId": "task-1790358426044-6k2936",
+      "type": "feature",
+      "description": "T10 doctor command: gates the runner by exit code. Verifies each channel end-to-end against an operator-controlled target. REFUSES to start a run if zero channels pass. Without it the first run is an unverified production run.",
+      "priority": "critical",
+      "status": "completed",
+      "progress": 100,
+      "assignedTo": [],
+      "tags": [
+        "instaReport",
+        "rebuild",
+        "T10"
+      ],
+      "createdAt": "2026-09-25T17:47:06.044Z",
+      "startedAt": null,
+      "completedAt": "2026-09-26T11:37:53.244Z",
+      "result": {}
+    },
+    "task-1790358426060-h2xe12": {
+      "taskId": "task-1790358426060-h2xe12",
+      "type": "feature",
+      "description": "T11 Pacing: time.monotonic() only, per-account cadence derived from remaining budget + time since last report so an account slows before it stops. Replaces the guessed random.uniform(1.5, 4.0).",
+      "priority": "normal",
+      "status": "completed",
+      "progress": 0,
+      "assignedTo": [],
+      "tags": [
+        "instaReport",
+        "rebuild",
+        "T11"
+      ],
+      "createdAt": "2026-09-25T17:47:06.060Z",
+      "startedAt": null,
+      "completedAt": null
+    },
+    "task-1790358426071-l7junl": {
+      "taskId": "task-1790358426071-l7junl",
+      "type": "feature",
+      "description": "T12 Runner + CLI: ladder orchestration with dispatch boundary enforced, per-channel health accounting, cross-check targets against account pool (self-report = instant self-lock), --dry-run/--max-reports/--resume/--config, exit codes, per-run cap + abort latch.",
+      "priority": "normal",
+      "status": "completed",
+      "progress": 0,
+      "assignedTo": [],
+      "tags": [
+        "instaReport",
+        "rebuild",
+        "T12"
+      ],
+      "createdAt": "2026-09-25T17:47:06.071Z",
+      "startedAt": null,
+      "completedAt": null
+    },
+    "task-1790358426096-5z78x4": {
+      "taskId": "task-1790358426096-5z78x4",
+      "type": "feature",
+      "description": "T13 CI: lint, type check, full offline test suite, git add -A credential-leak test (adopted #8), anchor-drift test (anchors in TOML == terminal strings in fixture, else fail loudly).",
+      "priority": "normal",
+      "status": "completed",
+      "progress": 0,
+      "assignedTo": [],
+      "tags": [
+        "instaReport",
+        "rebuild",
+        "T13"
+      ],
+      "createdAt": "2026-09-25T17:47:06.096Z",
+      "startedAt": "2026-09-26T11:37:53.271Z",
+      "completedAt": null
+    }
+  },
+  "version": "3.0.0"
+}

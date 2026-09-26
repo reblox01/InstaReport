@@ -58,11 +58,27 @@ log = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 20.0
 
-#: Only a last-resort default. Real user agents live in the config, because
-#: Instagram's accepted strings move and a pinned default goes stale silently.
+#: Matches the tier these probes actually talk to. Every default probe and the
+#: control point at ``i.instagram.com``, which is the *mobile* API host, and
+#: that tier answers ``400 {"message": "useragent mismatch"}`` to anything that
+#: does not present as a mobile client.
+#:
+#: This used to be a desktop Chrome string, which meant the probe's shipped
+#: defaults asked a mobile host a mobile question in a desktop's voice. The
+#: failure was quiet and self-consistent: the control 500'd, the module
+#: reported INCONCLUSIVE, and the natural reading -- "unobservable, so do not
+#: build the channel" -- was wrong. The API was answering the whole time.
+#:
+#: The earlier comment here said a pinned default "goes stale silently", which
+#: is not what was measured. Measured, on 2026-09-26 against a live session:
+#: app versions 155.0.0.14.114, 219.0.0.12.117 and 302.0.0.23.113 all
+#: returned byte-identical 200s, with and without ``X-IG-App-ID``, on both the
+#: Android and iOS UA shapes. Only the *format* is checked. So this stays
+#: pinned, and the config still overrides it -- but the reason to override is
+#: to match a tier, not to chase a version.
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    "Instagram 302.0.0.23.113 Android (24/7.0; 640dpi; 1440x2560; samsung; "
+    "SM-G930F; herolte; samsungexynos8890; en_US; 336201482)"
 )
 
 
@@ -81,6 +97,21 @@ class ProbeVerdict(str, Enum):
     #: This is the outcome a burned IP produces, and it is the one that caused
     #: the original misdiagnosis.
     INCONCLUSIVE = "inconclusive"
+
+    #: A route answered ``ok`` while the control did not. The API is real and
+    #: reachable and the session is good -- that much is proven -- but the exit
+    #: could not be shown to work, so nothing here will reproduce.
+    #:
+    #: This is a separate verdict rather than ``OBSERVABLE`` because the two
+    #: answers lead to opposite actions. ``OBSERVABLE`` unblocks building the
+    #: channel. This one says: the route exists, so the channel is worth
+    #: building, but not from *this* exit -- go get a better one first.
+    #:
+    #: Observed for real, which is why it exists. One run returned ``403`` for
+    #: the control and ``200 {"status": "ok"}`` for a probe against the same URL
+    #: 600ms later, and the old rule reported INCONCLUSIVE and threw the
+    #: success away. The success was the more informative of the two.
+    OBSERVABLE_UNSTABLE_EXIT = "observable_unstable_exit"
 
 
 @dataclass
@@ -132,7 +163,11 @@ class ProbeReport:
     def control_ok(self) -> bool:
         """Did the known-good call answer readably?
 
-        The single gate. False means every other row is noise.
+        A statement about the **exit**, not about any route. That distinction is
+        the whole design: the control exists so that a *negative* probe result
+        can be attributed -- a 404 next to a working control is a missing route,
+        and a 404 next to a failed control is an exit that cannot be trusted.
+        Only negatives need that corroboration.
         """
         if self.control is None:
             return False
@@ -140,9 +175,29 @@ class ProbeReport:
 
     @property
     def verdict(self) -> ProbeVerdict:
-        if not self.control_ok:
-            return ProbeVerdict.INCONCLUSIVE
         verdicts = {r.network_verdict for r in self.results}
+
+        if not self.control_ok:
+            # A failed control suppresses *negative* results, and only negative
+            # results. ``ok`` is not ambiguous: it cannot be produced by a
+            # blocked exit, a broken proxy, or an absent credential. Measured on
+            # 2026-09-26 -- the same route unauthenticated answers 404 -> 302 ->
+            # the logged-out page, never an application error -- so a ``200
+            # {"status": "ok"}`` is evidence about *this session* and not just
+            # about the route.
+            #
+            # Discarding it is how a working API got reported as unobservable:
+            # the run above had a 200 sitting in its own results and threw it
+            # away because an earlier request to the same URL had failed.
+            #
+            # A control that never *ran* is a different case and is excluded.
+            # ``OBSERVABLE_UNSTABLE_EXIT`` claims the exit was watched refusing
+            # us; a missing control means nobody watched, so there is no
+            # behaviour to report and the run is simply malformed.
+            if self.control is not None and NetworkVerdict.OK in verdicts:
+                return ProbeVerdict.OBSERVABLE_UNSTABLE_EXIT
+            return ProbeVerdict.INCONCLUSIVE
+
         if not verdicts:
             return ProbeVerdict.UNOBSERVABLE
         if verdicts <= {NetworkVerdict.OK, NetworkVerdict.REJECTED}:
@@ -211,6 +266,22 @@ def _interpretation(verdict: ProbeVerdict) -> str:
             "building. Re-run from a second clean exit before committing, in case this\n"
             "one is unusual."
         )
+    if verdict is ProbeVerdict.OBSERVABLE_UNSTABLE_EXIT:
+        return (
+            "OBSERVABLE, BUT THE EXIT IS NOT TRUSTWORTHY. At least one route\n"
+            "answered 'ok' -- so the API exists, this session is good, and the channel\n"
+            "is worth building -- while the control on the same exit did not answer.\n"
+            "\n"
+            "That combination is the interesting part. Both requests carried the same\n"
+            "cookie from the same address moments apart, so something is refusing\n"
+            "some requests and not others: a challenge threshold, a per-route throttle,\n"
+            "or a flaky provider hop. A run on this exit would be unreliable, which is\n"
+            "worse than no run at all, because it fails partway.\n"
+            "\n"
+            "Do not treat this as INCONCLUSIVE. It is the stronger of the two readings.\n"
+            "Re-run from a clean residential exit; if the control answers there, the\n"
+            "API channel is confirmed and the problem was the exit."
+        )
     if verdict is ProbeVerdict.ANSWERED_NOT_OK:
         return (
             "ANSWERED, NOT OK. Every route returned something readable that is not a\n"
@@ -260,11 +331,15 @@ class Probe:
 #: containing a state-changing call, so the guarantee lives in code.
 DEFAULT_PROBES: tuple[Probe, ...] = (
     Probe(
+        name="account_form_data",
+        url="https://i.instagram.com/api/v1/accounts/edit/web_form_data/",
+    ),
+    Probe(
         name="web_profile_info",
         url="https://i.instagram.com/api/v1/users/web_profile_info/?username={username}",
     ),
     Probe(
-        name="mobile_user_by_name",
+        name="web_profile_info_app_id",
         url="https://i.instagram.com/api/v1/users/web_profile_info/?username={username}",
         headers={"X-IG-App-ID": "936619743392459"},
     ),
@@ -309,21 +384,45 @@ def _assert_read_only(probes: Sequence[Probe]) -> None:
 
 
 
-def _egress_ip(client: httpx.Client, timeout: float) -> str | None:
+def _egress_ip(proxy: str | None, timeout: float, user_agent: str) -> str | None:
     """The address the world sees, so a 'clean exit' claim can be checked.
 
     A proxy pool that silently hands back the same flagged address is the reason
     the original probe burned itself, and it is invisible without asking.
+
+    This builds its **own** client rather than borrowing the caller's. Borrowing
+    looked harmless and was not: the caller's client carries
+    ``Cookie: sessionid=...`` at the client level, so the Instagram session was
+    sent to ``api.ipify.org`` and ``ifconfig.me/ip`` on every single run. Those
+    are unrelated third parties, and the operator consented to neither.
+
+    The proxy is still threaded through, and must be: an egress check that
+    bypasses the proxy reports the *direct* address, which is the one number
+    this function exists to establish and the one number that would be wrong.
+
+    So the credential is kept out of scope structurally -- it is not passed in,
+    so it cannot be sent -- rather than by remembering to strip it later.
     """
-    for service in ("https://api.ipify.org", "https://ifconfig.me/ip"):
-        try:
-            response = client.get(service, timeout=timeout)
-            if response.status_code == 200:
-                candidate = response.text.strip()
-                if candidate:
-                    return candidate
-        except httpx.HTTPError:
-            continue
+    headers = {"User-Agent": user_agent, "Accept": "text/plain"}
+    try:
+        with httpx.Client(
+            proxy=proxy, timeout=timeout, headers=headers
+        ) as client:
+            for service in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+                try:
+                    response = client.get(service)
+                except httpx.HTTPError:
+                    continue
+                if response.status_code == 200:
+                    candidate = response.text.strip()
+                    if candidate:
+                        return candidate
+    except httpx.HTTPError:
+        # The proxy refused to connect at all. Every service would fail
+        # identically, so there is no point trying the second one, and no
+        # address to report: "unknown" is the honest answer, and it is
+        # different from "the address is empty".
+        log.debug("egress check could not connect through %r", proxy)
     return None
 
 
@@ -347,10 +446,21 @@ def _do(
     """Execute one probe and record what came back."""
     url = render_url(probe.url, substitutions)
 
+    # ``probe.headers`` is the *request*, not a display value, so nothing here is
+    # scrubbed. It was, and that was the worst bug in this module's history:
+    # the control call carries ``Cookie: sessionid=...`` in its headers, the
+    # registry replaced the sessionid with the redaction placeholder, and the
+    # one request the entire module exists to trust went out unauthenticated.
+    # It answered 403 on every run, and because the *probes* pass ``headers={}``
+    # -- so the loop was a no-op for them, and they inherited the real cookie
+    # from the client -- a probe against the control's own route answered 200
+    # seconds later. The symptom read as "Instagram is flaky"; the cause was
+    # this function.
+    #
+    # Redaction belongs on the way *out* to a human, not on the way out to the
+    # network. It is applied where a value is recorded for display:
+    # ``ProbeResult.excerpt`` and the JSON/table renderers.
     headers = dict(probe.headers)
-    # Registered secrets are scrubbed from anything surfaced to a human.
-    for key, value in list(headers.items()):
-        headers[key] = get_registry().scrub(value)
 
     result = ProbeResult(name=probe.name, url=url)
     started = time.monotonic()
@@ -399,26 +509,36 @@ def run_probe(
     subs = dict(substitutions or {})
     headers = {"User-Agent": user_agent, **dict(extra_headers or {})}
 
+    # The egress check runs first and outside the credentialed client, so the
+    # order that matters -- control before probes -- is untouched, and the
+    # session never travels to an IP-echo service. See ``_egress_ip``.
+    report = ProbeReport(
+        exit_ip=_egress_ip(proxy, timeout, user_agent), control=None
+    )
+
     with httpx.Client(
         proxy=proxy,
         timeout=timeout,
         follow_redirects=True,
         headers=headers,
     ) as client:
-        report = ProbeReport(exit_ip=_egress_ip(client, timeout), control=None)
-
-        control = Probe(
-            name="CONTROL (known-good)",
-            url=control_url,
-            headers=dict(extra_headers or {}),
-        )
+        # The control adds no headers of its own. The credential is attached
+        # once, on the client, and the control and the probes both inherit it.
+        # They used to be attached twice -- once on the client and once on the
+        # control's own ``Probe.headers`` -- and that duplication is how the
+        # redaction loop came to scrub one copy and not the other.
+        control = Probe(name="CONTROL (known-good)", url=control_url)
         report.control = _do(client, control, subs)
 
         if not report.control_ok:
+            # True of the *negative* rows only. A row that answers ``ok`` does
+            # not need the control's corroboration and will still be believed,
+            # which is why this says what it actually means rather than the
+            # reassuring-sounding "nothing here means anything".
             log.error(
-                "control call failed (status=%s verdict=%s error=%s); "
-                "remaining probes will be run for completeness but their results "
-                "cannot be interpreted",
+                "control call failed (status=%s verdict=%s error=%s); negative "
+                "probe results below cannot be attributed to a route rather "
+                "than to this exit. A probe answering 'ok' is still evidence.",
                 report.control.status,
                 report.control.network_verdict.value,
                 report.control.error,
@@ -445,7 +565,21 @@ def run_across_exits(
 
 #: Authenticated, read-only, and known to answer when credentials are good. This
 #: is the control: if it does not answer, nothing else in the run means anything.
-DEFAULT_CONTROL_URL = "https://i.instagram.com/api/v1/accounts/current_v2/"
+#:
+#: It was ``/api/v1/accounts/current_v2/``, which is not a route. Measured on
+#: 2026-09-26: 404 with Instagram's 20,942-byte logged-out HTML page for every
+#: mobile user agent, and 500 for the desktop one. A control that answers 404
+#: to a valid session cannot distinguish "this exit is blocked" from "this URL
+#: is wrong" -- and it reported INCONCLUSIVE on an exit that was demonstrably
+#: working, which is the expensive direction to be wrong in.
+#:
+#: ``/api/v1/accounts/edit/web_form_data/`` is the replacement. It exists, it
+#: requires a session, it is a GET, and it answers ``{"status": "ok", ...}`` --
+#: which is the one shape :func:`classify_body` is built to recognise. It also
+#: fails *usefully*: an unauthenticated request gets 404 -> 302 -> the login
+#: page, and a bad user agent gets a JSON ``useragent mismatch``. Both name the
+#: actual problem, which is the property a control exists to provide.
+DEFAULT_CONTROL_URL = "https://i.instagram.com/api/v1/accounts/edit/web_form_data/"
 
 #: A username the operator controls. Probing an account you do not own is both
 #: rude and less informative, since a genuine block looks like a missing one.
@@ -513,6 +647,29 @@ def _main(argv: Sequence[str] | None = None) -> int:
     if config.api.app_id:
         headers["X-IG-App-ID"] = config.api.app_id
 
+    # The probe set targets the *mobile* API host, so the identity presented must
+    # be a mobile one. Falling back to the web user agent here is what made the
+    # first T0 run report INCONCLUSIVE on a perfectly reachable API: with
+    # [api] mobile_user_agent unset, the run sent a desktop Chrome string to
+    # i.instagram.com and got "useragent mismatch" back from every route.
+    #
+    # A wrong-tier identity is a configuration error, so it is named rather than
+    # papered over. Falling back to the module default -- which is mobile, and
+    # which the comment above explains -- is correct; falling back to the *web*
+    # agent is not, and never was.
+    if config.api.mobile_user_agent:
+        probe_ua = config.api.mobile_user_agent
+    else:
+        probe_ua = DEFAULT_USER_AGENT
+        if config.api.web_user_agent:
+            log.warning(
+                "[api] mobile_user_agent is unset; using the built-in mobile "
+                "default %r. The web user agent is deliberately NOT used here: "
+                "these probes target the mobile API tier, which rejects a "
+                "desktop identity with 'useragent mismatch'.",
+                DEFAULT_USER_AGENT.split(" Android ")[0] + " ...",
+            )
+
     exits: list[str | None] = list(args.proxy) or [None]
     if len(exits) < 2:
         print(
@@ -526,11 +683,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
         control_url=args.control,
         substitutions={"username": args.username},
         timeout=args.timeout,
-        user_agent=(
-            config.api.mobile_user_agent
-            or config.api.web_user_agent
-            or DEFAULT_USER_AGENT
-        ),
+        user_agent=probe_ua,
         extra_headers=headers,
     )
 
@@ -542,12 +695,17 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 print(f"\n{'=' * 64}\nEXIT {index + 1} of {len(reports)}\n{'=' * 64}")
             print(report.summary())
 
-    # Exit code mirrors the strongest signal seen: 0 only if some exit was
-    # OBSERVABLE, which is the only outcome that unblocks building the channel.
+    # Exit code mirrors the strongest signal seen. 0 requires a *clean*
+    # OBSERVABLE, not merely a route that answered: a run that proved the API
+    # exists but could not prove its own exit worked has not cleared the gate,
+    # because every report it later files would be filed through an exit it does
+    # not trust. That is exit 1 -- finished, and the operator has reading to do.
     best = {r.verdict for r in reports}
     if ProbeVerdict.OBSERVABLE in best:
         return 0
-    if ProbeVerdict.ANSWERED_NOT_OK in best:
+    if ProbeVerdict.OBSERVABLE_UNSTABLE_EXIT in best or (
+        ProbeVerdict.ANSWERED_NOT_OK in best
+    ):
         return 1
     return 3
 
