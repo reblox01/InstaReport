@@ -29,6 +29,7 @@ import pytest
 
 from insta_report.accounts import Account, AccountPool
 from insta_report.checkpoint import CheckpointStore
+from insta_report.doctor import ChannelProbe
 from insta_report.errors import (
     AccountChallenged,
     ErrorScope,
@@ -124,6 +125,10 @@ class FakeChannel:
         self._script = list(script or [])
         self.calls: list[tuple[str, int, str | None, str | None]] = []
         self.closed = False
+        #: Override the rehearsal verdict. ``None`` means "the channel works".
+        self.rehearsal: ChannelProbe | None = None
+        #: ``(handle, submit)`` for every rehearsal asked for.
+        self.rehearsed: list[tuple[str | None, bool]] = []
         #: Every boundary call seen, in order. The tests that matter assert
         #: against this rather than against a counter.
         self.boundaries: list[str] = []
@@ -156,6 +161,28 @@ class FakeChannel:
 
     async def aclose(self) -> None:
         self.closed = True
+
+    async def rehearse(self, target, *, submit: bool = False) -> ChannelProbe:
+        """Reach the submit button, like a channel that works.
+
+        Added for T10: the CLI now gates every run on a rehearsal, so a fake
+        channel with no ``rehearse`` fails the gate and the *other* 80 tests
+        that use this class start failing for a reason that has nothing to do
+        with what they are about. A test that cares about the gate builds its
+        own channel, or sets :attr:`rehearsal`.
+        """
+        self.rehearsed.append((getattr(target, "handle", None), submit))
+        if self.rehearsal is not None:
+            return self.rehearsal
+        return ChannelProbe(
+            name=self.name,
+            ok=True,
+            reached="submit ready",
+            detail="rehearsed by the fake",
+            categories=("Spam", "Fake account"),
+            submit_ready=True,
+            submitted=False,
+        )
 
 
 def _dispatch_then_ack(target: Target, on_dispatch, attempt: int) -> Outcome:

@@ -15,7 +15,7 @@ the module exists:
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -30,6 +30,25 @@ from insta_report.errors import (
     ReportBudgetExhausted,
 )
 from insta_report.outcomes import Outcome, TerminalState, utc_now
+
+#: The day every account in this file starts on, and the day the injected
+#: ``wall_clock`` reports.
+#:
+#: It is a constant rather than ``date.today()`` for a reason that cost two
+#: failures to learn: the daily budget is the one feature here that consults the
+#: calendar, so any test that lets the real date leak in is a test that expires
+#: at midnight. These two used to read ``date(2026, 9, 25)`` while
+#: ``Account.day`` defaulted to the real today -- they agreed by coincidence,
+#: and on the day the calendar turned over they silently inverted: the "rolls
+#: over on a new day" test was asked to roll to *today*, and the "same day is a
+#: no-op" test was asked to roll to *yesterday*. Both failed, and both were
+#: reporting the truth.
+#:
+#: An arbitrary fixed date, derived everywhere else, so "tomorrow" is written as
+#: tomorrow rather than as a number that stops meaning that next month.
+DAY = date(2026, 3, 14)
+TOMORROW = DAY + timedelta(days=1)
+YESTERDAY = DAY - timedelta(days=1)
 
 
 class FakeClock:
@@ -53,6 +72,12 @@ class FakeClock:
 def make_account(ref: str = "alpha", budget: int = 20, **kwargs) -> Account:
     kwargs.setdefault("username", f"{ref}_user")
     kwargs.setdefault("sessionid", "sessionid%3Anever-log-this-value")
+    # Pinned, not defaulted. ``Account.day`` defaults to ``date.today()``, and a
+    # test that inherits that is a test with a maintenance date. It also has to
+    # match the pool's injected ``wall_clock`` -- see the DAY comment -- because
+    # a pool whose clock says one day and whose accounts say another rolls the
+    # budget over on the first lease and never says so.
+    kwargs.setdefault("day", DAY)
     return Account(ref=ref, daily_budget=budget, **kwargs)
 
 
@@ -68,7 +93,7 @@ def make_pool(*accounts: Account, clock: FakeClock | None = None, **kwargs) -> A
     return AccountPool(
         chosen,
         monotonic=clock,
-        wall_clock=kwargs.pop("wall_clock", lambda: date(2026, 9, 25)),
+        wall_clock=kwargs.pop("wall_clock", lambda: DAY),
         **kwargs,
     )
 
@@ -79,7 +104,7 @@ def empty_pool(clock: FakeClock | None = None) -> AccountPool:
     return AccountPool(
         [],
         monotonic=clock or FakeClock(),
-        wall_clock=lambda: date(2026, 9, 25),
+        wall_clock=lambda: DAY,
     )
 
 
@@ -147,15 +172,59 @@ def test_budget_resets_on_a_new_day():
     account.count_dispatch()
     assert account.remaining == 3
 
-    assert account.roll_day_if_needed(date(2026, 9, 26)) is True
+    assert account.roll_day_if_needed(TOMORROW) is True
     assert account.remaining == 5
 
 
 def test_roll_day_on_the_same_day_is_a_no_op():
+    """Same day in, spent count out. The reset is idempotent, not cumulative."""
     account = make_account(budget=5)
     account.count_dispatch()
-    assert account.roll_day_if_needed(date(2026, 9, 25)) is False
+    assert account.roll_day_if_needed(DAY) is False
     assert account.remaining == 4
+
+
+def test_roll_day_backwards_also_resets():
+    """A clock that went backwards is treated as a new day, not trusted.
+
+    The alternative -- only rolling forwards -- means a machine whose date is
+    corrected backwards keeps reporting a budget already spent today, and the
+    account is silent-unusable until the clock catches up.
+    """
+    account = make_account(budget=5)
+    account.count_dispatch()
+    assert account.roll_day_if_needed(YESTERDAY) is True
+    assert account.remaining == 5
+
+
+def test_a_rolled_account_remembers_the_new_day():
+    """So a second call on the same new day is a no-op rather than a re-reset.
+
+    Without this, a pool whose clock ticks forward twice in a run would reset an
+    account that had already spent budget in the *new* day.
+    """
+    account = make_account(budget=5)
+    account.count_dispatch()
+    account.roll_day_if_needed(TOMORROW)
+    account.count_dispatch()
+    assert account.remaining == 4
+    assert account.roll_day_if_needed(TOMORROW) is False
+    assert account.remaining == 4
+
+
+def test_the_pool_clock_and_the_account_day_start_out_in_agreement():
+    """The invariant that made a midnight failure invisible.
+
+    ``Account.day`` defaults to the real calendar day while the pool's clock is
+    injected. If those two disagree, every account silently rolls its budget on
+    the first lease of the run -- so the pool looks like it honoured the
+    injection while quietly resetting the budget it was meant to enforce.
+    """
+    pool = make_pool(make_account(budget=5))
+    # ``accounts`` is the public view; the clock is private because injecting it
+    # is a test concern, and reading it back is the only way to assert the two
+    # agree.
+    assert [a.day for a in pool.accounts] == [pool._wall_clock()]  # noqa: SLF001
 
 
 def test_rolled_account_becomes_eligible_again_uses_pool_clock():
@@ -165,7 +234,7 @@ def test_rolled_account_becomes_eligible_again_uses_pool_clock():
     pool.note_dispatch(lease)
     with pytest.raises(NoEligibleAccount):
         pool.lease()
-    pool._wall_clock = lambda: date(2026, 9, 26)  # noqa: SLF001 - drives the clock
+    pool._wall_clock = lambda: TOMORROW  # noqa: SLF001 - drives the clock
     assert pool.lease() is not None
 
 

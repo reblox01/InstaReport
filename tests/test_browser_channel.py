@@ -254,6 +254,11 @@ class FakeDriver:
     async def close(self) -> None:
         self.events.append("close")
 
+    async def start(self, anchors) -> "FakeDriver":
+        self._maybe_fail("start")
+        self.events.append("start")
+        return self
+
 
 def a_channel(
     driver: Any,
@@ -871,6 +876,67 @@ EXACT_ANCHORS = {
     "report_rate_limited.html": {"rate_limited"},
     "report_not_found.html": {"not_found"},
 }
+
+
+class TestTheChannelOwnsItsDriverLifecycle:
+    """The bug the offline suite cannot see, and the reason these tests exist.
+
+    ``BrowserDriver.start()`` is what launches the browser, opens the persistent
+    context, creates the page, attaches the response capture, and -- crucially --
+    hands the driver its anchors, which every subsequent read depends on.
+
+    It was not called from anywhere. The CLI built drivers and handed them to a
+    channel; the channel went straight to ``goto_profile``; ``_page`` was
+    ``None``; and every single real report would have failed with
+    ``AttributeError: 'NoneType' object has no attribute 'goto'`` -- which the
+    runner files as CHANNEL_FAILED, reading to the operator as "Instagram
+    rejected the session".
+
+    The offline suite stayed green throughout, because every offline test uses a
+    fake driver that never needed starting. The real-browser tests stayed green
+    too, because they call ``start()`` themselves. Nothing tested the seam
+    between "a driver exists" and "a driver is running", which is where the tool
+    was broken.
+    """
+
+    def test_a_report_starts_its_driver_before_touching_the_page(self):
+        driver = FakeDriver(happy_pages())
+        channel = a_channel(driver)
+        report = asyncio.run(channel.report(a_target(), on_dispatch=lambda: None))
+        assert driver.events[0] == "start", driver.events
+        assert report.was_dispatched
+
+    def test_starting_twice_is_harmless(self):
+        """Idempotent, because the doctor starts a driver to test the build.
+
+        A second launch on a directory the first one still holds fails with a
+        lock error that reads like a corrupt profile.
+        """
+        driver = FakeDriver(happy_pages())
+        channel = a_channel(driver)
+        asyncio.run(driver.start(channel.anchors))
+        asyncio.run(driver.start(channel.anchors))
+        assert driver.events.count("start") == 2
+        assert driver.events.count("close") == 0
+
+    def test_a_driver_that_will_not_start_propagates_rather_than_pretending(
+        self,
+    ):
+        """A launch failure is not a decision not to report.
+
+        Swallowed into a NOT_REPORTABLE outcome it would read as "the tool
+        declined this one" -- and the account would never be quarantined, the
+        channel would never be graded, and the operator would be told the target
+        was not reportable when the truth is that no browser ever opened. The
+        typed exception is the only thing that reaches the runner's health
+        accounting, so it has to survive.
+        """
+        driver = FakeDriver(happy_pages(), fail_on={"start": RuntimeError("no build")})
+        channel = a_channel(driver)
+        with pytest.raises(RuntimeError, match="no build"):
+            asyncio.run(channel.report(a_target(), on_dispatch=lambda: None))
+        # And it did not get as far as pretending to look at the page.
+        assert "close" not in driver.events
 
 
 @pytest.mark.browser

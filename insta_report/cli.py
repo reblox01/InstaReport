@@ -45,6 +45,7 @@ import json
 import signal
 import sys
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence, TextIO
 
@@ -54,6 +55,7 @@ from .artifacts import ArtifactStore
 from .browser import BrowserChannel, BrowserDriver, SubmitPolicy
 from .checkpoint import CheckpointStore
 from .config import Config, ConfigError, load_config
+from .doctor import DoctorReport, run_doctor
 from .narrative import NarrativeBuilder, build_builder
 from .pacing import Pacer, PacingConfig
 from .proxies import ProxyPool, build_pool
@@ -471,6 +473,32 @@ def _install_sigint(runner: Runner) -> Callable[[], None]:
     return restore
 
 
+@dataclass(frozen=True)
+class DoctorRequest:
+    """What the gate should check, and how hard.
+
+    An explicit object rather than the parsed ``argparse.Namespace``, because
+    the same three questions are asked by two different commands with two
+    different flag sets, and passing a namespace between them means the gate
+    reads ``doctor_args.no_doctor`` from a parser that may not even have that
+    attribute. Every field has a default, so a caller that does not care gets
+    the safe answer.
+    """
+
+    #: Run the checks at all. ``False`` is the conscious ``--no-doctor``, and
+    #: the only way to skip the gate.
+    enabled: bool = True
+    #: The account the rehearsal opens its report dialog against. ``None`` means
+    #: no channel is rehearsed, which means the gate cannot pass -- see
+    #: :meth:`DoctorReport.runnable`.
+    probe_target: str | None = None
+    #: Actually file the one report. Off by default: it is the only step whose
+    #: verification costs a report.
+    submit: bool = False
+    #: Lease an exit and open a browser. ``False`` cannot satisfy the gate.
+    live: bool = True
+
+
 async def _run(
     config: Config,
     targets: TargetList,
@@ -481,6 +509,7 @@ async def _run(
     verbose: bool,
     stream: TextIO,
     fetch_impl: Callable[..., Any] | None = None,
+    doctor: DoctorRequest | None = None,
 ) -> int:
     """Assemble the parts, run once, print the summary, return the exit code.
 
@@ -514,6 +543,41 @@ async def _run(
     artifacts = ArtifactStore(config.paths, run_id, allow_trace=False)
     channels = _build_channels(config, anchors, artifacts)
     narratives = build_builder(config.run, anchors=anchors)
+
+    # The gate. Before the runner exists, because a runner that has already
+    # opened a checkpoint and started workers is a run that has started.
+    #
+    # A dry run is exempt: it sends nothing, so there is nothing for a broken
+    # channel to break, and refusing `--dry-run` on a broken setup would stop
+    # the operator from *seeing* that it is broken. A --resume is not exempt,
+    # because finishing a run is dispatching.
+    if doctor is not None and not options.dry_run:
+        if not doctor.enabled:
+            print(
+                "WARNING: --no-doctor. Nothing has verified that a report can be "
+                "filed. Every failure below will be discovered at the first click, "
+                "against the account you were trying to protect.",
+                file=stream,
+            )
+        else:
+            verdict = await _doctor(
+                config,
+                targets=targets,
+                probe_target=doctor.probe_target,
+                submit=doctor.submit,
+                live=doctor.live,
+                fetch_impl=fetch_impl,
+            )
+            print("", file=stream)
+            print(verdict.render(), file=stream)
+            if not verdict.runnable:
+                raise ConfigError(
+                    "refusing to start: nothing was verified as able to file a "
+                    "report, so a run now would discover it one report at a time, "
+                    "and file the failure against Instagram rather than against "
+                    "this setup. Fix the failures above, or pass --no-doctor to "
+                    "start anyway."
+                )
 
     runner = Runner(
         store=store,
@@ -861,6 +925,24 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="concurrent workers; bounded by eligible accounts anyway",
     )
+    run.add_argument(
+        "--no-doctor",
+        action="store_true",
+        help="skip the pre-flight check; every failure moves to the first click",
+    )
+    run.add_argument(
+        "--probe-target",
+        metavar="HANDLE",
+        help=(
+            "for the pre-flight rehearsal, an account you control; the gate "
+            "refuses to start without one (default: the first target in the list)"
+        ),
+    )
+    run.add_argument(
+        "--submit",
+        action="store_true",
+        help="with --probe-target, file one real report to verify the last step",
+    )
     run.set_defaults(handler=_cmd_run)
 
     status = sub.add_parser(
@@ -900,6 +982,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="compare a JSON map of anchor -> observed text, and report drift",
     )
     anchors.set_defaults(handler=_cmd_anchors)
+
+    doctor = sub.add_parser(
+        "doctor",
+        help="check that a report can actually be filed, before one is (live)",
+        description=(
+            "Check the setup, then drive each channel up to the submit button "
+            "against --probe-target and stop. Files nothing unless --submit. "
+            "'run' does this for you and refuses to start if no channel passes."
+        ),
+    )
+    doctor.add_argument(
+        "--probe-target",
+        metavar="HANDLE",
+        help="an account you control; the rehearsal opens its report dialog",
+    )
+    doctor.add_argument(
+        "--submit",
+        action="store_true",
+        help="actually file one report against --probe-target (off by default)",
+    )
+    doctor.add_argument(
+        "--targets",
+        metavar="PATH",
+        help="also check the target list (default: <data_dir>/targets.txt)",
+    )
+    doctor.add_argument(
+        "--no-live",
+        action="store_true",
+        help="setup checks only: no exit leased, no browser opened",
+    )
+    doctor.add_argument(
+        "--json", action="store_true", help="machine-readable, for a wrapper"
+    )
+    doctor.set_defaults(handler=_cmd_doctor)
 
     return parser
 
@@ -968,6 +1084,19 @@ def _cmd_run(
         dry_run=args.dry_run,
     )
 
+    # The rehearsal target defaults to the first reportable target in the list,
+    # so `run` is gated without the operator having to name anything. A handle
+    # the operator *does* name always wins: they may know their list is stale.
+    #
+    # There is deliberately no ``--no-live`` here, though `doctor` has one. A
+    # run that skipped every live check could not be gated at all, so the flag
+    # could only ever produce a refusal -- a flag that can only fail is a flag
+    # that should not exist. "Skip the gate" is what --no-doctor is for.
+    probe_target = args.probe_target
+    if probe_target is None and not args.no_doctor:
+        first = next(iter(targets.pending()), None)
+        probe_target = first.handle if first is not None else None
+
     try:
         return asyncio.run(
             _run(
@@ -979,6 +1108,11 @@ def _cmd_run(
                 verbose=args.verbose,
                 stream=stream,
                 fetch_impl=fetch_impl,
+                doctor=DoctorRequest(
+                    enabled=not args.no_doctor,
+                    probe_target=probe_target,
+                    submit=bool(args.submit),
+                ),
             )
         )
     except KeyboardInterrupt:
@@ -987,6 +1121,113 @@ def _cmd_run(
             file=stream,
         )
         return EXIT_INTERRUPTED
+
+
+async def _doctor(
+    config: Config,
+    *,
+    targets: TargetList | None,
+    target_problem: str = "",
+    probe_target: str | None,
+    submit: bool,
+    live: bool,
+    fetch_impl: Callable[..., Any] | None,
+) -> DoctorReport:
+    """Build whatever the requested checks need, then run them.
+
+    Nothing is built speculatively. A ``--no-live`` invocation does not lease an
+    exit or open a browser, and a run without ``--probe-target`` does not build
+    channels at all -- building a ``BrowserDriver`` is free but launching one is
+    not, and a health check that opens a browser it was not asked to open is
+    itself a surprise.
+    """
+    pool = _build_proxies(config, fetch_impl or fetch) if live else None
+    channels: list[Any] = []
+    if live and probe_target:
+        # The channels themselves, not the runner's ChannelSpec wrappers: the
+        # doctor asks a channel to rehearse, and a wrapper that does not forward
+        # is exactly how a gate ends up reporting "no attribute" for a channel
+        # that is present and working.
+        channels = [
+            spec.channel
+            for spec in _build_channels(
+                config, _load_anchors(config), ArtifactStore(config.paths, "doctor")
+            )
+        ]
+    return await run_doctor(
+        config,
+        targets=targets,
+        target_problem=target_problem,
+        pool=pool,
+        channels=channels,
+        probe_target=probe_target,
+        submit=submit,
+        live=live,
+    )
+
+
+def _cmd_doctor(
+    args: argparse.Namespace, *, stream: TextIO, fetch_impl: Any = None
+) -> int:
+    # Logs go to stderr under --json, not to the caller's stream. A wrapper
+    # parses stdout with json.loads, and a single INFO line in front of the
+    # payload turns a working integration into a crash. Machine output on
+    # stdout, diagnostics on stderr -- the ordinary discipline, applied here
+    # because "ordinary" is exactly what a tool like this forgets.
+    setup_logging(
+        verbose=args.verbose, stream=sys.stderr if args.json else stream
+    )
+    config = load_config(_resolve_config(args.config))
+
+    targets: TargetList | None = None
+    target_problem = ""
+    if args.targets is not None or (config.paths.data_dir / "targets.txt").is_file():
+        # A bad list is a *check result*, not a refusal: the doctor exists to
+        # tell the operator what is wrong, so a list it cannot even load is
+        # carried into the report rather than raised out of the command. Printed
+        # nowhere on its own -- a line on the terminal that the report does not
+        # contain is invisible to --json, which is the one output a wrapper
+        # reads.
+        try:
+            targets = _load_targets_from(config, args.targets, require_usable=False)
+        except ConfigError as exc:
+            target_problem = str(exc)
+
+    if args.probe_target and not args.submit and not args.json:
+        # Suppressed under --json. The JSON is the whole output there: a wrapper
+        # parses the stream with ``json.loads`` and one human-readable line in
+        # front of it turns a working integration into a crash. The same caveat
+        # is carried inside the payload, so nothing is actually lost.
+        print(
+            "note: the rehearsal stops one click before submit, so the irreversible "
+            "step stays unverified. Pass --submit to file one real report against "
+            f"{args.probe_target!r} and prove it.",
+            file=stream,
+        )
+
+    report = asyncio.run(
+        _doctor(
+            config,
+            targets=targets,
+            target_problem=target_problem,
+            probe_target=args.probe_target,
+            submit=args.submit,
+            live=not args.no_live,
+            fetch_impl=fetch_impl,
+        )
+    )
+
+    if args.json:
+        print(json.dumps(report.to_json(), indent=2), file=stream)
+    else:
+        print("", file=stream)
+        print(report.render(), file=stream)
+
+    if not report.runnable:
+        return EXIT_REFUSED
+    if report.warnings:
+        return EXIT_NEEDS_REVIEW
+    return EXIT_OK
 
 
 def _cmd_status(args: argparse.Namespace, *, stream: TextIO, fetch_impl: Any = None) -> int:

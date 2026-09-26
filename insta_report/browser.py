@@ -72,6 +72,7 @@ from typing import Any, ClassVar, Protocol, runtime_checkable
 
 from .anchors import AnchorSet
 from .artifacts import ArtifactStore, FailureContext
+from .doctor import ChannelProbe
 from .errors import (
     AccountChallenged,
     ChannelFailError,
@@ -905,6 +906,7 @@ class PageDriver(Protocol):
     that a method changed shape.
     """
 
+    async def start(self, anchors: AnchorSet) -> Any: ...
     async def goto_profile(self, handle: str) -> None: ...
     async def read(self, name: str, *, require_enabled: bool) -> str | None: ...
     async def selected_category(self) -> str | None: ...
@@ -973,7 +975,13 @@ class BrowserDriver:
         directory holds the whole browser profile, so the session arrives as the
         browser state it actually is.
         """
-        if self._browser is not None:
+        # Idempotent, and the guard is on the *context*, not the browser. A
+        # persistent context owns its own browser and leaves ``_browser`` as
+        # None, so a check on ``_browser`` would relaunch on every call -- and a
+        # second launch on a directory the first one still holds fails with a
+        # lock error that reads like a corrupt profile.
+        if self._context is not None or self._browser is not None:
+            self._anchors = anchors
             return self
         self._anchors = anchors
         try:
@@ -1323,10 +1331,204 @@ def _looks_like_timeout(exc: Exception) -> bool:
 # ===========================================================================
 
 
+class _RehearsalBoundary(Exception):
+    """Raised from ``on_dispatch`` so a rehearsal stops before the click.
+
+    An ``Exception`` rather than a sentinel return because the dispatch hook has
+    no way to say "no, do not proceed": it is called immediately before the
+    click and returning means *yes*. Raising is the only way to stop, which is
+    a property worth having -- there is no code path on which a rehearsal
+    forgets to stop.
+    """
+
+
+@dataclass
+class _RecordingDriver:
+    """A :class:`PageDriver` that remembers what the rehearsal actually saw.
+
+    The rehearsal runs the real wizard, which reports *that* it failed but not
+    *how far* it got -- and "how far it got" is the whole diagnostic. A drifted
+    selector at the menu and a drifted selector at the category both produce
+    "never reached a submit affordance", and they need completely different
+    fixes.
+
+    Forwarded rather than reimplemented: the four recorded methods are spelled
+    out, and everything else goes straight through to the real driver, so this
+    cannot become a second ``PageDriver`` that quietly lags behind the first.
+    """
+
+    inner: Any
+    #: Anchor names read, in order, with duplicates -- the sequence is the
+    #: signal, and a set would throw away "read the menu, then read it again".
+    reads: list[str] = field(default_factory=list)
+    offered: tuple[str, ...] = ()
+    chosen: str | None = None
+    #: Anchor names that came back non-None. A blocker found this way is a much
+    #: better finding than "it did not work", because it names the interstitial.
+    found: list[str] = field(default_factory=list)
+    #: Whether the category list was *asked for*. Separate from ``offered``
+    #: being empty, and the distinction is load-bearing: "the list was empty"
+    #: and "we never got that far" are opposite findings, and a health check
+    #: that reports the first when the second happened is worse than one that
+    #: reports nothing.
+    looked: bool = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+    @property
+    def capture(self) -> SubmitCapture:
+        return self.inner.capture
+
+    async def start(self, anchors: AnchorSet) -> Any:
+        return await self.inner.start(anchors)
+
+    async def read(self, name: str, *, require_enabled: bool) -> str | None:
+        found = await self.inner.read(name, require_enabled=require_enabled)
+        self.reads.append(name)
+        if found:
+            self.found.append(name)
+        return found
+
+    async def offered_categories(self) -> tuple[str, ...]:
+        self.looked = True
+        self.offered = await self.inner.offered_categories()
+        return self.offered
+
+    async def choose_category(self, category: str) -> None:
+        self.chosen = category
+        await self.inner.choose_category(category)
+
+    # -- the verdict ----------------------------------------------------
+
+    def reached(self) -> str:
+        """The last step this rehearsal got past, in wizard order.
+
+        Derived from what the driver was asked to do rather than from a counter
+        the wizard keeps, so it cannot claim progress the driver did not make.
+        """
+        if self.chosen is not None:
+            return "submit ready"
+        if self.looked:
+            return "reason list"
+        blockers = [
+            name
+            for name in self.found
+            if name in ("login_wall", "challenge", "rate_limited", "not_found")
+        ]
+        if blockers:
+            return blockers[0]
+        if "report_dialog.menu_item" in self.reads or "report_menu_item" in self.reads:
+            return "menu"
+        if self.reads:
+            return "profile"
+        return "launch"
+
+    def probe(self, name: str, *, submitted: bool, failure: str = "") -> ChannelProbe:
+        reached = self.reached()
+
+        # Checked first, and checked on ``looked`` rather than on ``offered``:
+        # this is the finding that has never once been made in this project's
+        # history, and it is more useful than whatever the wizard said, because
+        # it names the consequence. A wizard that reaches the submit button with
+        # a fallback classification is delivering reports against the wrong
+        # category and calling it a success.
+        if self.looked and not self.offered:
+            why = f" The wizard said: {failure}" if failure else ""
+            return ChannelProbe(
+                name=name,
+                ok=False,
+                reached=reached,
+                detail=(
+                    "the report dialog opened but the category list was empty, so "
+                    "every report would be filed under a fallback classification "
+                    "-- a report against the wrong category, not a visible "
+                    "failure." + why
+                ),
+                remedy="Dump the dialog and compare it against a live page: "
+                "insta-report anchors --check <dump.json>",
+            )
+
+        if failure:
+            return ChannelProbe(
+                name=name,
+                ok=False,
+                reached=reached,
+                detail=f"{failure} (stopped after: {reached})",
+                remedy=_remedy_for(reached),
+                categories=self.offered,
+            )
+
+        if self.chosen is None:
+            # The success branch below asserts "reached the submit button", and
+            # the evidence for that claim is a category having been chosen. If
+            # the flow ended without one and without saying why, reporting a
+            # pass would be a probe inventing its own evidence -- which is the
+            # failure mode this project exists to catch, not commit.
+            return ChannelProbe(
+                name=name,
+                ok=False,
+                reached=reached,
+                detail=(
+                    "the rehearsal ended with neither a category chosen nor a "
+                    f"reason given (stopped after: {reached})"
+                ),
+                remedy=_remedy_for(reached),
+                categories=self.offered,
+            )
+
+        return ChannelProbe(
+            name=name,
+            ok=True,
+            reached="submit ready",
+            detail=(
+                f"chose {self.chosen!r} from {len(self.offered)} category(s) and "
+                "reached the submit button; stopped one click short, so the "
+                "irreversible step is unverified by design"
+            ),
+            categories=self.offered,
+            submit_ready=True,
+            submitted=submitted,
+        )
+
+
+def _remedy_for(reached: str) -> str:
+    """What to do about a rehearsal that stopped at *reached*.
+
+    One place, because the same stop has the same fix whether it was reached in
+    a rehearsal or in a real run, and two copies would be two chances to give
+    contradictory advice about the same page.
+    """
+    return {
+        "launch": "python -m playwright install chromium, and check [browser] "
+        "user_data_dir is outside the checkout and not held by a dead process.",
+        "profile": "The profile page did not resolve. If the session is good the "
+        "target list is wrong; if it is not, expect a login_wall on the first read.",
+        "login_wall": "The stored session is no longer valid. Re-authenticate that "
+        "account's user_data_dir in a real browser -- a stale cookie is the most "
+        "common cause.",
+        "challenge": "Instagram is challenging this account. Clear it in a real "
+        "browser first; neither a doctor nor a run can file through a challenge.",
+        "rate_limited": "Instagram is rate limiting this exit. The answer is a "
+        "different residential address, not a retry from this one.",
+        "not_found": "The target does not exist, or Instagram served a logged-out "
+        "page. With a good session the list is wrong.",
+        "menu": "The report menu did not open. This is the step the deliberately "
+        "loose 'Report' anchor exists for, and it false-hits the confirmation page "
+        "by design -- so check the dump before assuming the menu broke.",
+        "reason list": "The reason list was read and came back empty. Instagram "
+        "renders it lazily, so this is either a selector that stopped matching or "
+        "a dialog that needs one more settle before the rows exist.",
+    }.get(
+        reached,
+        "The dialog opened but the flow did not reach a category. Dump the page and "
+        "compare it with: insta-report anchors --check <dump.json>",
+    )
+
+
 @dataclass
 class BrowserChannel:
     """One report attempt through the browser.
-
     Produces an :class:`~insta_report.outcomes.Outcome` and never invents a
     terminal state: every state it returns is either the output of
     :func:`~insta_report.outcomes.classify_browser` or the documented
@@ -1378,6 +1580,14 @@ class BrowserChannel:
         everything after that point is a race we would rather lose than win.
         """
         wizard = ReportWizard()
+        # The driver is started here rather than by the caller. A channel that
+        # owns a driver owns its lifecycle, and a channel that *doesn't* start
+        # it produces a page-less driver whose first call is an
+        # ``AttributeError`` on ``None`` -- reported to the operator as a
+        # channel failure against Instagram, which is the exact misdiagnosis
+        # this project exists to eliminate. Idempotent, so the doctor can start
+        # a driver to prove the build launches without starting it twice.
+        await self.driver.start(self.anchors)
         await self.driver.goto_profile(target.handle)
 
         for _ in range(wizard.max_observations):
@@ -1602,6 +1812,93 @@ class BrowserChannel:
         and one of them starts leaking a process.
         """
         await self.driver.close()
+
+    # -- the rehearsal ---------------------------------------------------
+
+    async def rehearse(self, target: Target, *, submit: bool = False) -> ChannelProbe:
+        """Drive the wizard to the submit button and stop there.
+
+        **This runs :meth:`report`, not a second walk.** A hand-rolled rehearsal
+        would be a second implementation of "open the report dialog", free to
+        drift from the first -- and the drift would be invisible precisely
+        because the rehearsal is the thing that tells the operator the channel
+        works. So the real method runs, with one substitution: ``on_dispatch``
+        raises instead of returning, which is the same hook the real dispatch
+        uses and therefore stops at exactly the same place.
+
+        With ``submit=True`` the hook records and returns, so the whole
+        production path runs and the verdict is the real
+        :func:`~insta_report.outcomes.classify_browser` output. That is the only
+        honest way to verify the irreversible step, and it costs a report --
+        which is why the operator has to ask for it against an account they
+        control.
+        """
+        recorder = _RecordingDriver(self.driver)
+        # A copy, not a mutation. The production channel is never observed
+        # mid-flight, and a rehearsal that fails cannot leave the channel a run
+        # will use half-configured. The *capture* is deliberately not swapped:
+        # it belongs to the driver, which is what fills it from the response
+        # event, and the CLI builds a separate channel for the rehearsal, so
+        # there is never a run in flight to confuse it with.
+        rehearsal = replace(self, driver=recorder)
+
+        def on_dispatch() -> None:
+            if not submit:
+                raise _RehearsalBoundary()
+
+        try:
+            outcome = await rehearsal.report(target, on_dispatch=on_dispatch)
+        except _RehearsalBoundary:
+            return recorder.probe(self.name, submitted=False)
+        except Exception as exc:  # noqa: BLE001
+            return recorder.probe(
+                self.name,
+                submitted=False,
+                failure=f"{type(exc).__name__}: {exc}",
+            )
+
+        if not submit:
+            # ``report()`` returned without ever reaching the dispatch hook, so
+            # the flow stopped before submit -- a login wall, a challenge, a
+            # dialog that would not open. Falling through to the submitted
+            # branch here would report the rehearsal as having filed a report
+            # it never attempted, which is the one thing this whole task exists
+            # to stop.
+            return recorder.probe(
+                self.name,
+                submitted=False,
+                failure=outcome.detail or "the flow stopped before the submit button",
+            )
+
+        # Reached here only with submit=True, because otherwise the boundary
+        # hook would have raised. The verdict is the production one, and it is
+        # reported as what it is: a claim about a request, never about the
+        # target account.
+        captured = rehearsal.capture.select()
+        detail = f"submitted: {outcome.terminal.value}"
+        if outcome.detail:
+            detail += f" -- {outcome.detail}"
+        if captured is not None:
+            detail += (
+                f"  [wire: {captured.method} {captured.url} -> {captured.status}]"
+            )
+        return ChannelProbe(
+            name=self.name,
+            ok=outcome.terminal
+            in (TerminalState.SUBMITTED_ACKED, TerminalState.SUBMITTED_UNCONFIRMED),
+            reached="submitted",
+            detail=detail,
+            remedy=(
+                ""
+                if captured is not None
+                else "the click produced no request on the wire. The button was not "
+                "the submit control, or the page sent nothing -- every report would "
+                "then be a UI transition with no request behind it."
+            ),
+            categories=recorder.offered,
+            submit_ready=True,
+            submitted=outcome.was_dispatched,
+        )
 
     async def _capture_evidence(
         self,
