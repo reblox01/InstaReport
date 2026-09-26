@@ -698,6 +698,45 @@ def test_an_exhausted_pool_explains_itself():
     assert "blocked" in message
 
 
+def test_an_empty_pool_says_it_is_empty_rather_than_sounding_exhausted():
+    """"Zero configured" and "all configured are down" have opposite fixes.
+
+    The exhausted report is built by looping over per-address health, so an
+    empty pool produced a bare header and a dangling colon. An operator reading
+    that cannot tell whether to go fill in ``proxies.txt`` or to go buy better
+    addresses, and the difference is the whole message.
+    """
+    pool = make_pool(fetch=lambda u, p: blocked_200(), endpoints=())
+    with pytest.raises(ProxyUnavailable) as excinfo:
+        pool.acquire()
+    message = str(excinfo.value)
+
+    assert "zero addresses" in message, message
+    assert "file_path" in message, message
+    # Still recognisable as the same class of error, so a caller matching on
+    # the header still works.
+    assert "no proxy address is currently available" in message, message
+
+
+def test_an_exhausted_pool_does_not_claim_to_be_empty():
+    """The two states must stay distinguishable in both directions.
+
+    A check that only asserts the empty case passes just as happily if the
+    exhausted case starts emitting the same words, which would be a regression
+    dressed as an improvement.
+    """
+    pool = make_pool(fetch=lambda u, p: blocked_200(), min_cooldown=0.0)
+    for _ in range(2):
+        with pytest.raises(ProxyUnavailable):
+            pool.acquire()
+    with pytest.raises(ProxyUnavailable) as excinfo:
+        pool.acquire()
+    message = str(excinfo.value)
+
+    assert "10.0.0.1:8080" in message, message
+    assert "zero addresses" not in message, message
+
+
 def test_a_blocked_address_cooling_down_can_be_reported_before_giving_up():
     """Both passes are named, and the second says it was a fallback.
 

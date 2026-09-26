@@ -241,6 +241,23 @@ class Probe:
 
 #: Endpoints whose liveness T0 is trying to establish. Deliberately read-only:
 #: nothing here submits a report, so a run cannot harm a target.
+#:
+#: Read-only is *enforced*, not merely intended, and it is enforced here because
+#: the first version of this table was not. It included a POST to
+#: ``/api/v1/users/{user_id}/flag_user/`` -- the live reporting endpoint -- which
+#: was harmless only because ``{user_id}`` was never substituted, so the request
+#: went to a literal ``{user_id}`` and 404'd. A safety property that holds
+#: because a substitution nobody remembered to add is missing is not a safety
+#: property. Supplying that substitution is the obvious next edit, and the result
+#: would be a tool that flags a real account while its own docstring states it
+#: files no reports -- the same shape of lie as the code this project replaced,
+#: inverted: there it claimed to have reported when it had not, here it would
+#: claim not to have reported when it had.
+#:
+#: So it is a GET. A GET to that route answers 405 when the route exists, which
+#: is the liveness signal T0 wanted, and answers it without a method that can
+#: change anything. ``_assert_read_only`` below refuses to load a probe set
+#: containing a state-changing call, so the guarantee lives in code.
 DEFAULT_PROBES: tuple[Probe, ...] = (
     Probe(
         name="web_profile_info",
@@ -252,10 +269,11 @@ DEFAULT_PROBES: tuple[Probe, ...] = (
         headers={"X-IG-App-ID": "936619743392459"},
     ),
     Probe(
-        name="flag_user",
+        name="flag_user_route_exists",
         url="https://www.instagram.com/api/v1/users/{user_id}/flag_user/",
-        method="POST",
-        body="source_name=profile",
+        # GET, and asserted. See the note above -- a 405 here still proves the
+        # route is real, and nothing here can report anyone.
+        method="GET",
     ),
     Probe(
         name="profile_html",
@@ -266,6 +284,29 @@ DEFAULT_PROBES: tuple[Probe, ...] = (
         url="https://www.instagram.com/",
     ),
 )
+
+#: Methods that cannot change state on a remote server. The probe's contract --
+#: "reports only, files no reports, touches no target" -- is only worth anything
+#: if it is checked rather than asserted in a docstring.
+READ_ONLY_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _assert_read_only(probes: Sequence[Probe]) -> None:
+    """Refuse a probe set that could change something.
+
+    Raises rather than warns. A probe run is a diagnostic: its value is that the
+    operator can trust it changed nothing, and a diagnostic that is trusted only
+    because it was careful is not a diagnostic.
+    """
+    for probe in probes:
+        if probe.method.upper() not in READ_ONLY_METHODS:
+            raise ValueError(
+                f"probe {probe.name!r} uses {probe.method!r}, which can change "
+                f"state on {probe.url.split('?')[0]!r}. This module reports; it "
+                f"does not act. If a state-changing call is genuinely needed, it "
+                f"is not a probe and does not belong in DEFAULT_PROBES."
+            )
+
 
 
 def _egress_ip(client: httpx.Client, timeout: float) -> str | None:
@@ -286,13 +327,25 @@ def _egress_ip(client: httpx.Client, timeout: float) -> str | None:
     return None
 
 
+def render_url(url: str, substitutions: Mapping[str, str]) -> str:
+    """Substitute ``{name}`` placeholders, leaving unknown ones in place.
+
+    Uses ``str.replace`` rather than ``str.format`` deliberately. ``format``
+    raises ``KeyError`` on a placeholder it has no value for, and this table
+    contains one that is intentionally not substituted -- so a strict formatter
+    would make the probe refuse to run, and the loose alternative of
+    pre-formatting the table would hide which call was actually made.
+    """
+    for key, value in substitutions.items():
+        url = url.replace("{" + key + "}", value)
+    return url
+
+
 def _do(
     client: httpx.Client, probe: Probe, substitutions: Mapping[str, str]
 ) -> ProbeResult:
     """Execute one probe and record what came back."""
-    url = probe.url
-    for key, value in substitutions.items():
-        url = url.replace("{" + key + "}", value)
+    url = render_url(probe.url, substitutions)
 
     headers = dict(probe.headers)
     # Registered secrets are scrubbed from anything surfaced to a human.
@@ -337,7 +390,12 @@ def run_probe(
     can get a readable answer at all. Running the probes first and checking the
     control afterwards would let a burned IP produce four confident-looking 404s
     and one failure, and the four are the ones that mislead.
+
+    The read-only check runs *before* any network call, so a probe set that
+    could report someone fails without having reported them.
     """
+    _assert_read_only(probes)
+
     subs = dict(substitutions or {})
     headers = {"User-Agent": user_agent, **dict(extra_headers or {})}
 

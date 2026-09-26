@@ -1251,6 +1251,20 @@ class ProxyPool:
         apart, because the detail is where the difference lives.
         """
         lines = ["no proxy address is currently available:"]
+        if not self._health:
+            # The loop below produces nothing at all when no address was ever
+            # configured, leaving a header and a dangling colon. That reads the
+            # same as "everything I configured is exhausted", and the two have
+            # opposite fixes: fill in the file, versus buy better addresses.
+            # A blank report is the one thing an operator cannot act on.
+            lines.append(
+                "  (none configured -- the pool holds zero addresses, so there "
+                "is nothing to report on)"
+            )
+            lines.append(
+                "  check [proxies] file_path: it resolved, and it is empty or "
+                "contained only comments"
+            )
         for health in self._health.values():
             remaining = max(0.0, (health.quarantined_until or now) - now)
             verdict = health.last_verdict.value if health.last_verdict else "untried"

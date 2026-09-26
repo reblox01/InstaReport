@@ -7,13 +7,16 @@ that it refuses to conclude. Everything here tests the refusal.
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from insta_report.outcomes import NetworkVerdict
 from insta_report.probe import (
     DEFAULT_PROBES,
+    READ_ONLY_METHODS,
     Probe,
     ProbeResult,
     ProbeVerdict,
+    render_url,
     run_probe,
 )
 from insta_report.support.redaction import get_registry
@@ -128,32 +131,146 @@ def test_control_only_with_no_probes_is_unobservable():
 # --- the probe never acts ---------------------------------------------------
 
 
-def test_no_default_probe_submits_a_report():
-    """A probe must be incapable of harming a target.
+def test_no_default_probe_can_change_state():
+    """The probe's central promise, checked rather than described.
 
-    flag_user uses POST because its route shape is part of what is being
-    tested, but the body is a bare marker and the account is not authenticated,
-    so it cannot file anything.
+    This replaces a test that asserted the same *intent* while documenting the
+    opposite reasoning. It read:
+
+        "flag_user uses POST because its route shape is part of what is being
+         tested, but the body is a bare marker and the account is not
+         authenticated, so it cannot file anything."
+
+    The POST and the live ``/flag_user/`` route were both there, and the
+    argument that made them safe was that the request would be unauthenticated.
+    T0 exists precisely to send an authenticated request -- the control call is
+    a known-good *authenticated* URL, and ``_main`` attaches the sessionid
+    cookie to every probe. So the premise that authorised the POST was
+    invalidated by the feature the probe was written to support, and a test that
+    asserted the conclusion while naming the now-false premise is worse than no
+    test: it reads as coverage and would have kept passing.
     """
     for probe in DEFAULT_PROBES:
-        if probe.method == "POST":
-            assert probe.body in (None, "", "source_name=profile")
-        assert "report" not in probe.url or "flag_user" in probe.url
+        assert probe.method.upper() in READ_ONLY_METHODS, (
+            f"{probe.name!r} uses {probe.method!r} against {probe.url!r}"
+        )
+        assert probe.body is None, (
+            f"{probe.name!r} carries a request body; a GET with a body is a"
+            " state-changing call wearing a read-only method"
+        )
 
 
-def test_default_probes_are_read_only_against_targets():
-    """No default probe may point at a submit endpoint."""
+def test_the_reporting_route_is_probed_but_cannot_report():
+    """The liveness question is still asked, with a method that cannot answer it
+    destructively.
+
+    A GET to the reporting route answers 405 when the route exists, which is
+    exactly the signal T0 wanted from it. What it cannot do is file a report
+    against anybody.
+    """
+    flag = [p for p in DEFAULT_PROBES if "flag_user" in p.url]
+    assert len(flag) == 1, f"expected the reporting route in the probe set: {flag}"
+    assert flag[0].method.upper() == "GET"
+
+
+def test_a_state_changing_probe_set_is_refused_before_any_request(monkeypatch):
+    """The refusal has to happen before the network, not after.
+
+    Checking after the first call would mean the first call already went out. On
+    a set whose first entry is the mutating one, that is the report. Asserted by
+    making the client unconstructable, so a check that ran one step too late
+    would surface as a construction error rather than a silent pass.
+    """
+    def _unconstructable(**kwargs):  # pragma: no cover - must not be reached
+        raise AssertionError("a client was built despite the refusal")
+
+    monkeypatch.setattr("insta_report.probe.httpx.Client", _unconstructable)
+
+    with pytest.raises(ValueError, match="does not act"):
+        run_probe(
+            proxy=None,
+            control_url=CONTROL_URL,
+            probes=[
+                Probe(
+                    name="would_report",
+                    url="https://www.instagram.com/api/v1/users/123/flag_user/",
+                    method="POST",
+                    body="source_name=profile",
+                )
+            ],
+        )
+
+
+def test_the_read_only_check_does_not_depend_on_the_caller_being_authenticated(
+    monkeypatch,
+):
+    """The guarantee must survive the run it is most needed in.
+
+    ``run_probe`` is called with a sessionid cookie attached, because that is
+    what a real T0 run does. If the read-only check were a property of the
+    *unauthenticated* case -- which is how the previous version reasoned -- it
+    would not apply to any run an operator would actually perform. So the check
+    is asserted on the authenticated path, which is the only path that exists in
+    production.
+    """
+    with pytest.raises(ValueError, match="can change"):
+        run_probe(
+            proxy=None,
+            control_url=CONTROL_URL,
+            probes=[
+                Probe(
+                    name="authenticated_post",
+                    url="https://www.instagram.com/api/v1/users/123/flag_user/",
+                    method="POST",
+                )
+            ],
+            extra_headers={"Cookie": "sessionid=whatever"},
+        )
+
+
+def test_no_default_probe_points_at_a_submit_endpoint():
+    """Independent of method: the submit *page* is also off limits.
+
+    ``/report/`` in a URL is a form that changes state on a GET, because the
+    server does not care what the client intended. The reporting API is covered
+    by the method check above; this covers the HTML surface.
+    """
     for probe in DEFAULT_PROBES:
-        assert "/report" not in probe.url.replace("flag_user", "")
-        assert "flag_user" in probe.url or "/report" not in probe.url
+        assert "/report/" not in probe.url, (
+            f"{probe.name!r} points at a report form; a GET there is a POST"
+        )
+
+
+def test_an_unknown_placeholder_is_left_visible_rather_than_guessed():
+    """A placeholder with no value stays visible, so the report shows the truth.
+
+    Silently dropping it would turn ``.../users/{user_id}/flag_user/`` into
+    ``.../users/flag_user/`` -- a *different, real* endpoint -- and the operator
+    would be reading a liveness result for a route nobody probed.
+    """
+    rendered = render_url(
+        "https://t.test/api/v1/users/{user_id}/flag_user/",
+        {"username": "alice"},
+    )
+    assert "{user_id}" in rendered
+    assert "users/flag_user" not in rendered
 
 
 # --- plumbing ---------------------------------------------------------------
 
 
 def test_substitutions_replace_path_placeholders():
-    probe = Probe(name="x", url="https://t.test/{username}/")
-    assert probe.url.format(username="alice") == "https://t.test/alice/"
+    """Exercises :func:`render_url`, which is the code that actually runs.
+
+    It used to assert on ``str.format``, which production does not use -- so it
+    would have kept passing if the real substitution had been broken, which is
+    the failure mode a test is supposed to prevent. It sat in this file twice
+    under one name for a while, and the static gate caught the shadowing; the
+    second definition silently owned the name, so the ``render_url`` version
+    never ran at all until the duplicate was removed.
+    """
+    rendered = render_url("https://t.test/{username}/", {"username": "alice"})
+    assert rendered == "https://t.test/alice/"
 
 
 def test_every_probe_result_is_reported_as_a_row():
