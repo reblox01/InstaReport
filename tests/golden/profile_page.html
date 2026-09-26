@@ -1,0 +1,39 @@
+<!doctype html>
+<!--
+  GOLDEN FIXTURE - a target profile page, logged in.
+
+  Included for two anchors that have no representation anywhere else:
+
+    report_dialog.trigger  the "More options" button that opens the menu. This
+                           is the first thing the browser channel touches, and
+                           a drift here looks like a target that cannot be
+                           reported at all.
+    identity               the reporting account's own handle, read back so the
+                           tool can confirm it is filing as the account the
+                           operator meant and not as somebody else. The value
+                           below is deliberately prefixed `example` -- see
+                           TestGoldenCorpusLeaksNothing.
+
+  It also serves as the "nothing is wrong" control state: a normal page must
+  match no blocker anchor and no confirmation anchor. Without it, every case in
+  the corpus is a failure state, and a set of fixtures that only ever describes
+  failure cannot catch an anchor that is simply too eager.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>example_target (@example_target)</title>
+</head>
+<body>
+  <header>
+    <a href="/example_operator/" data-username="example_operator">@example_operator</a>
+  </header>
+  <main>
+    <h2>example_target</h2>
+    <p>Bio: example text</p>
+    <div role="button" aria-label="More options" data-testid="option-button">
+      More
+    </div>
+  </main>
+</body>
+</html>

@@ -1,0 +1,27 @@
+<!doctype html>
+<!--
+  GOLDEN FIXTURE - the post-submit confirmation state.
+
+  This is the fixture the confirmation anchor exists to corroborate. If the
+  string in insta_report/data/anchors.toml stops matching the text here, the
+  test in tests/test_anchor_drift.py fails -- which is the point. A confirmation
+  anchor that has silently stopped matching is indistinguishable, in the
+  ledger, from a run where no report was ever submitted.
+
+  Corroboration only, never evidence. Instagram renders this optimistically, to
+  anyone, including unauthenticated and flagged identities. See the comment
+  block above [confirmation] in the anchor file.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Report</title>
+</head>
+<body>
+  <div role="dialog">
+    <div data-testid="report-confirmation">
+      Thanks for reporting this account
+    </div>
+  </div>
+</body>
+</html>

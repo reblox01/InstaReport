@@ -14,18 +14,47 @@ htmlcov/
 
 # --- SECRETS: never commit any of these ---
 # Live session cookies, provider keys, local config with inline secrets.
+#
+# ``config.toml`` is in this list and that is the sharpest edge in the file. The
+# operator's config is *meant* to sit in the repo -- they copy it from
+# config.example.toml, which is tracked, and it belongs next to the docs they
+# are following -- and it holds a live ``sessionid``. So the one credential
+# location this project actively invites someone to create is the one a rule
+# scoped to artifacts/ can never cover. Matched by exact name, so the example
+# stays tracked.
+config.toml
+config.local.toml
 .env
 .env.*
 *.env
 secrets/
 credentials/
-config.local.toml
 *.sessionid
 
 # --- RUNTIME STATE: checkpoints, artifacts, traces ---
-# NOTE: the tool defaults its data directory OUTSIDE the working tree
-# (see insta_report/support/paths.py). These entries are a second line of
-# defence, not the primary one -- support.paths.assert_outside_repo() is.
+# The tool defaults its data directory OUTSIDE the working tree, and
+# support.paths.assert_outside_repo() *refuses* a data_dir inside it -- it
+# raises, it does not warn. So these rules are not the guard. They exist for the
+# one case the guard cannot cover: someone running the tool with a data
+# directory on another machine, or before the check existed, or with a stray copy
+# of an artifact dropped in by hand.
+#
+# WHICH MEANS THEY MUST BE SCOPED BY PATH. They used to end with `*.png` and
+# `*.html`, and that is where the golden DOM corpus went missing.
+#
+# A bare extension rule has no scope. It matches every file of that name
+# everywhere, including the seven committed HTML fixtures the anchor-drift suite
+# reads and asserts against -- which were therefore invisible to git, untracked,
+# and not even reported as untracked. All 27 of the tests that read them passed
+# on the machine that wrote them and failed on a fresh clone, which is the exact
+# failure this repository is about: a claim in a docstring ("a fixture is
+# committed to git") that the repository did not support.
+#
+# The specific extension rules are gone rather than negated. Negation would also
+# work, but it leaves a trap for the next person who adds a broad rule, and the
+# real protection is that a data directory inside the repo cannot be configured
+# in the first place. tests/test_repository_hygiene.py enforces both halves: the
+# fixtures are tracked, and no broad rule can swallow them again.
 state/
 artifacts/
 traces/
@@ -33,8 +62,6 @@ checkpoints/
 runs/
 *.checkpoint.jsonl
 *.trace.zip
-*.png
-*.html
 
 # --- reference repo scratch (not part of this build) ---
 /vendor/

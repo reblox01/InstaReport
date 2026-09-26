@@ -1,0 +1,26 @@
+<!doctype html>
+<!--
+  GOLDEN FIXTURE - a challenge interstitial served in place of the dialog.
+
+  Arrived as HTTP 200 in the original investigation (F7): a challenge is a DOM
+  event or a 200 with a challenge field, never a status code. So the negative
+  anchors below are the only thing standing between "the browser was shown a
+  CAPTCHA" and "the report was submitted". If this file starts matching the
+  confirmation anchor, the ladder has inverted and a CAPTCHA is being read as a
+  success.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Instagram</title>
+</head>
+<body>
+  <div data-testid="challenge-dialog">
+    <p>It was us, not you</p>
+    <p>Please confirm it's you</p>
+    <p>Enter the characters you see</p>
+    <button>Solve the challenge</button>
+  </div>
+  <iframe src="https://www.google.com/recaptcha/api2/anchor"></iframe>
+</body>
+</html>

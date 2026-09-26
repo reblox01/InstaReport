@@ -1,0 +1,24 @@
+<!doctype html>
+<!--
+  GOLDEN FIXTURE - a temporary block, served with HTTP 200.
+
+  Distinguished from the challenge and the login wall because the three need
+  three different responses: a challenge ends the account, a login wall means
+  the session died and the account must be rebound, and a rate limit means back
+  off without penalising the account at all. Collapsing them into one
+  "blocked" state would either burn a good account on a pacing problem or keep
+  dispatching into a dead session.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Instagram</title>
+</head>
+<body>
+  <div data-testid="rate-limit-notice">
+    <p>You're temporarily blocked</p>
+    <p>Too many requests</p>
+    <p>Try again later</p>
+  </div>
+</body>
+</html>

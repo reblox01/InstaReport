@@ -1,0 +1,26 @@
+<!doctype html>
+<!--
+  GOLDEN FIXTURE - the login wall, served with HTTP 200.
+
+  The root cause of the original tool: Instagram serves the logged-out login
+  page with status 200 for unmatched paths, so report_user()'s
+  `if status == 200` was satisfied by a page containing no report form at all.
+  Nothing has ever been reported by that code path.
+
+  This fixture is why the browser channel reads the DOM for a reason list rather
+  than trusting a status code, and why the ladder falls through on this state
+  instead of believing the dispatch.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Log in to Instagram</title>
+</head>
+<body>
+  <form action="/accounts/login/" method="post">
+    <input type="text" name="username" placeholder="Phone number, username, or email">
+    <input type="password" name="password">
+    <button>Log in</button>
+  </form>
+</body>
+</html>

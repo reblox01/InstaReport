@@ -1,0 +1,65 @@
+# Line endings are normalised in the repository and checked out as LF on every
+# platform, Windows included.
+#
+# Two reasons, and the second is the one that matters here.
+#
+# 1. The noise. Git was emitting "CRLF will be replaced by LF" on nearly every
+#    `git add`, for every file, forever. A warning that fires on all traffic is
+#    a warning nobody reads, so the day a real one appears -- a merge conflict,
+#    a file that cannot be parsed -- it is already background.
+#
+# 2. The bytes. The drift suite reads committed HTML fixtures and asserts that
+#    configured anchor strings appear in them. A fixture that is LF in the
+#    repository and CRLF in a Windows working tree is a different byte sequence
+#    on the machine running the tests than on the machine that committed them.
+#    Python's universal newlines hide that for text reads, which is exactly why
+#    it is dangerous: it works right up until something reads bytes, and then it
+#    fails on one platform only. Identical bytes everywhere removes the whole
+#    class rather than relying on every reader to be well-behaved.
+#
+# `text=auto` rather than `text`, so git still detects binary content and leaves
+# it alone. `eol=lf` is what forces the working copy to match the repository
+# instead of the platform default.
+* text=auto eol=lf
+
+# Spelled out for the file types this project actually contains, so the intent
+# survives someone reading only this section. `*.py text` also stops git from
+# treating a Python file as binary because of a stray byte in a docstring, which
+# is how a Latin-1 comment once gets committed as-is and then fails to parse on
+# a machine with a different default encoding.
+*.py      text eol=lf diff=python
+*.toml    text eol=lf
+*.md      text eol=lf
+*.txt     text eol=lf
+*.json    text eol=lf
+*.jsonl   text eol=lf
+*.html    text eol=lf
+*.css     text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.cfg     text eol=lf
+*.ini     text eol=lf
+
+# Binary, and marked as such deliberately rather than left to `auto` detection.
+# Screenshots and Playwright traces are written next to the runtime data
+# directory and must never be line-ending translated: a translated trace zip is
+# a corrupt trace zip, and a "corrupt" artifact sends someone hunting for a bug
+# in the capture code that is not there.
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.webp    binary
+*.ico     binary
+*.zip     binary
+*.trace.zip binary
+*.woff    binary
+*.woff2   binary
+*.ttf     binary
+*.otf     binary
+*.eot     binary
+
+# Nothing in this repository is generated, and nothing is worth merging without
+# conflict. Marking the generated shapes as such keeps git from offering to
+# merge two people's checkpoints, which is a merge that cannot mean anything.
+*.checkpoint.jsonl linguist-generated=true -merge

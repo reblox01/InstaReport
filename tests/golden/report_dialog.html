@@ -1,0 +1,40 @@
+<!doctype html>
+<!--
+  GOLDEN FIXTURE - the pre-submit report dialog.
+
+  Provenance
+  ----------
+  Hand-transcribed from the shape of the dialog described in the README and
+  reproduced from Instagram's documented accessibility tree (role=dialog with a
+  nested role=menu of role=menuitem children). This is NOT a byte-for-byte
+  capture: a real capture would carry session state, and a golden fixture is
+  committed to git, so it must not.
+
+  Every attribute here exists because an anchor in insta_report/data/anchors.toml
+  selects it. If you add an anchor, add the matching attribute to this file, and
+  add the case to tests/test_anchor_drift.py. A selector with no representation
+  in the golden corpus is a selector nobody has ever tested.
+
+  Do not add: session cookies, tokens, real handles, real user ids, or any
+  script content. tests/test_anchor_drift.py asserts this file contains none of
+  those, because a golden fixture that leaks a credential leaks it forever.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Report</title>
+</head>
+<body>
+  <div role="dialog" aria-label="Report">
+    <h2>Why are you reporting this account?</h2>
+    <ul role="menu">
+      <li role="menuitem">Spam</li>
+      <li role="menuitem">Impersonation</li>
+      <li role="menuitem">Hate Speech or Bullying</li>
+      <li role="menuitem">Nudity or Sexual Content</li>
+      <li role="menuitem">Something Else</li>
+    </ul>
+    <button type="submit" data-testid="submit-report-button">Submit</button>
+  </div>
+</body>
+</html>

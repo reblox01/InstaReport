@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Instagram (•_•)</title>
+<link rel="icon" href="/static/images/favicon/favicon-192x192.png">
+<style>
+  body{background:#fafafa;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:935px;margin:0 auto;padding:80px 20px;display:flex;gap:100px}
+  .panel{background:#fff;border:1px solid #dbdbdb;border-radius:4px;padding:40px;width:350px}
+  h1{font-size:24px;font-weight:400;margin:0 0 20px}
+  input{width:100%;padding:12px;border:1px solid #dbdbdb;border-radius:3px;margin-bottom:8px;box-sizing:border-box}
+  button{width:100%;padding:12px;background:#0095f6;color:#fff;border:0;border-radius:4px;font-weight:600}
+  .or{text-align:center;color:#8e8e8e;margin:16px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="phone">
+    <img src="/static/images/instagram/phones/phone_anonymous.png" alt="Phones showing Instagram">
+  </div>
+  <div class="panel">
+    <h1>Instagram</h1>
+    <form action="/accounts/login/" method="post">
+      <input type="text" name="username" placeholder="Phone number, username, or email" autocomplete="username">
+      <input type="password" name="password" placeholder="Password" autocomplete="current-password">
+      <button type="submit">Log in</button>
+    </form>
+    <div class="or">OR</div>
+    <button type="button">Log in with Facebook</button>
+    <p>Forgot your password?</p>
+    <p>Don't have an account? <a href="/accounts/emailsignup/">Sign up</a></p>
+  </div>
+</div>
+</body>
+</html>

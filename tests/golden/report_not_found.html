@@ -1,0 +1,24 @@
+<!doctype html>
+<!--
+  GOLDEN FIXTURE - a missing account.
+
+  Included because "not found" is not a failure of the report. The account may
+  have been deleted, may never have existed, or may be one of Instagram's
+  reserved words -- and Instagram serves the same 404-shaped page for all
+  three. The browser channel therefore cannot distinguish "target is gone" from
+  "target never existed", and this is why targets.py refuses reserved words
+  before dispatch: catching that case in the target list turns an unreportable
+  dispatch into a fixable list error.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Instagram</title>
+</head>
+<body>
+  <div>
+    <p>Sorry, this page isn't available.</p>
+    <p>The page you were looking for doesn't exist.</p>
+  </div>
+</body>
+</html>
