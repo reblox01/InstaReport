@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -46,6 +45,7 @@ import httpx
 
 from .outcomes import NetworkVerdict, classify_network
 from .support.redaction import get_registry
+from .support.urls import PLACEHOLDER, missing_placeholders, render_url
 
 __all__ = [
     "ProbeVerdict",
@@ -391,10 +391,10 @@ def _assert_read_only(probes: Sequence[Probe]) -> None:
             )
 
 
-#: ``{name}`` as it appears in a probe URL. Deliberately narrow: it must not match
-#: a percent-encoded brace, or a URL that legitimately contains one would be
-#: rejected for a reason that does not apply.
-_PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+#: ``{name}`` as it appears in a probe URL. Aliased rather than redefined: the
+#: substitution rules and the "what is still missing" rules have to be the same
+#: rules, and the API channel needs both too.
+_PLACEHOLDER = PLACEHOLDER
 
 
 def _assert_placeholders(
@@ -416,7 +416,7 @@ def _assert_placeholders(
     nobody can interpret is not output.
     """
     for probe in probes:
-        missing = sorted(set(_PLACEHOLDER.findall(probe.url)) - set(substitutions))
+        missing = sorted(missing_placeholders(probe.url, substitutions))
         if missing:
             raise ValueError(
                 f"probe {probe.name!r} addresses {probe.url!r}, which needs "
@@ -471,18 +471,11 @@ def _egress_ip(proxy: str | None, timeout: float, user_agent: str) -> str | None
     return None
 
 
-def render_url(url: str, substitutions: Mapping[str, str]) -> str:
-    """Substitute ``{name}`` placeholders, leaving unknown ones in place.
-
-    Uses ``str.replace`` rather than ``str.format`` deliberately. ``format``
-    raises ``KeyError`` on a placeholder it has no value for, and this table
-    contains one that is intentionally not substituted -- so a strict formatter
-    would make the probe refuse to run, and the loose alternative of
-    pre-formatting the table would hide which call was actually made.
-    """
-    for key, value in substitutions.items():
-        url = url.replace("{" + key + "}", value)
-    return url
+# ``render_url`` used to live here. It is now in ``support.urls`` because the API
+# channel needs the same substitution, and two copies of a substitution table is
+# two chances for the tables to disagree -- which is how a probe ended up
+# addressing a URL with a literal ``{user_id}`` in it. Re-exported so the
+# existing importers keep working and so the name remains discoverable from here.
 
 
 def _do(

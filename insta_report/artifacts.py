@@ -101,18 +101,26 @@ class FailureContext:
     attempt: int = 1
 
     def to_metadata(self) -> dict[str, Any]:
+        # Every string that came off the wire is scrubbed here rather than in each
+        # caller. ``submit_body_excerpt`` and ``detail`` are both built from
+        # observed traffic, and the store already scrubs the DOM it writes -- so
+        # scrubbing only the HTML would have left the same secret one field away,
+        # in the same directory, in the same run. Centralised because "remember to
+        # scrub at the call site" is not a property, it is a habit, and the
+        # channel that joins later is the one that will forget.
+        scrub = get_registry().scrub
         return {
             "target": self.target_display,
             "target_key": self.target_key,
             "channel": self.channel,
             "terminal": self.terminal.value,
-            "detail": self.detail,
+            "detail": scrub(self.detail),
             "anchors_hit": list(self.anchors_hit),
             "anchors_missed": list(self.anchors_missed),
             "drift_detail": self.drift_detail,
             "submit_status": self.submit_status,
-            "submit_body_excerpt": self.submit_body_excerpt,
-            "submit_url": self.submit_url,
+            "submit_body_excerpt": scrub(self.submit_body_excerpt),
+            "submit_url": scrub(self.submit_url),
             "account": self.account_display,
             "proxy_origin": self.proxy_origin,
             "attempt": self.attempt,
