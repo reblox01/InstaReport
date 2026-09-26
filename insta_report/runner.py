@@ -76,7 +76,9 @@ from datetime import datetime
 from typing import (
     Any,
     Callable,
+    ClassVar,
     Iterator,
+    Mapping,
     Protocol,
     Sequence,
     runtime_checkable,
@@ -165,7 +167,13 @@ class ReportChannel(Protocol):
     re-implementing the part of this that is hardest to test.
     """
 
-    name: str
+    #: A ClassVar, not an instance attribute. A channel's identity is a property
+    #: of the channel it *is*, not of the report it is currently filing -- so the
+    #: protocol declares it the same way the implementation does. Declaring it as
+    #: an instance variable here let a channel that declared it a ClassVar fail
+    #: the protocol for no reason, which is the worst kind of type error: one
+    #: that says your working code is wrong.
+    name: ClassVar[str]
 
     async def report(
         self,
@@ -192,6 +200,43 @@ class ChannelSpec:
     name: str
     channel: ReportChannel
     capacity: int = 1
+
+
+@dataclass(frozen=True)
+class RunPlan:
+    """What a dry run says it will do.
+
+    A named shape rather than a dict, and ``frozen`` so a consumer cannot
+    quietly "adjust" the plan into a different plan than the one the runner
+    computed. The two things a dry run exists to tell the operator are the
+    counts -- how many targets, how many pending, how many already settled -- and
+    a plan whose fields are unchecked ``object`` lookups is a plan that can print
+    a number that was never verified against the field it claims to come from.
+
+    Every field is derived by the same code the real run uses. That is the
+    property that makes a dry run worth reading: a plan computed by looser logic
+    than the run is a plan that promises forty and delivers five.
+    """
+
+    run_id: str
+    targets: int
+    pending: int
+    already_settled: int
+    channels: tuple[str, ...]
+    capacity: int
+    #: ``None`` means "no per-run ceiling", which is different from any number
+    #: and is the reason this field is optional rather than defaulted to 0.
+    #: Coercing it to 0 here would make an uncapped plan print a cap of zero.
+    max_reports: int | None
+    horizon_seconds: float
+    max_concurrent: int
+    workers: int
+    #: One status mapping per account, from
+    #: :meth:`~insta_report.accounts.Account.status`. Kept as mappings rather
+    #: than flattened to strings so the plan and the live status view cannot
+    #: disagree about what an account's state is.
+    accounts: tuple[Mapping[str, object], ...]
+    self_reporting: tuple[str, ...]
 
 
 @dataclass
@@ -709,11 +754,17 @@ class Runner:
     def channel_health(self) -> dict[str, ChannelHealth]:
         return dict(self._health)
 
-    def plan(self) -> dict[str, object]:
+    def plan(self) -> "RunPlan":
         """What a dry run reports.
 
         Pure with respect to the outside world: no network, no writes, and no
         clock reads that could make the plan disagree with the run it describes.
+
+        A dataclass rather than a dict. It has two consumers -- the dry-run
+        report and the ``--dry-run`` printer -- and as a ``dict[str, object]``
+        every field access was an unchecked cast, so a renamed key or a changed
+        type surfaced as a wrong number on the operator's screen rather than as
+        an error. The plan is a contract; it is now written down as one.
         """
         # Deliberately the same computation the real run uses. A plan built from
         # a looser notion of "pending" than the run itself is how an operator
@@ -722,22 +773,22 @@ class Runner:
         self_reporting = self._targets.self_reporting(
             [account.username for account in self._pool.accounts]
         )
-        return {
-            "run_id": self._store.run_id,
-            "targets": len(self._targets),
-            "pending": len(queue),
-            "already_settled": len(self._targets) - len(queue),
-            "channels": [spec.name for spec in self._channels],
-            "capacity": sum(spec.capacity for spec in self._channels),
-            "max_reports": self._options.max_reports,
-            "horizon_seconds": self._options.horizon_seconds,
-            "max_concurrent": self._options.max_concurrent,
-            "workers": self._worker_count(),
-            "accounts": [
+        return RunPlan(
+            run_id=self._store.run_id,
+            targets=len(self._targets),
+            pending=len(queue),
+            already_settled=len(self._targets) - len(queue),
+            channels=tuple(spec.name for spec in self._channels),
+            capacity=sum(spec.capacity for spec in self._channels),
+            max_reports=self._options.max_reports,
+            horizon_seconds=self._options.horizon_seconds,
+            max_concurrent=self._options.max_concurrent,
+            workers=self._worker_count(),
+            accounts=tuple(
                 account.status(self._monotonic()) for account in self._pool.accounts
-            ],
-            "self_reporting": [target.key for target in self_reporting],
-        }
+            ),
+            self_reporting=tuple(target.key for target in self_reporting),
+        )
 
     async def run(self) -> RunReport:
         if not self._channels:

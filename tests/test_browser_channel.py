@@ -22,6 +22,7 @@ toast race needs.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -937,6 +938,121 @@ class TestTheChannelOwnsItsDriverLifecycle:
             asyncio.run(channel.report(a_target(), on_dispatch=lambda: None))
         # And it did not get as far as pretending to look at the page.
         assert "close" not in driver.events
+
+
+class TestAnUnstartedDriverSaysSo:
+    """The same bug, one layer down, and the fix for it.
+
+    ``start()`` sets two things: the page and the anchor set. Fixing the
+    never-called-``start()`` bug made the channel call it -- but the individual
+    read paths still reached into ``_anchors`` directly, so a driver that some
+    *other* path failed to start would raise ``AttributeError: 'NoneType' object
+    has no attribute 'report_dialog_trigger'`` from the first click.
+
+    That name is the problem, not the exception type. The runner grades an
+    unclassified channel error as CHANNEL_FAILED, and CHANNEL_FAILED reads to an
+    operator as *Instagram rejected the session* -- so the error was raised
+    before a single byte went out and it named a party that was not involved.
+    Every anchor read now goes through one accessor that raises
+    ``ChannelFailError`` and says what actually happened.
+
+    A real ``BrowserDriver``, not a fake: this is about the driver's own state
+    machine, and a fake that faithfully reproduced the bug would be a fake
+    faithfully reproducing nothing.
+    """
+
+    @pytest.fixture
+    def unstarted(self, tmp_path):
+        from insta_report.browser import BrowserDriver
+
+        return BrowserDriver(user_data_dir=tmp_path / "profile", headless=True)
+
+    # Every one of these reaches for the anchors. If a future edit reintroduces a
+    # direct read, this is the list that catches it. Mixed sync/async on purpose
+    # -- the real driver has both, and a test that only covered the async half
+    # would miss a read on a sync path.
+    REACHERS = ("open_menu", "pick_menu_item", "click_submit", "_category_selectors")
+
+    @staticmethod
+    def _reach(driver, name):
+        """Call a reader, awaiting it if it is a coroutine.
+
+        Not cosmetic. Calling an async method without awaiting it does not
+        raise -- it returns a coroutine object and emits a RuntimeWarning, so a
+        version of this test that forgot to await would have passed while
+        asserting nothing.
+        """
+        result = getattr(driver, name)()
+        if inspect.isawaitable(result):
+            return asyncio.run(result)
+        return result
+
+    def test_it_starts_with_no_anchors(self, unstarted):
+        assert unstarted._anchors is None  # noqa: SLF001 - reading the real state
+
+    def test_every_anchor_reader_raises_something_the_runner_can_grade(self, unstarted):
+        """The general form of the bug, and the reason it is worth a test.
+
+        It is not "an AttributeError happened" that matters. It is that the
+        runner grades an *unclassified* channel error as CHANNEL_FAILED, and
+        CHANNEL_FAILED is what an operator reads as Instagram having said no. So
+        the property to enforce is that every one of these paths fails through
+        :mod:`insta_report.errors` -- which the runner can route and attribute --
+        rather than through a bare builtin that names an internal detail and
+        blames the wrong party.
+
+        Checking the class rather than the exact type also catches a future
+        ``KeyError`` or ``IndexError`` on one of these paths, which the
+        type-specific test above would not.
+        """
+        from insta_report import errors as tool_errors
+
+        for name in self.REACHERS:
+            with pytest.raises(tool_errors.InstaReportError):
+                self._reach(unstarted, name)
+
+    @pytest.mark.parametrize("name", REACHERS)
+    def test_each_anchor_reader_names_the_real_cause(self, unstarted, name):
+        from insta_report.errors import ChannelFailError
+
+        with pytest.raises(ChannelFailError) as caught:
+            self._reach(unstarted, name)
+        message = str(caught.value)
+        # Names our side, and says nothing was sent. An operator reading this
+        # must not conclude Instagram did anything.
+        assert "never started" in message
+        assert "Nothing was sent" in message
+
+    def test_the_failure_is_scoped_to_the_run_not_to_a_report(self, unstarted):
+        """A wiring fault must not be charged to a target's outcome."""
+        from insta_report.errors import ChannelFailError, ErrorScope
+
+        with pytest.raises(ChannelFailError) as caught:
+            asyncio.run(unstarted.open_menu())
+        assert caught.value.scope is ErrorScope.RUN
+
+    def test_reading_an_anchor_returns_nothing_rather_than_raising(self, unstarted):
+        """``read`` is a query, and a query cannot raise to say "no page".
+
+        The rehearsal asks "is that anchor on the page"; if asking raised on an
+        unstarted driver, the answer to *absence* would be indistinguishable
+        from the answer to *not having looked*.
+        """
+        assert asyncio.run(unstarted.read("confirmation", require_enabled=False)) is None
+
+    def test_choose_category_without_a_page_still_names_the_real_cause(self, unstarted):
+        """``choose_category`` reaches anchors only in its failure message.
+
+        The interesting part is that its *failure* path -- a category that was
+        read off one list and then not found on the next -- was where a raw
+        ``_anchors`` read sat. So the error a drift produces would have been
+        masked by an AttributeError about the driver instead of naming the
+        dialog that changed.
+        """
+        from insta_report.errors import ChannelFailError
+
+        with pytest.raises(ChannelFailError, match="never started"):
+            asyncio.run(unstarted.choose_category("It's a scam"))
 
 
 @pytest.mark.browser

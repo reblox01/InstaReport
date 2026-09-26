@@ -55,7 +55,7 @@ import time
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Protocol, Sequence
+from typing import Any, Callable, Iterable, Iterator, Protocol, Sequence, cast
 from urllib.parse import quote, urlparse
 
 from .errors import ProxyUnavailable
@@ -933,14 +933,27 @@ class ProxyPool:
         self._health: dict[str, ProxyHealth] = {}
         self._by_origin: dict[str, str] = {}
         self._leases: dict[str, ProxyLease] = {}
+        #: Declared rather than inferred. The first assignment is inside a
+        #: branch, so mypy infers the type from that branch alone and then
+        #: rejects the ``None`` below -- which is the inference being wrong
+        #: about a value that is genuinely None for every operator-proxy pool.
+        self._provider: ProviderAdapter | None
 
+        # The two shapes a caller can pass -- a live provider, or a plain list
+        # of addresses -- are told apart structurally, because both are
+        # legitimate and there is no base class to inherit. ``hasattr`` is a
+        # real runtime narrowing that a type checker cannot follow, so the
+        # narrowing is restated here as two casts rather than scattered as three
+        # ``type: ignore`` comments that suppress whatever the line happens to
+        # be doing that week.
         if hasattr(endpoints, "fetch"):
-            self._provider = endpoints  # type: ignore[arg-type]
-            for endpoint in endpoints.fetch(64):  # type: ignore[union-attr]
+            provider = cast("ProviderAdapter", endpoints)
+            self._provider = provider
+            for endpoint in provider.fetch(64):
                 self._register(endpoint)
         else:
             self._provider = None
-            for endpoint in endpoints:  # type: ignore[union-attr]
+            for endpoint in cast("Iterable[ProxyEndpoint]", endpoints):
                 self._register(endpoint)
 
         if not self._health:

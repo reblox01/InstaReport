@@ -1477,9 +1477,9 @@ class TestDryRun:
             monotonic=Clock(),
         )
         plan = runner.plan()
-        assert plan["targets"] == 3
-        assert plan["pending"] == 2
-        assert plan["already_settled"] == 1
+        assert plan.targets == 3
+        assert plan.pending == 2
+        assert plan.already_settled == 1
 
     async def test_the_plan_names_our_own_handles_before_the_run(self, tmp_path):
         pool = make_pool("alpha", "bravo")
@@ -1492,7 +1492,7 @@ class TestDryRun:
             options=RunOptions(dry_run=True),
             monotonic=Clock(),
         )
-        assert runner.plan()["self_reporting"] == ["reporter.bravo"]
+        assert runner.plan().self_reporting == ("reporter.bravo",)
 
 
 # ===========================================================================

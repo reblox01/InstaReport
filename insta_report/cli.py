@@ -59,7 +59,15 @@ from .doctor import DoctorReport, run_doctor
 from .narrative import NarrativeBuilder, build_builder
 from .pacing import Pacer, PacingConfig
 from .proxies import ProxyPool, build_pool
-from .runner import ChannelHealth, ChannelSpec, Refusal, RunOptions, RunReport, Runner
+from .runner import (
+    ChannelHealth,
+    ChannelSpec,
+    Refusal,
+    RunOptions,
+    RunPlan,
+    RunReport,
+    Runner,
+)
 from .support.logging import setup_logging
 from .support.paths import RunIdError, check_run_id
 from .targets import TargetList, TargetProblem, load_targets
@@ -358,7 +366,7 @@ def _wrap(text: str, width: int) -> list[str]:
 
 
 def _self_report_refusals(
-    targets: TargetList, plan: dict[str, Any], pool: AccountPool
+    targets: TargetList, plan: RunPlan, pool: AccountPool
 ) -> tuple[Refusal, ...]:
     """The targets that would be refused before dispatch, in report form.
 
@@ -372,12 +380,12 @@ def _self_report_refusals(
     being refused.
     """
     refusals = []
-    for key in plan["self_reporting"]:
-        target = targets.get(str(key))
+    for key in plan.self_reporting:
+        target = targets.get(key)
         refusals.append(
             Refusal(
-                target_key=str(key),
-                display=target.escaped() if target else str(key),
+                target_key=key,
+                display=target.escaped() if target else key,
                 reason="this is one of our own accounts",
                 fatal_to_run=True,
             )
@@ -396,21 +404,21 @@ def _dry_run_report(runner: Runner, targets: TargetList, pool: AccountPool) -> R
     plan = runner.plan()
     now = datetime.now(timezone.utc)
     return RunReport(
-        run_id=str(plan["run_id"]),
+        run_id=plan.run_id,
         started_at=now,
         finished_at=now,
         dispatches=0,
-        targets_considered=int(plan["pending"]),
+        targets_considered=plan.pending,
         counts={},
         refusals=_self_report_refusals(targets, plan, pool),
-        channel_names=tuple(plan["channels"]),  # type: ignore[arg-type]
+        channel_names=plan.channels,
         # Zeroed health per planned channel, so the summary's channel section
         # shows which channels *would* have been used. Without this a dry run
         # prints the bare heading "channels:" with nothing under it, which
         # reads as "the tool found no channels" rather than "nothing was
         # attempted".
         health=tuple(
-            ChannelHealth(name=str(name), capacity=1) for name in plan["channels"]
+            ChannelHealth(name=name, capacity=1) for name in plan.channels
         ),
         review=(),
         unsettled=(),
@@ -643,10 +651,15 @@ def _status(config: Config, run_id: str | None, *, stream: TextIO) -> int:
         print(f"runs in {state_dir} (newest first):", file=stream)
         for name in runs[:20]:
             store = CheckpointStore(state_dir / name / "checkpoint.jsonl", name)
-            unsettled = len(store.state.pending)
+            # Named apart from the list further down, because both mean "a
+            # target dispatched with no recorded outcome" and one of them is a
+            # count. Two bindings of one name to two types in one function is
+            # not a bug until someone moves a line, and then it is a bug that
+            # prints a plausible number.
+            open_count = len(store.state.pending)
             print(
                 f"  {name:<28} dispatched={len(store.state.dispatched):<4} "
-                f"settled={len(store.state.settled):<4} unsettled={unsettled}",
+                f"settled={len(store.state.settled):<4} unsettled={open_count}",
                 file=stream,
             )
         return EXIT_NEEDS_REVIEW if any(

@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, TextIO
 
 from .errors import CheckpointCorrupt, RunAborted
 from .outcomes import Outcome, TerminalState, utc_now
@@ -227,7 +227,7 @@ class CheckpointStore:
     def __init__(self, path: Path, run_id: str) -> None:
         self.path = Path(path)
         self.run_id = run_id
-        self._handle = None
+        self._handle: TextIO | None = None
         # Loaded eagerly. Deferring to open() meant a caller who inspected
         # .state first saw an empty run and would conclude every target was
         # unattempted -- the most dangerous possible default here.

@@ -954,7 +954,14 @@ class BrowserDriver:
     _context: Any = field(default=None, repr=False)
     _page: Any = field(default=None, repr=False)
     _capture: SubmitCapture = field(default_factory=SubmitCapture, repr=False)
-    _anchors: AnchorSet = field(default=None, repr=False)
+    #: None until :meth:`start`. Honest about it, because the alternative --
+    #: annotating this as an ``AnchorSet`` while defaulting it to None -- is a
+    #: declaration that says a read can never fail, and it did: for the whole
+    #: life of the tool, nothing called ``start``, every read hit ``None``, and
+    #: the resulting ``AttributeError`` was graded by the runner as
+    #: CHANNEL_FAILED, which reads to an operator as "Instagram rejected the
+    #: session". The type is the assertion; it should be true.
+    _anchors: AnchorSet | None = field(default=None, repr=False)
     _closing: bool = field(default=False, repr=False)
 
     # -- lifecycle --------------------------------------------------------
@@ -1162,6 +1169,29 @@ class BrowserDriver:
         """The submit request seen so far, if unambiguous."""
         return self._capture.select()
 
+    def _anchor_set(self) -> AnchorSet:
+        """The anchors, or a failure naming the real cause.
+
+        Every anchor read goes through here rather than touching ``_anchors``
+        directly. Before this existed, a driver that had never been started
+        raised ``AttributeError: 'NoneType' object has no attribute
+        'report_dialog_trigger'`` from the first click -- and the runner grades
+        an unclassified channel error as CHANNEL_FAILED, which an operator reads
+        as *Instagram rejected the session*. The error was raised before a single
+        byte went out and it named a party that was not involved.
+
+        It says ``ErrorScope.RUN`` because it is a wiring fault, not a report
+        that failed: no target's outcome should be blamed on it.
+        """
+        if self._anchors is None:
+            raise ChannelFailError(
+                "the browser driver was never started, so it has neither a page "
+                "nor an anchor set. Nothing was sent and nothing was received; "
+                "this is a fault in the caller, not an Instagram response.",
+                scope=ErrorScope.RUN,
+            )
+        return self._anchors
+
     # -- anchor reading ---------------------------------------------------
 
     async def read(self, name: str, *, require_enabled: bool) -> str | None:
@@ -1173,7 +1203,12 @@ class BrowserDriver:
         text -- the caller only needs to know it matched, and returning page
         text here would let a selector hit satisfy a *text* anchor by accident.
         """
-        if self._page is None:
+        if self._page is None or self._anchors is None:
+            # Satisfies nothing, which is the truthful answer for a driver that
+            # was never started -- and returns rather than raises, because this
+            # is the query the rehearsal uses to ask "is that anchor on the
+            # page". A query that raises on "no page" cannot be used to detect
+            # the absence of a page.
             return None
         anchor = anchor_by_name(self._anchors, name)
         marker = anchor.texts[0] if anchor.texts else name
@@ -1213,10 +1248,10 @@ class BrowserDriver:
             raise
 
     async def open_menu(self) -> None:
-        await self._click_first(self._anchors.report_dialog_trigger.selectors)
+        await self._click_first(self._anchor_set().report_dialog_trigger.selectors)
 
     async def pick_menu_item(self) -> None:
-        await self._click_first(self._anchors.report_menu_item.selectors)
+        await self._click_first(self._anchor_set().report_menu_item.selectors)
 
     async def choose_category(self, category: str) -> None:
         """Click the row whose visible text matches the chosen category.
@@ -1246,16 +1281,17 @@ class BrowserDriver:
             f"category {category!r} was chosen from the dialog's own list but "
             "no row matched it on click; the dialog changed between reading and "
             "clicking",
-            missing=(self._anchors.subdialog_item.name,),
+            missing=(self._anchor_set().subdialog_item.name,),
         )
 
     def _category_selectors(self) -> tuple[str, ...]:
-        return tuple(self._anchors.subdialog_item.selectors) or tuple(
-            self._anchors.reason_item.selectors
+        anchors = self._anchor_set()
+        return tuple(anchors.subdialog_item.selectors) or tuple(
+            anchors.reason_item.selectors
         )
 
     async def click_submit(self) -> None:
-        await self._click_first(self._anchors.submit.selectors)
+        await self._click_first(self._anchor_set().submit.selectors)
 
     async def _click_first(self, selectors: Sequence[str]) -> None:
         if self._page is None:
@@ -2049,7 +2085,12 @@ class BrowserChannel:
         failure, and the runner will not try again anywhere.
         """
         hit = classify_blocked(wizard.seen)
-        common = {
+        # Heterogeneous on purpose: these are Outcome's own field names, and
+        # spelling them out three times per branch is how a field silently stops
+        # being set on one path. ``Any`` rather than a union because the value
+        # of each key is checked by Outcome's own signature, which is the only
+        # place the field types are written down.
+        common: dict[str, Any] = {
             "target_ref": target.key,
             "channel": CHANNEL,
             "account_ref": account_ref,

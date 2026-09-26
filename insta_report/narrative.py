@@ -334,12 +334,22 @@ class NarrativeBuilder:
                 )
 
         if offered:
-            ranked = [
-                (self._rank_for_category(t, offered), t)
-                for t in usable
-            ]
-            ranked = [(rank, t) for rank, t in ranked if rank is not None]
+            # An explicit loop rather than two chained comprehensions. The
+            # second one existed only to drop the unranked templates, and
+            # rebuilding the list to do it left the element type as
+            # ``tuple[int | None, Template]`` -- so the sort key below was
+            # typed as possibly-None and had to be cast away. Dropping the
+            # unranked rows as they are produced means the list only ever holds
+            # ranked pairs, and the annotation says what is actually true.
+            ranked: list[tuple[int, Template]] = []
+            for template in usable:
+                rank = self._rank_for_category(template, offered)
+                if rank is not None:
+                    ranked.append((rank, template))
             if ranked:
+                # Ties broken by position, and ``ranked`` was built from
+                # ``usable`` in its existing order, so an equal-score pair
+                # resolves the same way every run for the same input.
                 ranked.sort(key=lambda pair: pair[0])
                 best = ranked[0][1]
                 chosen = _resolve_category(best, offered)

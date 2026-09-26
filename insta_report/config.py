@@ -20,7 +20,7 @@ import tomllib
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, overload
 
 from .support.paths import Paths, resolve_paths
 from .support.redaction import get_registry
@@ -245,7 +245,22 @@ class _Reader:
             raise ConfigError(f"{self._where(key)} must be true or false, got {type(value).__name__}")
         return value
 
+    @overload
+    def path_(self, key: str) -> Path | None: ...
+
+    @overload
+    def path_(self, key: str, default: Path) -> Path: ...
+
     def path_(self, key: str, default: Path | None = None) -> Path | None:
+        """A path from this table, or *default* when the key is absent.
+
+        Overloaded rather than returning a bare ``Path | None``, because the two
+        call sites mean different things by the result: one wants "not
+        configured, carry on" and the other wants a path it can use without
+        checking. Collapsing them to one optional return made the second caller
+        cast its way past the check, which is exactly the cast that hides a
+        missing key until something dereferences it.
+        """
         raw = self.str_(key)
         return Path(raw).expanduser() if raw else default
 
