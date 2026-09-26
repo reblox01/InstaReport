@@ -74,6 +74,33 @@ WEB = ApiIdentity(
 
 TEMPLATE = "https://i.instagram.com/api/v1/users/{user_id}/flag_user/"
 
+#: A complete, valid config with two enabled accounts, so the real
+#: ``_build_channels`` builds its browser channels and the test can compare the
+#: set of names against what it should be.
+CONFIG_BODY = """
+data_dir = "{data}"
+anchors_path = "anchors.toml"
+
+[accounts.alpha]
+username = "reporter.one"
+sessionid_env = "IG_SESSIONID_ALPHA"
+user_id = "555000111"
+daily_budget = 20
+
+[accounts.bravo]
+username = "reporter.two"
+sessionid_env = "IG_SESSIONID_BRAVO"
+user_id = "555000222"
+daily_budget = 20
+
+[proxies]
+source = "file"
+file_path = "{data}/proxies.txt"
+
+[browser]
+max_concurrent = 1
+"""
+
 
 def make_response(
     status: int, text: str, content_type: str = "text/plain"
@@ -1022,3 +1049,57 @@ async def test_a_dispatched_2xx_spends_budget_and_an_unresolved_one_does_not(
     )
     assert unresolved.was_dispatched is False
     assert unresolved.terminal.counts_against_budget is False
+
+
+# ---------------------------------------------------------------------------
+# The channel stays out of a real run
+# ---------------------------------------------------------------------------
+
+
+class TestTheChannelIsNotWiredIntoARun:
+    """The second lock.
+
+    ``ApiEndpoint`` refusing to be built unverified is the first one, and it is
+    the stronger of the two because it holds however the channel is reached. This
+    is the second: the CLI does not import the channel at all, so a real run
+    cannot schedule it even if someone constructs a verified endpoint in a
+    hurry.
+
+    Neither lock is allowed to be the only one. The endpoint gate protects the
+    endpoint; this protects the wiring. A tool that files reports against a real
+    business account wants two independent reasons to refuse, because the failure
+    being guarded is a plausible-looking submission nobody checked.
+    """
+
+    def test_the_cli_does_not_reference_the_api_channel(self):
+        from insta_report import cli
+
+        source = Path(cli.__file__).read_text(encoding="utf-8")
+        for name in ("ApiChannel", "ApiEndpoint", "ApiIdentity"):
+            assert name not in source, f"cli now mentions {name}"
+
+    def test_a_real_run_builds_only_browser_channels(self, tmp_path: Path, monkeypatch):
+        """The behavioural half: the real builder, not a stub.
+
+        The existing CLI tests monkeypatch ``_build_channels`` wholesale, so
+        nothing in the suite ever called it. That is a gap this assertion closes
+        rather than a test it reuses.
+        """
+        from insta_report import cli
+        from insta_report.anchors import load_anchors
+        from insta_report.config import load_config
+
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(CONFIG_BODY.format(data=tmp_path.as_posix()), "utf-8")
+        monkeypatch.setenv("IG_SESSIONID_ALPHA", SESSION)
+        monkeypatch.setenv("IG_SESSIONID_BRAVO", SESSION)
+        proxies = tmp_path / "proxies.txt"
+        proxies.write_text("http://203.0.113.10:8080\n", encoding="utf-8")
+
+        specs = cli._build_channels(
+            load_config(config_path), load_anchors(), a_store(tmp_path)
+        )
+
+        assert specs, "the browser channel should still be built"
+        assert {spec.name for spec in specs} == {"browser"}
+
