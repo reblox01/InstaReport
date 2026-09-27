@@ -9,6 +9,20 @@
 
 data_dir = "~/.insta-report"          # must be OUTSIDE the working tree
 
+# INSTA_REPORT_DATA_DIR overrides the line above when it is set to a non-blank
+# value. It is the ONLY path in this file an environment variable may override,
+# and it is absolute-only -- a relative value is refused rather than resolved,
+# because a variable has no config file to be relative to and guessing wrong
+# relocates the checkpoint ledger to somewhere nobody chose. The value is subject
+# to the same "outside the working tree" refusal as the line above.
+#
+#   container:  INSTA_REPORT_DATA_DIR=/data
+#   host:       leave it unset, and set data_dir here
+#
+# Everything else you supply is read, never overridden: a container that could be
+# pointed at a different proxy file or anchor set than the one you reviewed is a
+# worse failure than a data directory in an unexpected place.
+
 # Every path in this file is resolved relative to THIS file, not to the
 # directory you happen to run from. A config that means different things in
 # different shells has a blast radius the operator never wrote down.

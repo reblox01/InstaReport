@@ -254,6 +254,10 @@ insta_report/
   doctor.py      the gate
   probe.py       observability probe
   cli.py         command surface
+
+Dockerfile          Playwright image, pinned to the driver version
+docker-compose.yml  bind-mounted config and artifacts, env_file for the secret
+.dockerignore       active rules matter: the build context is sent whole
 ```
 
 ## Development
