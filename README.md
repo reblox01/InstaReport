@@ -69,8 +69,8 @@ which caused this rewrite, and the code refuses to repeat it.
 Requires Python 3.11+.
 
 ```bash
-git clone https://github.com/reblox01/instaReport.git
-cd instaReport
+git clone https://github.com/reblox01/InstaReport.git
+cd InstaReport
 python -m venv .venv
 .venv\Scripts\pip install -e ".[dev]"      # Windows
 .venv\Scripts\python -m playwright install chromium
