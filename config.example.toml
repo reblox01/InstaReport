@@ -57,6 +57,22 @@ file_path = "~/proxies.txt"          # required when source = "file"
 # provider_key_env = "IG_PROXY_KEY"
 sticky_ttl_minutes = 240             # must exceed your lease length (F10)
 
+# Every lease is checked against this machine's own IP address, and a lease that
+# egresses from it is refused. That is the one correlation the tool exists to
+# avoid: a report filed from the address Instagram already associates with you
+# identifies the reporting account.
+#
+# Left unset, the address is observed once at startup with a direct, non-proxied
+# request to the IP-echo service, which is right for almost everyone. Set it
+# when that cannot be inferred correctly: behind CGNAT where you want the address
+# you are known by, behind a corporate egress that rewrites source addresses, or
+# when the echo service is unreachable from this network.
+#
+# A value here that is not a valid address is REFUSED, not ignored. Leave the
+# key out rather than in with something unchecked -- a typo disables the check
+# while still looking configured.
+# own_ip = "203.0.113.9"
+
 [browser]
 headless = true
 max_concurrent = 2                   # must be <= number of accounts

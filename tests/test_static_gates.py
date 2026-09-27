@@ -29,6 +29,7 @@ Two properties keep this from being theatre:
 from __future__ import annotations
 
 import importlib.util
+import socket
 import subprocess
 import sys
 import tempfile
@@ -39,6 +40,10 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 PACKAGE = "insta_report"
+
+#: Assembled rather than written out, so that searching this file for the
+#: marker does not find this file. See the test that uses it.
+_MARKER = "network" + "_access"
 
 pytestmark = pytest.mark.static
 
@@ -240,3 +245,103 @@ class TestMypyIsClean:
                 "mypy failed but not for the reason the gate is checking:\n"
                 + done.stdout + done.stderr
             )
+
+
+class TestTheSuiteIsOffline:
+    """The conftest socket guard, and proof that it is armed.
+
+    The suite reached the internet for years of this project's life without
+    anyone deciding to: twenty-odd ``run`` tests were quietly depending on
+    ``api.ipify.org`` being up, because establishing the operator's own address
+    happens over the network and the test harness had no seam to replace that
+    transport. They passed in CI and would have failed on a plane.
+
+    The guard in ``conftest.py`` is what makes "the suite is offline" a fact
+    rather than a convention. A guard nothing tests is a convention again, so
+    the next section is the part that matters.
+    """
+
+    def test_a_non_loopback_connection_is_refused(self):
+        """The guard fires, and fires before anything leaves the machine.
+
+        The address is a documentation range, so even if the guard were somehow
+        bypassed this could not reach a real host. It is refused by the patched
+        ``connect``, not by the network, and the message has to say which -- an
+        operator reading a CI failure needs to know the block is the suite's own
+        rule and not a firewall.
+        """
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            with pytest.raises(AssertionError) as caught:
+                sock.connect(("198.51.100.7", 80))
+        finally:
+            sock.close()
+
+        message = str(caught.value)
+        assert "offline" in message, message
+        assert "198.51.100.7" in message, message
+
+    def test_a_loopback_connection_is_allowed(self):
+        """The exception is real, and it is narrow.
+
+        asyncio holds a self-pipe socket per event loop and on Windows that is
+        a genuine AF_INET socket on 127.0.0.1, so a guard without this carve-out
+        breaks every async test in the suite for a reason that has nothing to do
+        with what they test. A listening socket on an ephemeral port keeps the
+        assertion about the guard rather than about whether the port was free.
+        """
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            client.settimeout(5.0)
+            client.connect(("127.0.0.1", port))
+        finally:
+            client.close()
+            listener.close()
+
+    def test_the_marker_that_defeats_the_guard_exists_and_nothing_uses_it(self):
+        """The escape hatch is declared, and still unused.
+
+        A guard with no opt-out is a guard someone will eventually delete rather
+        than work around. A guard with an opt-out nobody has taken is a guard
+        that has held, and the second fact is the one worth keeping true: if a
+        test ever carries ``network_access``, the README's offline claim has
+        become false and should have been corrected in the same commit.
+        """
+        pyproject = REPO / "pyproject.toml"
+        markers = pyproject.read_text(encoding="utf-8")
+        assert f"{_MARKER}:" in markers, (
+            f"the {_MARKER} marker is not declared; a test cannot opt out of"
+            " the offline guard, so the next person who needs to will remove the"
+            " guard instead"
+        )
+
+        # Searched for the decorator rather than the bare name, so this file --
+        # which necessarily spells the marker out -- does not match itself. The
+        # decorator is also the only form that means anything: a mention in a
+        # docstring is a claim, not a socket.
+        used = subprocess.run(
+            ["git", "grep", "-l", "-F", "@pytest.mark." + _MARKER, "--", "tests"],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+        )
+        # conftest is excluded because it names the marker in the message it
+        # raises, so the guard itself would otherwise be reported as a user of
+        # it. The decorator form is searched rather than the bare name so that
+        # this file, which has to spell the marker out too, does not match
+        # itself.
+        offenders = [
+            line
+            for line in used.stdout.splitlines()
+            if line and not line.endswith("conftest.py")
+        ]
+        assert not offenders, (
+            "tests carrying the network marker are actually using the network:\n"
+            + "\n".join(offenders)
+            + "\n\nEither the transport belongs behind an injection seam, or the"
+            " README's 'the suite is offline' needs to stop being said."
+        )

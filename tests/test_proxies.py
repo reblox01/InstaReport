@@ -90,6 +90,11 @@ def make_pool(
     kwargs.setdefault("monotonic", clock)
     kwargs.setdefault("probe_url", "https://echo.invalid/ip")
     kwargs.setdefault("rng", random.Random(5))
+    # Every pool now has to be told the operator's own address, because
+    # ``acquire`` refuses without it. The default is deliberately distinct from
+    # ``ok()``'s 203.0.113.7 so an existing test that accidentally stages a
+    # self-egress would fail loudly rather than pass for a different reason.
+    kwargs.setdefault("own_ip", "192.0.2.99")
     kwargs["min_cooldown"] = min_cooldown
     return ProxyPool(endpoints, fetch=fetch, **kwargs)
 
@@ -259,6 +264,7 @@ def test_a_reserved_egress_is_never_bound_even_though_the_verdict_says_ok():
             egress=EgressObservation(ip="198.51.100.7", is_documentation_range=True),
         ),
         enforce_asn_diversity=False,
+        own_ip="192.0.2.99",
     )
     with pytest.raises(ProxyUnavailable, match="reserved range"):
         pool.acquire()
@@ -281,6 +287,7 @@ def test_a_documentation_egress_does_not_even_become_health():
             egress=EgressObservation(ip="2001:db8::1", is_documentation_range=True),
         ),
         enforce_asn_diversity=False,
+        own_ip="192.0.2.99",
     )
     with pytest.raises(ProxyUnavailable):
         pool.acquire()
@@ -299,6 +306,7 @@ def test_a_benchmarking_egress_is_refused_like_any_other_reserved_range():
             egress=EgressObservation(ip="198.18.4.4", is_documentation_range=True),
         ),
         enforce_asn_diversity=False,
+        own_ip="192.0.2.99",
     )
     with pytest.raises(ProxyUnavailable, match="198.18.4.4"):
         pool.acquire()
@@ -322,6 +330,7 @@ def test_an_observation_whose_ip_is_not_an_address_is_refused():
                 egress=EgressObservation(ip=fake, is_documentation_range=False),
             ),
             enforce_asn_diversity=False,
+            own_ip="192.0.2.99",
         )
         with pytest.raises(ProxyUnavailable) as excinfo:
             pool.acquire()
@@ -350,6 +359,7 @@ def test_carrier_grade_nat_is_not_treated_as_a_fake_exit():
             status=200,
             egress=EgressObservation(ip="100.110.3.7", asn=6167),
         ),
+        own_ip="192.0.2.99",
     )
     lease = pool.acquire()
     assert lease.egress is not None
@@ -366,6 +376,7 @@ def test_a_genuine_egress_is_still_bound_after_all_of_that():
             status=200,
             egress=EgressObservation(ip="45.9.148.99", asn=21408),
         ),
+        own_ip="192.0.2.99",
     )
     lease = pool.acquire()
     assert lease.egress is not None
@@ -1171,7 +1182,9 @@ def test_a_configured_sticky_ttl_is_carried_into_the_lease(tmp_path: Path):
     config = SimpleNamespace(source="file", file_path=listing, sticky_ttl_minutes=30)
 
     clock = Clock()
-    pool = build_pool(config, fetch=lambda u, p: ok(), monotonic=clock)
+    pool = build_pool(
+        config, fetch=lambda u, p: ok(), monotonic=clock, own_ip="192.0.2.99"
+    )
     lease = pool.acquire()
     assert lease.sticky_expires_at == 30 * 60.0
 
@@ -1337,3 +1350,395 @@ def test_the_httpx_transport_passes_the_proxy_through():
         httpx.Client.send = original  # type: ignore[method-assign]
 
     assert seen["proxy"] is not None
+
+
+# --- the own-address guard (plan item #6) -----------------------------------
+#
+# The failure this prevents: a proxies.txt that lists the operator's own
+# address, or a "proxy" that quietly passes through to it. Every report then
+# leaves from the one IP Instagram already associates with the reporting
+# account's operator, which is the single correlation this whole tool exists to
+# avoid -- and it does so silently, because the address answers every probe
+# perfectly. Health scoring cannot see it, because the address works.
+
+
+def test_the_own_address_is_compared_as_an_address_not_a_string():
+    """Formatting must not be a way through.
+
+    ``ipaddress`` is the only thing here that knows ``::ffff:203.0.113.7`` and
+    ``203.0.113.7`` are one host, and that ``2001:0DB8:0000::1`` and
+    ``2001:db8::1`` are one address. A string comparison would let the mapped
+    form through, and the mapped form is what a dual-stack proxy legitimately
+    returns.
+    """
+    from insta_report.proxies import canonical_address
+
+    assert canonical_address("::ffff:203.0.113.7") == canonical_address("203.0.113.7")
+    assert canonical_address("2001:0DB8:0000:0000:0000:0000:0000:0001") == (
+        canonical_address("2001:db8::1")
+    )
+    assert canonical_address("203.0.113.7") != canonical_address("203.0.113.8")
+    # Unparseable is None, never a guess.
+    assert canonical_address("not-an-ip") is None
+    assert canonical_address("") is None
+    assert canonical_address("999.1.1.1") is None
+
+
+def test_a_lease_whose_egress_is_the_operators_own_address_is_refused():
+    """The core assertion. The address answers perfectly and is still refused.
+
+    The refusal is deliberately not a health failure. Nothing about this address
+    is broken or transient: it will answer identically forever. Quarantining it
+    with a backoff and re-selecting it once the pool has nothing else would make
+    the guard intermittent, which is worse than useless -- it would hold only on
+    the runs that were already going to fail for lack of a proxy.
+    """
+    endpoints = [ProxyEndpoint(url="http://10.0.0.1:8080", source="file", label="leak")]
+    pool = make_pool(
+        endpoints, fetch=lambda url, proxy: ok("198.51.100.7"), own_ip="198.51.100.7"
+    )
+
+    with pytest.raises(ProxyUnavailable, match="own address"):
+        pool.acquire()
+
+
+def test_the_refusal_survives_the_ipv4_mapped_ipv6_form():
+    """The bypass this closes.
+
+    A dual-stack proxy returns ``::ffff:198.51.100.7``. Compared as strings that
+    is not the operator's address, so the guard passes and every report leaves
+    from home. The comparison has to be on the parsed address.
+    """
+    endpoints = [ProxyEndpoint(url="http://10.0.0.1:8080", source="file", label="leak")]
+    pool = make_pool(
+        endpoints,
+        fetch=lambda url, proxy: ok("::ffff:198.51.100.7"),
+        own_ip="198.51.100.7",
+    )
+
+    with pytest.raises(ProxyUnavailable, match="own address"):
+        pool.acquire()
+
+    # And the other direction: the address answers in plain form, the operator's
+    # own address is known only in mapped form.
+    pool = make_pool(
+        endpoints,
+        fetch=lambda url, proxy: ok("198.51.100.7"),
+        own_ip="::ffff:198.51.100.7",
+    )
+    with pytest.raises(ProxyUnavailable, match="own address"):
+        pool.acquire()
+
+
+def test_a_leaking_address_is_dismissed_and_a_healthy_sibling_still_works():
+    """One bad entry must not cost the operator the whole pool.
+
+    This is the test that separates "dismissed" from "quarantined". A dismissed
+    address is skipped on every later pass, including the fallback pass that
+    runs when nothing is off cooldown -- otherwise the leak comes back the first
+    time the pool is busy, which is to say under load.
+
+    Leases are released between iterations. Holding them would make the second
+    acquire fail for an unrelated and correct reason -- ASN diversity refuses a
+    second concurrent lease on an ASN already in use -- and that failure would
+    pass for the leak coming back.
+    """
+    endpoints = [
+        ProxyEndpoint(url="http://10.0.0.1:8080", source="file", label="leak"),
+        ProxyEndpoint(url="http://10.0.0.2:8080", source="file", label="good"),
+    ]
+
+    def fetch(url, proxy):
+        return ok("198.51.100.7") if proxy.endswith("10.0.0.1:8080") else ok("198.51.100.9")
+
+    pool = make_pool(endpoints, fetch=fetch, own_ip="198.51.100.7")
+
+    for _ in range(3):
+        lease = pool.acquire()
+        assert lease.endpoint.origin == "10.0.0.2:8080", lease.endpoint.origin
+        assert lease.egress is not None and lease.egress.ip == "198.51.100.9"
+        pool.release(lease)
+
+
+def test_a_dismissed_address_does_not_return_on_the_fallback_pass():
+    """The guard holds on the pass that runs when the pool is busy.
+
+    The fallback pass exists so a busy pool still runs, so it is the pass an
+    operator hits mid-run with reports outstanding. If the guard only applied to
+    the ordinary path, the leak would come back here -- intermittently, under
+    load, which is the worst shape a guard can have.
+
+    What protects it is the per-candidate check in ``acquire``, not the
+    candidate-list filter; ``test_a_dismissed_address_is_not_probed_again``
+    covers that filter's actual contribution. Both are kept because they fail
+    for different reasons and only one of them is about safety.
+    """
+    endpoints = [
+        ProxyEndpoint(url="http://10.0.0.1:8080", source="file", label="leak"),
+        ProxyEndpoint(url="http://10.0.0.2:8080", source="file", label="good"),
+    ]
+    clock = Clock()
+
+    def fetch(url, proxy):
+        return ok("198.51.100.7") if proxy.endswith("10.0.0.1:8080") else ok("198.51.100.9")
+
+    pool = make_pool(
+        endpoints, fetch=fetch, clock=clock, min_cooldown=900.0, own_ip="198.51.100.7"
+    )
+
+    # First pass dismisses the leak and binds the good address. The success puts
+    # the good address on cooldown, so the next acquire has nothing available
+    # and must take the fallback path.
+    first = pool.acquire()
+    assert first.endpoint.origin == "10.0.0.2:8080"
+    pool.release(first)
+    clock.advance(1.0)
+    assert pool.available(clock.now) == [], "the good address should be cooling down"
+
+    second = pool.acquire()
+    assert second.endpoint.origin == "10.0.0.2:8080", (
+        "the fallback pass re-selected the self-egress address"
+    )
+
+
+def test_a_dismissed_address_is_not_probed_again():
+    """What the candidate-list filter actually buys: not re-asking.
+
+    Not a safety property -- ``acquire`` would refuse the address a second time
+    regardless. A cost and legibility one: the fallback pass runs under load,
+    and a pool that re-probes a permanently-bad address every time pays an HTTP
+    round trip per report and repeats the same ERROR line until nobody reads the
+    log at all.
+
+    Asserted as a probe count rather than as a lease outcome, because the lease
+    outcome is identical with or without the filter. That is the whole reason
+    this test exists separately.
+    """
+    endpoints = [
+        ProxyEndpoint(url="http://10.0.0.1:8080", source="file", label="leak"),
+        ProxyEndpoint(url="http://10.0.0.2:8080", source="file", label="good"),
+    ]
+    clock = Clock()
+    probed: list[str] = []
+
+    def fetch(url, proxy):
+        origin = proxy.rsplit("//", 1)[-1]
+        probed.append(origin)
+        return ok("198.51.100.7") if origin.endswith("10.0.0.1:8080") else ok("198.51.100.9")
+
+    pool = make_pool(
+        endpoints, fetch=fetch, clock=clock, min_cooldown=900.0, own_ip="198.51.100.7"
+    )
+
+    first = pool.acquire()
+    pool.release(first)
+    clock.advance(1.0)
+    assert pool.available(clock.now) == []
+    second = pool.acquire()
+
+    assert first.endpoint.origin == second.endpoint.origin == "10.0.0.2:8080"
+    assert probed.count("10.0.0.1:8080") == 1, (
+        f"the dismissed address was re-probed: {probed}"
+    )
+
+
+def test_a_pool_whose_own_address_was_never_established_refuses_to_lease():
+    """Fail closed, with the ways out named in the message.
+
+    The alternative is to read "we could not tell" as "nothing to compare",
+    which is how an unverified guard becomes one that reads as verified in the
+    output while checking nothing.
+    """
+    endpoints = [ProxyEndpoint(url="http://10.0.0.1:8080", source="file", label="p")]
+    pool = make_pool(endpoints, fetch=lambda url, proxy: ok(), own_ip=None)
+
+    with pytest.raises(ProxyUnavailable) as excinfo:
+        pool.acquire()
+    message = str(excinfo.value)
+    assert "own_ip" in message, message
+    assert "proxy" in message.lower(), message
+
+
+def test_an_own_address_that_is_merely_unparseable_also_refuses():
+    """A typo in the operator's own IP must not disable the guard silently.
+
+    ``own_ip = "1.2.3.4.5"`` reads as configured, looks configured in the file,
+    and compares equal to nothing. Accepting it would be the same hole as
+    ``None``, reached by a different route.
+    """
+    endpoints = [ProxyEndpoint(url="http://10.0.0.1:8080", source="file", label="p")]
+    pool = make_pool(endpoints, fetch=lambda url, proxy: ok(), own_ip="1.2.3.4.5")
+
+    with pytest.raises(ProxyUnavailable, match="own address"):
+        pool.acquire()
+
+
+def test_a_leak_is_reported_at_error_level_naming_both_addresses(caplog):
+    """The operator has to be able to find this in the log.
+
+    A silent refusal is indistinguishable from a pool that ran out of working
+    addresses, and the operator's next move -- add more proxies -- would not fix
+    it.
+    """
+    endpoints = [ProxyEndpoint(url="http://10.0.0.1:8080", source="file", label="leak")]
+    pool = make_pool(
+        endpoints, fetch=lambda url, proxy: ok("198.51.100.7"), own_ip="198.51.100.7"
+    )
+
+    with caplog.at_level("ERROR", logger="insta_report.proxies"):
+        with pytest.raises(ProxyUnavailable):
+            pool.acquire()
+
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert errors, "the leak was refused with nothing logged at ERROR"
+    joined = "\n".join(errors)
+    assert "198.51.100.7" in joined, joined
+    assert "10.0.0.1:8080" in joined, joined
+
+
+def test_the_own_address_is_established_with_no_proxy_and_no_env():
+    """The load-bearing detail, and the one that would make the guard theater.
+
+    The baseline has to be the operator's *own* address. Observed through the
+    pool it would be a pool address, compared against itself, and every
+    comparison would trivially pass. Observed with httpx's default
+    ``trust_env`` it would be whatever ``HTTPS_PROXY`` names -- a different
+    failure with the same result: a comparison that looks real and never fires.
+
+    So the baseline request is built with no proxy and ``trust_env=False``, and
+    this asserts both from the outside.
+    """
+    import httpx
+
+    from insta_report.proxies import make_direct_fetch
+
+    seen: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = "198.51.100.7"
+        headers = {"content-type": "text/plain"}
+
+    def fake_init(self, **kwargs):
+        seen["proxy"] = kwargs.get("proxy")
+        seen["trust_env"] = kwargs.get("trust_env")
+        # Record, then run the real initialiser. Replacing it outright leaves
+        # the client with no _state and `with httpx.Client(...)` explodes.
+        real_init(self, **kwargs)
+
+    def fake_send(self, request, **kwargs):
+        return FakeResponse()
+
+    real_init = httpx.Client.__init__
+    real_send = httpx.Client.send
+    httpx.Client.__init__ = fake_init  # type: ignore[method-assign]
+    httpx.Client.send = fake_send  # type: ignore[method-assign]
+    try:
+        result = make_direct_fetch(timeout=5.0)("https://echo.invalid/ip")
+    finally:
+        httpx.Client.__init__ = real_init  # type: ignore[method-assign]
+        httpx.Client.send = real_send  # type: ignore[method-assign]
+
+    assert seen["proxy"] is None, seen
+    assert seen["trust_env"] is False, seen
+    assert result.egress is not None and result.egress.ip == "198.51.100.7"
+
+
+def test_build_pool_observes_the_own_address_once_at_startup(tmp_path):
+    """Observed, not configured, and asked exactly once.
+
+    Once matters: a baseline observed per lease is a third-party HTTP request
+    per report, from a machine that is about to be doing something much more
+    interesting to that third party.
+    """
+    from types import SimpleNamespace
+
+    from insta_report.proxies import build_pool
+
+    listing = tmp_path / "proxies.txt"
+    listing.write_text("10.0.0.1:8080\n", encoding="utf-8")
+    config = SimpleNamespace(source="file", file_path=listing, sticky_ttl_minutes=240)
+
+    calls: list[str] = []
+
+    def direct(url):
+        calls.append(url)
+        return ok("198.51.100.7")
+
+    pool = build_pool(
+        config,
+        fetch=lambda u, p: ok("198.51.100.9"),
+        own_ip=None,
+        direct_fetch=direct,
+    )
+
+    first = pool.acquire()
+    pool.release(first)
+    second = pool.acquire()
+
+    assert calls == ["https://api.ipify.org?format=json"], calls
+    assert first.endpoint.origin == "10.0.0.1:8080"
+    assert second.endpoint.origin == "10.0.0.1:8080"
+
+
+def test_a_declared_own_address_is_never_re_observed(tmp_path):
+    """Declared wins, and costs no request.
+
+    The operator who states their address is the operator behind a NAT or a
+    corporate egress -- cases where inferring it would be wrong. Honouring the
+    declaration is also what makes ``own_ip`` a real escape hatch for the
+    unreachable-echo case rather than a cosmetic override.
+    """
+    from types import SimpleNamespace
+
+    from insta_report.proxies import build_pool
+
+    listing = tmp_path / "proxies.txt"
+    listing.write_text("10.0.0.1:8080\n", encoding="utf-8")
+    config = SimpleNamespace(source="file", file_path=listing, sticky_ttl_minutes=240)
+
+    def direct(url):
+        raise AssertionError(f"observed the own address despite a declaration: {url}")
+
+    pool = build_pool(
+        config,
+        fetch=lambda u, p: ok("198.51.100.9"),
+        own_ip="198.51.100.7",
+        direct_fetch=direct,
+    )
+    pool.acquire()
+
+
+def test_an_unreachable_echo_service_still_builds_a_pool_that_refuses_to_lease(tmp_path, caplog):
+    """Degraded, inspectable, and still closed.
+
+    Building the pool anyway is deliberate: an operator whose only problem is a
+    flaky IP-echo service should get one line, not a traceback out of a
+    constructor, and should still be able to run ``status``. Leasing is refused
+    regardless, because the whole reason to build the pool was to lease from it.
+    """
+    from types import SimpleNamespace
+
+    from insta_report.proxies import build_pool
+
+    listing = tmp_path / "proxies.txt"
+    listing.write_text("10.0.0.1:8080\n", encoding="utf-8")
+    config = SimpleNamespace(source="file", file_path=listing, sticky_ttl_minutes=240)
+
+    def direct(url):
+        return ProbeResult(
+            verdict=ProbeVerdict.TIMEOUT, detail="ConnectTimeout: echo service"
+        )
+
+    with caplog.at_level("ERROR", logger="insta_report.proxies"):
+        pool = build_pool(
+            config, fetch=lambda u, p: ok(), own_ip=None, direct_fetch=direct
+        )
+        with pytest.raises(ProxyUnavailable, match="own address"):
+            pool.acquire()
+
+    errors = "\n".join(r.getMessage() for r in caplog.records if r.levelname == "ERROR")
+    assert "own IP address" in errors, errors
+    assert "own_ip" in errors, errors
+    # Still inspectable.
+    assert "10.0.0.1:8080" in pool.summary()

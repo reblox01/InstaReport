@@ -76,6 +76,8 @@ __all__ = [
     "HttpJsonProvider",
     "build_pool",
     "make_httpx_fetch",
+    "make_direct_fetch",
+    "canonical_address",
 ]
 
 log = logging.getLogger(__name__)
@@ -113,6 +115,10 @@ class ProbeVerdict(Enum):
     TIMEOUT = "timeout"
     CONNECT_ERROR = "connect_error"
     STATUS_ERROR = "status_error"
+    #: The address works perfectly and is the operator's own. Not a fault of the
+    #: address and not transient, so it is never quarantined -- see
+    #: :meth:`ProxyPool._dismiss_as_own_address`.
+    SELF_EGRESS = "self_egress"
 
     @property
     def usable(self) -> bool:
@@ -180,6 +186,41 @@ _DOCUMENTATION_NETS = (
     # address real and distinct" must have exactly one answer in the codebase.
     ipaddress.ip_network("198.18.0.0/15"),
 )
+
+
+def canonical_address(value: str) -> str | None:
+    """The one form two spellings of the same address are compared in.
+
+    Returns ``None`` for anything that is not an address. Never guesses and never
+    returns a partially-parsed value, because a caller that compares a guess is
+    the same failure as a caller that does not compare at all.
+
+    Two things are collapsed here that a string comparison gets wrong:
+
+    * **IPv4-mapped IPv6.** ``::ffff:203.0.113.7`` and ``203.0.113.7`` are one
+      host, and a dual-stack egress is entitled to answer in the mapped form.
+      Compared as strings they differ, so a string comparison lets the operator's
+      own address through exactly when the proxy is working correctly.
+    * **Presentation form.** ``2001:0DB8::1`` and ``2001:db8::1`` are one
+      address; so are the many legal spellings of an IPv4 octet group. Only the
+      parsed object knows that.
+    """
+    candidate = (value or "").strip()
+    if not candidate:
+        return None
+    # An echo service asked for JSON sometimes answers with the address quoted or
+    # wrapped in an object, and a bracketed IPv6 literal is not a bare address.
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address):
+        mapped = address.ipv4_mapped
+        if mapped is not None:
+            return str(mapped)
+    return str(address)
 
 
 @dataclass(frozen=True)
@@ -916,6 +957,7 @@ class ProxyPool:
         quarantine_cap: float = DEFAULT_PROXY_QUARANTINE_CAP,
         rng: random.Random | None = None,
         enforce_asn_diversity: bool = True,
+        own_ip: str | None = None,
     ) -> None:
         self._fetch = fetch
         self._monotonic = monotonic
@@ -927,6 +969,18 @@ class ProxyPool:
         self._rng = rng or random.Random()
         self._enforce_asn_diversity = enforce_asn_diversity
         self._sequence = 0
+        #: The operator's own address, exactly as supplied, kept so the two ways
+        #: of not having one -- absent, and present but unparseable -- can be
+        #: reported differently. They are different mistakes: the first is an
+        #: unfinished install, the second is a typo that looks finished.
+        self._own_raw = own_ip
+        #: The comparable form, or ``None`` when absent or unparseable.
+        self._own = canonical_address(own_ip) if own_ip else None
+        #: Origins proven to egress from the operator's own address, mapped to
+        #: the address they egressed from. Dismissed rather than quarantined;
+        #: see :meth:`_dismiss_as_own_address`. The address is kept because the
+        #: report has to be able to say *which* one it was.
+        self._self_egress: dict[str, str] = {}
         #: Stable per-address tiebreak, drawn once. See ``_order_key``.
         self._tiebreak: dict[str, float] = {}
 
@@ -995,8 +1049,23 @@ class ProxyPool:
         return tuple(h.endpoint for h in self._health.values())
 
     def available(self, now: float | None = None) -> list[ProxyHealth]:
+        """Addresses that could be leased right now.
+
+        Dismissed self-egress origins are excluded here rather than at each use
+        site, so every consumer -- ranking, the fallback pass, and the operator
+        reading ``status`` -- gets the same answer. Filtering only inside
+        ``acquire`` would leave this public method reporting an address as
+        available that the pool has already decided is not a proxy, which is the
+        same false reading as the misleading refusal message, in a different
+        place.
+        """
         now = self._monotonic() if now is None else now
-        return [h for h in self._health.values() if h.available(now, min_cooldown=self._min_cooldown)]
+        return [
+            h
+            for h in self._health.values()
+            if h.endpoint.origin not in self._self_egress
+            and h.available(now, min_cooldown=self._min_cooldown)
+        ]
 
     def status(self) -> list[dict[str, Any]]:
         now = self._monotonic()
@@ -1043,6 +1112,8 @@ class ProxyPool:
         exceeds the provider's sticky TTL the request is refused, because the
         address will be rotated out from under a live session.
         """
+        self._require_own_address()
+
         if hold_for is not None and hold_for > self._sticky_ttl:
             raise ProxyUnavailable(
                 f"requested hold of {hold_for / 60:.0f}min exceeds the provider's "
@@ -1097,6 +1168,17 @@ class ProxyPool:
             tried += 1
             result = self._probe(health.endpoint)
             if result.verdict.usable and result.egress is not None:
+                if self._is_own_address(result.egress.ip):
+                    # Dismissed, not failed. This address is not broken and will
+                    # not recover: it answers every probe perfectly, from the
+                    # one place the operator must never be seen reporting from.
+                    # Recording a health failure would quarantine it on a backoff
+                    # and then let `_fallback_ranked` re-select it the moment the
+                    # pool is busy, so the guard would hold exactly when it
+                    # mattered least. The sibling addresses in the same file are
+                    # unaffected -- one bad entry costs one entry.
+                    self._dismiss_as_own_address(health.endpoint, result.egress)
+                    continue
                 if want_distinct and result.egress.asn is not None:
                     if result.egress.asn in leased_asns:
                         # Skip WITHOUT recording a failure. The address just
@@ -1121,6 +1203,24 @@ class ProxyPool:
                 cap=self._quarantine_cap,
             )
 
+        if self._self_egress:
+            # Its own headline, because the generic one is actively misleading
+            # here. "no usable proxy after probing 1 address(es)" and "untried"
+            # both read as a broken address, and the remedy that follows from
+            # that -- buy more addresses -- does not work, because these answers
+            # perfectly. They are worse than useless: they are the only
+            # addresses in the pool that do work.
+            raise ProxyUnavailable(
+                f"refusing to lease: {len(self._self_egress)} configured "
+                f"address(es) work correctly and egress from this machine's own "
+                f"address, so they are not proxies. Adding more addresses will "
+                f"not help. Remove them from the proxy file, or point them at a "
+                f"real upstream proxy.\n"
+                + self._dismissed_report()
+                + "\n"
+                + self._exhausted_report(self._monotonic())
+            )
+
         raise ProxyUnavailable(
             f"no usable proxy after probing {tried} address(es); "
             f"{len(candidates)} were considered"
@@ -1131,6 +1231,88 @@ class ProxyPool:
             )
             + "\n"
             + self._exhausted_report(self._monotonic())
+        )
+
+    def _dismissed_report(self) -> str:
+        """Name the dismissed origins, for the refusal and for ``summary``.
+
+        Kept separate from :meth:`_exhausted_report` because these addresses are
+        not in that report at all -- they are not cooling down, not failed, not
+        untried. They are a different kind of unavailable, and folding them into
+        the cooldown table would restate the false reading that produced this
+        fix.
+        """
+        lines = ["dismissed (working, but egress from this machine's own address):"]
+        for origin in sorted(self._self_egress):
+            lines.append(f"  {origin}: {self._self_egress[origin]}")
+        return "\n".join(lines)
+
+    def _require_own_address(self) -> None:
+        """Refuse to lease anything until the operator's own address is known.
+
+        The whole point of the guard is that a report never leaves from the
+        address the operator browses from. That cannot be checked without knowing
+        the operator's address, and "we could not find out" is not the same as
+        "there is nothing to compare" -- reading it that way produces a guard
+        that reports healthy while comparing nothing, which is the failure mode
+        this project has now paid for twice.
+
+        So this fails closed, in two distinguishable messages, because the two
+        ways of arriving here have different fixes.
+        """
+        if self._own is not None:
+            return
+        if self._own_raw is None:
+            raise ProxyUnavailable(
+                "refusing to lease a proxy: the operator's own IP address was "
+                "never established, so no lease can be checked against it. This "
+                "is the one correlation the tool exists to avoid -- a report sent "
+                "from the operator's own address identifies the reporting "
+                "account. Either set own_ip in [proxies], or let the pool observe "
+                "it at startup (build_pool does this with a direct, non-proxied "
+                "request)."
+            )
+        raise ProxyUnavailable(
+            f"refusing to lease a proxy: own_ip={self._own_raw!r} is not a valid "
+            "IP address, so it cannot be compared against anything. A typo here "
+            "disables the check that keeps reports off the operator's own "
+            "address, while still looking configured. Fix it, or remove the key "
+            "to have the pool observe the address itself."
+        )
+
+    def _is_own_address(self, observed: str) -> bool:
+        """Whether *observed* egress is the operator's own address.
+
+        Compares canonical forms, so the mapped and presentation variants of one
+        address are one address. Both sides are canonicalised rather than only
+        one: the baseline may have arrived in either form, and a guard that
+        canonicalises only the candidate is a guard with a bypass.
+        """
+        if self._own is None:
+            # Unreachable via acquire, which requires it first. Answering False
+            # rather than raising keeps this usable from a status path that has
+            # no lease to give, and cannot be reached with a pool that leases.
+            return False
+        candidate = canonical_address(observed)
+        return candidate is not None and candidate == self._own
+
+    def _dismiss_as_own_address(
+        self, endpoint: ProxyEndpoint, egress: EgressObservation
+    ) -> None:
+        """Retire an origin that egresses from the operator's own address."""
+        self._self_egress[endpoint.origin] = egress.ip
+        # ERROR, not WARNING. The operator's next move after "no usable proxy"
+        # is to add more addresses, which would not fix this and would spend
+        # money. The line names the origin and the address so the entry in
+        # proxies.txt can be found and read.
+        log.error(
+            "[proxies] %s egresses from %s, which is this machine's own address. "
+            "It is not a proxy. Reports sent through it would leave from the "
+            "address Instagram already associates with the operator, so it is "
+            "dismissed from the pool rather than retried. Remove it from the "
+            "proxy file.",
+            endpoint.origin,
+            egress.ip,
         )
 
     def _fallback_ranked(self, now: float) -> list[ProxyHealth]:
@@ -1149,7 +1331,21 @@ class ProxyPool:
                 self._tiebreak[health.endpoint.origin],
             )
 
-        return sorted(self._health.values(), key=key)
+        # A dismissed origin is not on cooldown, it is not a candidate. This is
+        # a cost guard, not a safety guard: the per-candidate check in `acquire`
+        # would refuse the address again anyway, so removing this filter leaks
+        # nothing -- it re-probes a known-bad address on every fallback pass and
+        # repeats the ERROR line with it. Kept because the fallback pass is the
+        # one that runs under load, and a pool that re-asks a question it has a
+        # permanent answer to is a pool whose logs stop being readable.
+        return sorted(
+            (
+                health
+                for health in self._health.values()
+                if health.endpoint.origin not in self._self_egress
+            ),
+            key=key,
+        )
 
     def _asn_capacity(self) -> int:
         known = {h.egress.asn for h in self._health.values() if h.egress and h.egress.asn is not None}
@@ -1342,6 +1538,13 @@ class ProxyPool:
             for row in self.asn_diversity_report():
                 asn = f"AS{row['asn']}" if row["known"] else "AS? (not reported)"
                 lines.append(f"  {asn}: {', '.join(row['origins'])}")
+        if self._self_egress:
+            # Not a footnote. An operator reading `status` has to see that these
+            # entries are the reason the pool is short, because the alternative
+            # reading -- "the pool is exhausted" -- has a remedy that costs
+            # money and changes nothing.
+            lines.append("")
+            lines.append(self._dismissed_report())
         return "\n".join(lines)
 
     def __iter__(self) -> Iterator[ProxyHealth]:
@@ -1374,6 +1577,7 @@ def make_httpx_fetch(
     *,
     timeout: float = 20.0,
     headers: dict[str, str] | None = None,
+    trust_env: bool = True,
 ) -> Fetch:
     """Build a ``fetch`` backed by ``httpx``.
 
@@ -1381,6 +1585,11 @@ def make_httpx_fetch(
     A transport that raises is not a broken design here -- the pool handles that
     too -- but there is no reason to convert a known timeout into an exception
     only for the caller to convert it straight back into a verdict.
+
+    ``trust_env`` is passed through to httpx and left on by default, because for
+    an address under test the operator's ``HTTPS_PROXY`` is often exactly how
+    that address is reached. :func:`make_direct_fetch` is the case that turns it
+    off, and the reason is in its docstring.
     """
     import httpx
 
@@ -1395,6 +1604,7 @@ def make_httpx_fetch(
                 timeout=timeout,
                 follow_redirects=True,
                 headers=default_headers,
+                trust_env=trust_env,
             ) as client:
                 response = client.get(url)
         except httpx.TimeoutException as exc:
@@ -1451,6 +1661,38 @@ def make_httpx_fetch(
     return fetch
 
 
+def make_direct_fetch(
+    *,
+    timeout: float = 20.0,
+    headers: dict[str, str] | None = None,
+) -> Callable[[str], ProbeResult]:
+    """A ``fetch`` that can only observe *this* machine's own address.
+
+    Takes a bare URL rather than ``(url, proxy)`` so it cannot be handed a
+    proxy by accident. The signature is the guard: every call site that could
+    pass one has to reach for a different function, rather than passing ``None``
+    and hoping.
+
+    ``trust_env`` is off, and that is the part that matters. With httpx's default
+    the request would egress through ``HTTPS_PROXY`` if the operator has one
+    set -- a corporate VPN, a debugging tool -- and the "own address" recorded
+    would be that proxy's address. The comparison would then be real-looking and
+    wrong: it would hold against a pool entry pointing at the VPN, and pass for
+    a pool entry pointing at the actual home connection, which is the case the
+    guard exists to catch.
+
+    An operator genuinely behind something that rewrites their egress should
+    declare ``own_ip`` explicitly instead. Silently inferring it is how a
+    security check becomes a no-op with a log line saying it ran.
+    """
+    fetch = make_httpx_fetch(timeout=timeout, headers=headers, trust_env=False)
+
+    def direct(url: str) -> ProbeResult:
+        return fetch(url, None)
+
+    return direct
+
+
 # --- wiring -----------------------------------------------------------------
 
 
@@ -1463,6 +1705,8 @@ def build_pool(
     min_cooldown: float = MIN_PROXY_COOLDOWN_SECONDS,
     rng: random.Random | None = None,
     enforce_asn_diversity: bool = True,
+    own_ip: str | None = None,
+    direct_fetch: Callable[[str], ProbeResult] | None = None,
 ) -> ProxyPool:
     """Build a pool from an :class:`~insta_report.config.ProxyConfig`.
 
@@ -1470,6 +1714,20 @@ def build_pool(
     module, so a real import here would be circular; the alternative -- moving
     the config class in here -- would put a file-path field and an env lookup in
     a module that is otherwise about health and leases.
+
+    This is also where the operator's own address is established, and it is here
+    rather than inside ``ProxyPool`` for two reasons. The pool stays free of
+    network I/O at construction, which is what keeps it testable with a plain
+    function and no socket; and an address observed once at startup is one
+    answer, where an address observed per lease is a fresh HTTP request per
+    report against a third party.
+
+    Declared ``own_ip`` wins. Otherwise the address is observed once, directly.
+    If neither yields an address the pool is still built, and the refusal
+    happens at the first ``acquire`` with a message naming both ways out -- not
+    here, because a pool that cannot be constructed cannot be inspected, and an
+    operator whose only problem is an unreachable IP-echo service should be told
+    that in one line rather than by a stack trace out of the constructor.
 
     An operator with no proxy configuration gets an empty pool and a loud
     warning rather than a silent direct connection. Failing closed is the point:
@@ -1545,4 +1803,47 @@ def build_pool(
         min_cooldown=min_cooldown,
         rng=rng,
         enforce_asn_diversity=enforce_asn_diversity,
+        own_ip=own_ip if own_ip is not None else _observe_own_address(
+            probe_url, direct_fetch
+        ),
     )
+
+
+def _observe_own_address(
+    probe_url: str,
+    direct_fetch: Callable[[str], ProbeResult] | None,
+) -> str | None:
+    """This machine's own address, observed once. ``None`` if it cannot be had.
+
+    A ``None`` here is not an error to raise: it becomes the first
+    ``acquire``'s refusal, which names both remedies. Raising here instead
+    would mean a pool that could not be built could not be inspected, and the
+    most common cause -- an IP-echo service briefly unreachable -- deserves one
+    line, not a stack trace out of a constructor.
+
+    A declared ``own_ip`` never reaches this, which is the point of it: an
+    operator behind a NAT or a corporate egress can state the address rather
+    than have it guessed from whichever path the packet took.
+    """
+    if direct_fetch is None:
+        # Injected as None by tests and by any caller that has deliberately
+        # opted out of network I/O at construction. Reported as "not
+        # established" so the refusal says so rather than implying an attempt.
+        return None
+    result = direct_fetch(probe_url)
+    if result.egress is None:
+        log.error(
+            "[proxies] could not establish this machine's own IP address (%s). "
+            "Leases will be refused rather than issued unchecked -- a lease that "
+            "cannot be compared against the operator's own address is a lease "
+            "that might be the operator's own address. Set own_ip in [proxies] "
+            "to supply it directly.",
+            result.detail or result.verdict.value,
+        )
+        return None
+    log.info(
+        "[proxies] operator's own address is %s; leases egressing from it are "
+        "dismissed.",
+        result.egress.ip,
+    )
+    return result.egress.ip

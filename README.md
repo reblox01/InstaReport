@@ -32,9 +32,8 @@ success rendering (the opening section), and the absence of an oracle for
 "accepted and discarded".
 
 **No report has ever been filed by this tool against a live Instagram.** The test
-suite is green (1088 tests) and it is green with every channel unable to reach
-Instagram, because it is offline by design. That sentence is the single most
-important thing on this page.
+suite is green (1105 tests) and it is green with every channel unable to reach
+Instagram. That sentence is the single most important thing on this page.
 
 Items 1–3 need two things that do not exist yet:
 
@@ -181,14 +180,29 @@ insta_report/
 ## Development
 
 ```bash
-.venv\Scripts\python -m pytest              # 1088 tests, offline
+.venv\Scripts\python -m pytest              # 1105 tests, offline
 .venv\Scripts\python -m pytest -m "not static"   # skip pyflakes + mypy
 .venv\Scripts\python -m pytest -m "not browser"   # skip the Chromium tests
 ```
 
-The suite never touches the network. Exactly two layers do, and both are invoked
-by hand: `doctor` and the `probe` module. Four things are enforced as tests
-rather than conventions, because each one found a real defect:
+The suite never touches the network — and that is now enforced, not promised. An
+autouse fixture in `tests/conftest.py` fails any test that opens a non-loopback
+socket, so a test that reaches the internet fails loudly instead of passing
+because the network happened to be up. Loopback is allowed on purpose: asyncio
+holds a self-pipe per event loop and on Windows that is a real socket on
+`127.0.0.1`. A test that genuinely needs the network must ask with
+`@pytest.mark.network_access`; a test asserts that nothing is so marked, so
+adding one is a visible act that forces this section to be corrected.
+
+That guard exists because the suite was *not* offline. Adding the own-address
+check below put a live request to `api.ipify.org` on the path that builds the
+exit pool, and roughly twenty `run` tests started depending on a third party's
+uptime without anyone deciding to. They passed in CI and would have failed on a
+plane. Two layers do reach the network, and both are invoked by hand: `doctor`
+and the `probe` module.
+
+Five things are enforced as tests rather than conventions, because each one
+found a real defect:
 
 - **pyflakes** found two test functions whose names shadowed each other, so one
   had never run in the life of the suite.
@@ -208,6 +222,41 @@ rather than conventions, because each one found a real defect:
   which is precisely the case a credential scanner is blind to by construction.
   The pattern is structural (`ds_user_id` digit run, `%3A` separators, length and
   case mixing), so `user_id = "61214264580"` still does not fire.
+- **The offline socket guard itself.** A guard nothing tests is a convention
+  again, so the gate is exercised both ways: a non-loopback connect must be
+  refused, and a loopback connect must be allowed. The first of those failed
+  during development for a reason worth recording — the guard is what caught the
+  ipify regression, and nothing else did.
+
+## The own-address guard
+
+Every lease is checked against the address this machine reports for itself, and a
+lease that egresses from it is refused. That is the one correlation the tool
+exists to avoid: a report filed from the address Instagram already associates
+with you identifies the reporting account, and no amount of session hygiene
+compensates for it.
+
+```
+  operator's own IP  ──┐
+                       ├── canonical form ── equal? ── yes ──> leased
+  lease's egress IP  ──┘                        └── no  ──> bind
+```
+
+Left unset in `[proxies]`, the address is observed once at startup with a direct,
+non-proxied request, and a pool that could not observe it still builds but refuses
+to lease — the refusal names both remedies, and an unreachable IP-echo service
+deserves one line rather than a traceback out of a constructor. Set `own_ip` when
+that cannot be inferred correctly: behind CGNAT, behind a corporate egress that
+rewrites source addresses, or when the echo service is unreachable from your
+network. A value there that is not a valid address is **refused, not ignored** —
+leave the key out rather than in with something unchecked.
+
+An address that turns out to be the operator's own is *dismissed*, not
+quarantined, and the distinction is the whole design. Quarantine is for addresses
+that might come back; this one is a configuration error that will not fix itself.
+And it is filtered out of the candidate list rather than only refused at bind
+time, so the answer stays the same for `acquire`, for the fallback pass that
+runs under load, and for an operator reading `status`.
 
 Two invariants in the probe are refused rather than checked after the fact,
 because both defects produced output that *looked* like evidence: a probe may not

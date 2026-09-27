@@ -68,7 +68,7 @@ from .test_browser_channel import (
     a_channel,
     happy_pages,
 )
-from .test_cli import CONFIG_TEMPLATE, PROXY_LINES, _ok_probe, _no_wait
+from .test_cli import CONFIG_TEMPLATE, PROXY_LINES, _no_wait, _ok_direct, _ok_probe
 from .test_runner import FakeChannel
 
 # ===========================================================================
@@ -133,6 +133,7 @@ def run_cli(operator, monkeypatch):
             ["--config", str(operator.config_path), *argv],
             stream=out,
             fetch_impl=_ok_probe,
+            direct_fetch_impl=_ok_direct,
         )
         return code, out.getvalue()
 
@@ -832,6 +833,33 @@ class TestTheDoctorCommand:
         """
         code, out = run_cli("doctor", "--no-live")
         assert code == cli.EXIT_REFUSED, "no channel was rehearsed, so not runnable"
+        assert "nothing here proves" in out
+
+    def test_no_live_does_not_reach_the_network_to_find_the_own_address(
+        self, run_cli, monkeypatch
+    ):
+        """``--no-live`` means no network, and the own-address check could break it.
+
+        Establishing the operator's own address is a live HTTP request to a
+        third-party echo service, added to the path that builds the exit pool.
+        The sibling test above says this mode "passes in a container with no
+        network", which is a claim about behaviour rather than a check, and a
+        claim like that decays the moment someone adds a step in front of it.
+
+        So the step is made to fail loudly here. If a future change lets
+        ``--no-live`` build a pool, this fails rather than quietly turning the
+        offline check into a network check that also takes a second.
+        """
+        def explosive(*args, **kwargs):
+            raise AssertionError(
+                "--no-live must not observe the operator's own address"
+            )
+
+        monkeypatch.setattr(cli, "make_direct_fetch", explosive)
+        monkeypatch.setattr(cli, "build_pool", explosive)
+
+        code, out = run_cli("doctor", "--no-live")
+        assert code == cli.EXIT_REFUSED
         assert "nothing here proves" in out
 
     def test_a_warning_exits_one_so_a_wrapper_notices(self, run_cli):

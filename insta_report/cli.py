@@ -58,7 +58,7 @@ from .config import Config, ConfigError, load_config
 from .doctor import DoctorReport, run_doctor
 from .narrative import NarrativeBuilder, build_builder
 from .pacing import Pacer, PacingConfig
-from .proxies import ProxyPool, build_pool
+from .proxies import ProxyPool, build_pool, make_direct_fetch
 from .runner import (
     ChannelHealth,
     ChannelSpec,
@@ -204,13 +204,25 @@ def _build_accounts(config: Config) -> AccountPool:
     return AccountPool(accounts)
 
 
-def _build_proxies(config: Config, fetch_impl: Callable[..., Any]) -> ProxyPool:
+def _build_proxies(
+    config: Config,
+    fetch_impl: Callable[..., Any],
+    direct_fetch_impl: Callable[[str], Any] | None = None,
+) -> ProxyPool:
     """Build the exit pool, refusing to start a run without a usable one.
 
     ``build_pool`` already fails closed on an empty list. This adds the failure
     the pool cannot see: a provider key that is not in the environment reads as
     "no exits available", and the operator debugging that at 2am needs to be
     told the variable is unset rather than that a proxy is down.
+
+    ``own_ip`` and the direct observation are passed through here rather than
+    inside ``build_pool`` so this stays the single place that knows where the
+    operator's address comes from, and so a caller can substitute a
+    ``direct_fetch``. Every path that reaches this wants the observation: a pool
+    that cannot lease is not useful to a health check, and ``doctor --no-live``
+    never calls this at all, so the one mode that promised no network I/O is
+    unaffected.
     """
     if config.proxies.source == "provider" and not config.proxies.resolved_key():
         variable = config.proxies.provider_key_env or "(no provider_key_env set)"
@@ -218,7 +230,12 @@ def _build_proxies(config: Config, fetch_impl: Callable[..., Any]) -> ProxyPool:
             f"[proxies] source='provider' needs the API key in {variable}, and "
             "that variable is unset or empty."
         )
-    return build_pool(config.proxies, fetch=fetch_impl)
+    return build_pool(
+        config.proxies,
+        fetch=fetch_impl,
+        own_ip=config.proxies.own_ip,
+        direct_fetch=direct_fetch_impl or make_direct_fetch(),
+    )
 
 
 def _build_channels(
@@ -517,6 +534,7 @@ async def _run(
     verbose: bool,
     stream: TextIO,
     fetch_impl: Callable[..., Any] | None = None,
+    direct_fetch_impl: Callable[[str], Any] | None = None,
     doctor: DoctorRequest | None = None,
 ) -> int:
     """Assemble the parts, run once, print the summary, return the exit code.
@@ -546,7 +564,7 @@ async def _run(
         )
 
     pool = _build_accounts(config)
-    proxies = _build_proxies(config, fetch_impl or fetch)
+    proxies = _build_proxies(config, fetch_impl or fetch, direct_fetch_impl)
     anchors = _load_anchors(config)
     artifacts = ArtifactStore(config.paths, run_id, allow_trace=False)
     channels = _build_channels(config, anchors, artifacts)
@@ -575,6 +593,7 @@ async def _run(
                 submit=doctor.submit,
                 live=doctor.live,
                 fetch_impl=fetch_impl,
+                direct_fetch_impl=direct_fetch_impl,
             )
             print("", file=stream)
             print(verdict.render(), file=stream)
@@ -1037,7 +1056,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_run(
-    args: argparse.Namespace, *, stream: TextIO, fetch_impl: Callable[..., Any] | None
+    args: argparse.Namespace,
+    *,
+    stream: TextIO,
+    fetch_impl: Callable[..., Any] | None = None,
+    direct_fetch_impl: Callable[[str], Any] | None = None,
 ) -> int:
     if args.resume and args.run_id:
         raise ConfigError("--resume and --run-id name the same thing; pass one")
@@ -1121,6 +1144,7 @@ def _cmd_run(
                 verbose=args.verbose,
                 stream=stream,
                 fetch_impl=fetch_impl,
+                direct_fetch_impl=direct_fetch_impl,
                 doctor=DoctorRequest(
                     enabled=not args.no_doctor,
                     probe_target=probe_target,
@@ -1145,6 +1169,7 @@ async def _doctor(
     submit: bool,
     live: bool,
     fetch_impl: Callable[..., Any] | None,
+    direct_fetch_impl: Callable[[str], Any] | None = None,
 ) -> DoctorReport:
     """Build whatever the requested checks need, then run them.
 
@@ -1154,7 +1179,9 @@ async def _doctor(
     not, and a health check that opens a browser it was not asked to open is
     itself a surprise.
     """
-    pool = _build_proxies(config, fetch_impl or fetch) if live else None
+    pool = (
+        _build_proxies(config, fetch_impl or fetch, direct_fetch_impl) if live else None
+    )
     channels: list[Any] = []
     if live and probe_target:
         # The channels themselves, not the runner's ChannelSpec wrappers: the
@@ -1180,7 +1207,7 @@ async def _doctor(
 
 
 def _cmd_doctor(
-    args: argparse.Namespace, *, stream: TextIO, fetch_impl: Any = None
+    args: argparse.Namespace, *, stream: TextIO, fetch_impl: Any = None, direct_fetch_impl: Any = None
 ) -> int:
     # Logs go to stderr under --json, not to the caller's stream. A wrapper
     # parses stdout with json.loads, and a single INFO line in front of the
@@ -1227,6 +1254,7 @@ def _cmd_doctor(
             submit=args.submit,
             live=not args.no_live,
             fetch_impl=fetch_impl,
+            direct_fetch_impl=direct_fetch_impl,
         )
     )
 
@@ -1243,20 +1271,20 @@ def _cmd_doctor(
     return EXIT_OK
 
 
-def _cmd_status(args: argparse.Namespace, *, stream: TextIO, fetch_impl: Any = None) -> int:
+def _cmd_status(args: argparse.Namespace, *, stream: TextIO, fetch_impl: Any = None, direct_fetch_impl: Any = None) -> int:
     setup_logging(verbose=args.verbose, stream=stream)
     return _status(load_config(_resolve_config(args.config)), args.run, stream=stream)
 
 
 def _cmd_targets(
-    args: argparse.Namespace, *, stream: TextIO, fetch_impl: Any = None
+    args: argparse.Namespace, *, stream: TextIO, fetch_impl: Any = None, direct_fetch_impl: Any = None
 ) -> int:
     setup_logging(verbose=args.verbose, stream=stream)
     return _targets(load_config(_resolve_config(args.config)), args.targets, stream=stream)
 
 
 def _cmd_anchors(
-    args: argparse.Namespace, *, stream: TextIO, fetch_impl: Any = None
+    args: argparse.Namespace, *, stream: TextIO, fetch_impl: Any = None, direct_fetch_impl: Any = None
 ) -> int:
     setup_logging(verbose=args.verbose, stream=stream)
     config = load_config(_resolve_config(args.config))
@@ -1270,17 +1298,33 @@ def main(
     *,
     stream: TextIO | None = None,
     fetch_impl: Callable[..., Any] | None = None,
+    direct_fetch_impl: Callable[[str], Any] | None = None,
 ) -> int:
     """Entry point. Returns an exit code rather than calling ``sys.exit``.
 
     Returning rather than exiting is what lets the tests drive the real
     argument parser and the real dispatch and assert on the code, instead of
     asserting on a captured ``SystemExit``.
+
+    ``direct_fetch_impl`` is the seam for the operator's own-address
+    observation, which is a *different* transport from ``fetch_impl``: no proxy,
+    no environment, and pointed at an IP-echo service rather than at a proxy
+    under test. It exists as a separate parameter precisely because it is
+    separate, and because a test that could not replace it would reach the real
+    internet -- which is how twenty tests came to depend on api.ipify.org being
+    up without anyone deciding that.
     """
     out = stream or sys.stdout
     args = build_parser().parse_args(list(argv) if argv is not None else None)
     try:
-        return int(args.handler(args, stream=out, fetch_impl=fetch_impl))
+        return int(
+            args.handler(
+                args,
+                stream=out,
+                fetch_impl=fetch_impl,
+                direct_fetch_impl=direct_fetch_impl,
+            )
+        )
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=out)
         return EXIT_REFUSED

@@ -8,8 +8,10 @@ secrets between cases and producing order-dependent failures.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import shutil
+import socket
 import tempfile
 from pathlib import Path
 
@@ -26,6 +28,75 @@ def _clean_registry():
     get_registry().clear()
     yield
     get_registry().clear()
+
+
+def _is_loopback(address: object) -> bool:
+    """Whether *address* is a loopback target, in any of the shapes a socket takes.
+
+    ``connect`` is handed an ``(host, port)`` tuple for AF_INET and a
+    ``(host, port, flowinfo, scopeid)`` tuple for AF_INET6, and either may be a
+    4-tuple already. Unpacking defensively is cheaper than a test that fails on
+    a shape nobody predicted.
+    """
+    if not isinstance(address, tuple) or not address:
+        return False
+    try:
+        host = str(address[0])
+    except Exception:  # pragma: no cover - defensive
+        return False
+    if host in ("localhost", ""):
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
+@pytest.fixture(autouse=True)
+def _no_outbound_network(monkeypatch: pytest.MonkeyPatch, request):
+    """Fail any test that opens a non-loopback socket.
+
+    "The suite is offline" was a claim in the README with nothing behind it, and
+    a claim like that is worth exactly nothing until something breaks. This is
+    that something: a test that reaches the internet fails here, loudly, instead
+    of passing because the network happened to be up and quietly costing CI a
+    round trip to a third party.
+
+    Loopback stays open on purpose. asyncio holds a self-pipe socket per event
+    loop, and on Windows that pipe is a real AF_INET socket on 127.0.0.1, so
+    blocking it breaks every async test in the file for a reason that has
+    nothing to do with what they are testing.
+
+    A test that genuinely needs a socket opts out by asking for
+    ``network_access``. Nothing does today; the marker exists so that adding one
+    is a deliberate, greppable act rather than a quiet deletion of this fixture.
+    """
+    if request.node.get_closest_marker("network_access"):
+        return
+
+    def blocked(self, address, *args, **kwargs):
+        if _is_loopback(address):
+            return _real_connect(self, address, *args, **kwargs)
+        raise AssertionError(
+            f"test {request.node.nodeid!r} tried to open a socket to {address!r}. "
+            "The suite is meant to be offline: inject a transport (fetch_impl, "
+            "httpx.MockTransport, or a patched client factory) instead of letting "
+            "a real request escape. If this test genuinely needs the network, mark "
+            "it with @pytest.mark.network_access and say why."
+        )
+
+    def blocked_ex(self, address, *args, **kwargs):
+        if _is_loopback(address):
+            return _real_connect_ex(self, address, *args, **kwargs)
+        raise AssertionError(
+            f"test {request.node.nodeid!r} tried to connect to {address!r}; "
+            "the suite is meant to be offline."
+        )
+
+    _real_connect = socket.socket.connect
+    _real_connect_ex = socket.socket.connect_ex
+    monkeypatch.setattr(socket.socket, "connect", blocked, raising=False)
+    monkeypatch.setattr(socket.socket, "connect_ex", blocked_ex, raising=False)
 
 
 @pytest.fixture

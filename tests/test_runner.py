@@ -277,7 +277,15 @@ def ok_probe(url: str, proxy: str | None = None) -> ProbeResult:
 
 
 def make_proxies(count: int = 2, clock: Clock | None = None, **kwargs) -> ProxyPool:
-    """A pool of always-healthy exits, on a clock the test controls."""
+    """A pool of always-healthy exits, on a clock the test controls.
+
+    ``own_ip`` defaults to an address these exits never produce. Every lease is
+    now checked against it, and ``ok_probe`` derives each exit's address from
+    its own host, so the sentinel has to be outside the 198.51.100.0/24 range
+    this harness hands out -- otherwise the pool would refuse to lease at all
+    and the tests would fail on the guard instead of on what they are about.
+    """
+    kwargs.setdefault("own_ip", "192.0.2.99")
     return ProxyPool(
         [ProxyEndpoint(url=f"http://198.51.100.{n}:9000") for n in range(1, count + 1)],
         fetch=ok_probe,

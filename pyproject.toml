@@ -56,6 +56,12 @@ markers = [
   # type checks" cannot drift apart. Costs about twenty seconds, so it is a
   # marker: `-m "not static"` for a fast inner loop, and no marker in CI.
   "static: runs pyflakes or mypy over the package",
+  # Escape hatch for a test that genuinely needs the network. Nothing is marked
+  # with it today, and the point is that adding one is a visible, greppable act
+  # rather than a quiet deletion of the conftest guard that blocks outbound
+  # sockets. If you add a marker here, the README's "the suite is offline" claim
+  # has just become false and needs updating in the same commit.
+  "network_access: opens a real socket, defeating the offline guard",
 ]
 
 [tool.mypy]

@@ -163,6 +163,26 @@ def _ok_probe(url: str, proxy: str | None = None) -> ProbeResult:
     )
 
 
+def _ok_direct(url: str) -> ProbeResult:
+    """The operator's own address, as the pool would observe it.
+
+    A separate helper from ``_ok_probe`` because the two transports are
+    genuinely different, and because it is single-argument by design: the
+    observation takes no proxy, so a fake that accepted one would be accepting a
+    call shape the real transport cannot be given.
+
+    The address is in a different range from every exit ``_ok_probe`` reports, so
+    the pool's own-address guard does not dismiss the exits and the test fails
+    on the thing it is about rather than on the guard.
+    """
+    return ProbeResult(
+        verdict=ProbeVerdict.OK,
+        status=200,
+        body=json.dumps({"ip": "198.51.100.250"}),
+        egress=EgressObservation(ip="198.51.100.250"),
+    )
+
+
 async def _no_wait(self, *args, **kwargs) -> float:
     """A ``Pacer.async_wait`` that returns immediately.
 
@@ -200,6 +220,7 @@ def run_cli(workspace, monkeypatch):
             ["--config", str(workspace.config), *argv],
             stream=out,
             fetch_impl=_ok_probe,
+            direct_fetch_impl=_ok_direct,
         )
         return code, out.getvalue()
 

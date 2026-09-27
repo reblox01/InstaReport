@@ -69,6 +69,20 @@ class ProxyConfig:
     provider: str | None = None
     provider_key_env: str | None = None
     sticky_ttl_minutes: int = 240
+    #: The operator's own public IP address, as a last resort of last resorts.
+    #:
+    #: Leave unset and the pool observes it once at startup with a direct,
+    #: non-proxied request, which is right for almost everyone. Set it when that
+    #: cannot be inferred correctly: behind CGNAT where you want the address you
+    #: are known by rather than the address your packets leave from, behind a
+    #: corporate egress that rewrites source addresses, or when the IP-echo
+    #: service is unreachable from this network.
+    #:
+    #: A value here that is not a valid address is refused, not ignored. Set
+    #: nothing rather than something you have not checked -- a typo in this
+    #: field disables the check that keeps reports off your own address while
+    #: still looking configured.
+    own_ip: str | None = None
 
     def resolved_key(self) -> str | None:
         if not self.provider_key_env:
@@ -351,6 +365,7 @@ def _load_proxies(reader: _Reader) -> ProxyConfig:
         provider=provider,
         provider_key_env=reader.str_("provider_key_env"),
         sticky_ttl_minutes=reader.int_("sticky_ttl_minutes", 240, minimum=15),
+        own_ip=reader.str_("own_ip"),
     )
 
 
