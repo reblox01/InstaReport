@@ -29,6 +29,7 @@ Two properties keep this from being theatre:
 from __future__ import annotations
 
 import importlib.util
+import re
 import socket
 import subprocess
 import sys
@@ -260,6 +261,51 @@ class TestTheSuiteIsOffline:
     rather than a convention. A guard nothing tests is a convention again, so
     the next section is the part that matters.
     """
+
+    def test_the_test_count_in_the_readme_is_the_real_one(self):
+        """A number in a README is a claim about the suite, and it goes stale.
+
+        It had already gone stale twice: 1088 became 1105 became 1118, and each
+        time the README kept asserting the old figure while the suite quietly
+        grew past it. That is a small lie, and small lies are how the larger
+        ones in this project started -- a claim in a docstring, a comment, a
+        status table, none of them checked against anything.
+
+        So it is checked. Collect-only is fast and touches no network, and the
+        count is taken from pytest's own collection rather than from parsing
+        test files, so a test that is renamed, skipped by default, or collected
+        twice all show up here.
+        """
+        readme = (REPO / "README.md").read_text(encoding="utf-8")
+        claimed = re.search(r"#\s*(\d+)\s+tests, offline", readme)
+        assert claimed, (
+            "the README's development section no longer states a test count."
+            " Restore it, or state plainly that there is no count -- but do not"
+            " let the line quietly change meaning."
+        )
+
+        collected = subprocess.run(
+            [sys.executable, "-m", "pytest", "--collect-only", "-q"],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+        )
+        assert collected.returncode == 0, collected.stdout + collected.stderr
+        # The last line of a -q collection is the summary, e.g.
+        # "1118 tests collected in 3.21s". Read the integer from it rather than
+        # counting lines, because the dots/summary format is pytest's to change
+        # and the number is the part being asserted.
+        summary = collected.stdout.strip().splitlines()[-1]
+        found = re.search(r"(\d+)\s+tests?\s+collected", summary)
+        assert found, (
+            f"could not read a test count from pytest's summary line: {summary!r}"
+        )
+
+        assert int(found.group(1)) == int(claimed.group(1)), (
+            f"the README says {claimed.group(1)} tests; the suite collects"
+            f" {found.group(1)}. If you just added or removed a test, update the"
+            " number in the same commit -- that is the whole point of this gate."
+        )
 
     def test_a_non_loopback_connection_is_refused(self):
         """The guard fires, and fires before anything leaves the machine.

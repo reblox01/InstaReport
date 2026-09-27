@@ -685,14 +685,55 @@ class TestTheDockerfileCannotDrift:
         file excluded from every ``COPY`` still arrives in the build context and
         lands in a layer the daemon holds. The distinction between "not in the
         final image" and "never transmitted" is the whole point of the file.
+
+        Rules are read as *active rules*, not as substrings. Asserting the
+        pattern appears in the text is satisfied by commenting the line out,
+        which is the shape this very file's own ``.gitignore`` warns about:
+        a rule that looks present and excludes nothing.
         """
-        ignore = (REPO / ".dockerignore").read_text(encoding="utf-8")
+        active = {
+            line.strip()
+            for line in (REPO / ".dockerignore").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        }
         for pattern, why in (
             ("config.toml", "names real accounts and the env var holding the sessionid"),
             ("proxies.txt", "a paid resource, and the addresses are the point of the tool"),
-            (".git", "five commits in the history carry the operator's real account id"),
+            (".git/", "five commits in the history carry the operator's real account id"),
         ):
-            assert pattern in ignore, f".dockerignore does not exclude {pattern} -- {why}"
+            assert pattern in active, (
+                f".dockerignore has no active rule for {pattern} -- {why}\n"
+                "Active rules are: " + ", ".join(sorted(active)[:12])
+            )
+
+    def test_nothing_the_tool_writes_to_is_in_the_build_context(self):
+        """A ledger inside a layer is a ledger nobody can rotate.
+
+        Listed by what the code *writes*, not by what a reader guesses might
+        matter. The first draft of this file used a count threshold instead --
+        "at least N active rules" -- and it was decoration: the file has 42, so
+        deleting 30 of them still passed. A count is not a property of anything;
+        this list is, and adding a place the tool writes to means adding it
+        here too.
+        """
+        active = {
+            line.strip()
+            for line in (REPO / ".dockerignore").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        }
+        for written, what in (
+            ("artifacts/", "redacted screenshots, DOM diffs, traces"),
+            ("traces/", "Playwright trace archives"),
+            ("checkpoints/", "the resume ledger"),
+            ("runs/", "per-run directories"),
+            ("state/", "account and target state"),
+            ("data/", "the data directory, under whatever name it resolves to"),
+        ):
+            assert written in active, (
+                f".dockerignore does not exclude {written} -- {what}. A ledger"
+                " baked into an image outlives the run that produced it and is"
+                " not covered by the credential scan, which reads the work tree."
+            )
 
     def test_the_compose_file_reads_its_secret_from_outside_the_repository(self):
         text = (REPO / "docker-compose.yml").read_text(encoding="utf-8")
@@ -726,6 +767,36 @@ class TestTheDockerfileCannotDrift:
                 " A secrets file under the checkout is a secrets file that the"
                 " next `git add -A` commits."
             )
+
+    def test_the_documented_vps_override_form_is_the_one_the_test_accepts(self):
+        """The README's escape hatch and the gate that reads it must agree.
+
+        The check above allows an absolute path, because a VPS has no parent
+        directory to be one level up from and the README tells operators to
+        supply one. That makes the absolute form a feature, and a feature with
+        no positive test is a feature that quietly stops working while the
+        refusal still passes. So the documented string is asserted to be the
+        documented string.
+        """
+        readme = (REPO / "README.md").read_text(encoding="utf-8")
+        compose = (REPO / "docker-compose.yml").read_text(encoding="utf-8")
+
+        assert "INSTA_REPORT_ENV_FILE=" in readme, (
+            "the README no longer documents how to point the container at a"
+            " secrets file on a second host, which is the only host where the"
+            " container is worth using"
+        )
+        assert "/run/secrets" in readme, (
+            "the documented override is not an absolute path, so it would be"
+            " refused by the same rule that keeps the secrets file out of the"
+            " checkout"
+        )
+        # The variable must be the one compose reads, or the override is a
+        # sentence in a README that does nothing.
+        assert "INSTA_REPORT_ENV_FILE" in compose, (
+            "the README documents INSTA_REPORT_ENV_FILE but compose reads a"
+            " different name, so the documented override is silently ignored"
+        )
 
     def test_the_compose_file_never_defines_the_sessionid_inline(self):
         """The failure mode is an ``environment:`` entry, not a stray mention.

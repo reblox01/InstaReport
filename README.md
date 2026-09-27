@@ -32,7 +32,7 @@ success rendering (the opening section), and the absence of an oracle for
 "accepted and discarded".
 
 **No report has ever been filed by this tool against a live Instagram.** The test
-suite is green (1105 tests) and it is green with every channel unable to reach
+suite is green (1119 tests) and it is green with every channel unable to reach
 Instagram. That sentence is the single most important thing on this page.
 
 Items 1–3 need two things that do not exist yet:
@@ -259,7 +259,7 @@ insta_report/
 ## Development
 
 ```bash
-.venv\Scripts\python -m pytest              # 1105 tests, offline
+.venv\Scripts\python -m pytest              # 1119 tests, offline
 .venv\Scripts\python -m pytest -m "not static"   # skip pyflakes + mypy
 .venv\Scripts\python -m pytest -m "not browser"   # skip the Chromium tests
 ```
@@ -280,7 +280,7 @@ uptime without anyone deciding to. They passed in CI and would have failed on a
 plane. Two layers do reach the network, and both are invoked by hand: `doctor`
 and the `probe` module.
 
-Five things are enforced as tests rather than conventions, because each one
+Six things are enforced as tests rather than conventions, because each one
 found a real defect:
 
 - **pyflakes** found two test functions whose names shadowed each other, so one
@@ -306,6 +306,18 @@ found a real defect:
   refused, and a loopback connect must be allowed. The first of those failed
   during development for a reason worth recording — the guard is what caught the
   ipify regression, and nothing else did.
+- **This test count.** It had already gone stale twice — 1088, then 1105, while
+  the suite quietly grew past both — so the number is now read out of pytest's
+  own collection and compared. A figure in a README is a claim about the suite,
+  and a claim nobody checks is how the other claims in this file got made.
+
+The container adds four more, in `tests/test_repository_hygiene.py`: the pinned
+dependency set in the image must equal the one `pyproject` declares, no `ARG` or
+`ENV` may carry a credential, the compose file may not define the sessionid
+inline, and its default secrets path must resolve *outside* the checkout. Each was
+verified by breaking it. That last one was wrong on the first attempt — it
+matched a substring, so commenting a rule out satisfied it, which is the same
+trap this repository's own `.gitignore` documents.
 
 ## The own-address guard
 

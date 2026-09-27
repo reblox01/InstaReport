@@ -389,6 +389,55 @@ def test_the_override_cannot_smuggle_the_ledger_into_the_repository(
     assert not inside.exists()
 
 
+def test_a_relative_override_is_refused_rather_than_guessed(
+    base_config_toml, proxy_file, session_env, monkeypatch
+):
+    """There is no good base for a relative value in an environment variable.
+
+    Every path *in the config* accepts a relative value and resolves it against
+    the config file's directory, so that a run's blast radius does not depend on
+    the shell it was launched from. That rule cannot transfer: a variable has no
+    config file to be relative to. Resolving it against the working directory
+    would reintroduce the exact dependence the rest of this file removes, and
+    resolving it against the config's directory would be a second, undocumented
+    base. So it is refused, naming both absolute forms.
+
+    Found by mutation: an override applied without ``.resolve()`` passed every
+    other test in this file, because they all set an absolute path. This is the
+    case that was actually uncovered, and it is the one an operator is most
+    likely to type.
+    """
+    from insta_report.config import DATA_DIR_ENV
+
+    for relative in ("./artifacts", "artifacts", "../insta-report-data"):
+        monkeypatch.setenv(DATA_DIR_ENV, relative)
+        with pytest.raises(ConfigError) as caught:
+            load_config(_write(base_config_toml))
+        message = str(caught.value)
+        assert "relative path" in message, message
+        assert "/data" in message, (
+            "the refusal should name the form that works, not just reject the"
+            f" one that does not: {message}"
+        )
+
+
+def test_an_absolute_override_outside_the_repository_is_accepted(
+    base_config_toml, proxy_file, session_env, monkeypatch, tmp_path
+):
+    """The container's case, and the reason the override exists at all.
+
+    An absolute path that is *not* inside the checkout is the documented way to
+    point a container at a volume. Asserted positively because a test that only
+    ever refuses says nothing about whether the feature works -- which is how a
+    gate ends up blocking everything and reading as a safety improvement.
+    """
+    from insta_report.config import DATA_DIR_ENV
+
+    outside = tmp_path / "somewhere-else-entirely"
+    monkeypatch.setenv(DATA_DIR_ENV, str(outside))
+    assert load_config(_write(base_config_toml)).paths.data_dir == outside.resolve()
+
+
 def test_an_empty_override_is_not_an_override(
     base_config_toml, proxy_file, session_env, monkeypatch
 ):

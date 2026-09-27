@@ -503,6 +503,39 @@ CONFIG_PATH_KEYS: tuple[tuple[str, str], ...] = (
 DATA_DIR_ENV = "INSTA_REPORT_DATA_DIR"
 
 
+def _apply_data_dir_override(data: dict[str, Any], override: str) -> None:
+    """Replace ``data_dir`` with an operator-supplied absolute path.
+
+    Absolute only, and refused rather than resolved. Every other path in this
+    config accepts a relative value and resolves it against the *config file's*
+    directory, precisely so that a run's blast radius does not depend on the
+    shell it was launched from. That rule does not transfer to an environment
+    variable: the variable has no config file to be relative to, so a relative
+    value here would have to mean either the working directory or the config's
+    directory, and guessing wrong relocates the checkpoint ledger to somewhere
+    nobody chose. ``/data`` in a container and an absolute host path both work;
+    ``./artifacts`` is refused with the two forms named.
+
+    Applied after ``_absolutise_paths`` and before anything reads the key, so
+    the value is subject to exactly the same containment check as a configured
+    one. An override that could bypass it would be a way to put the ledger --
+    which holds the report text, the one thing here written in the reporter's
+    own voice -- where the credential scanner does not look.
+    """
+    candidate = Path(override).expanduser()
+    if not candidate.is_absolute():
+        raise ConfigError(
+            f"{DATA_DIR_ENV}={override!r} is a relative path. This variable "
+            "names a directory, and a relative one has no stable base: the "
+            "working directory of whatever launched the tool is not an answer "
+            "worth putting a checkpoint ledger in. Use an absolute path -- "
+            f"{DATA_DIR_ENV}=/data in a container, or the full path on the "
+            "host -- or leave the variable unset and set data_dir in the "
+            "config, where a relative value resolves against the config file."
+        )
+    data["data_dir"] = str(candidate.resolve())
+
+
 def _absolutise_paths(data: dict[str, Any], base: Path) -> None:
     """Rewrite every relative path in *data* so it is relative to *base*.
 
@@ -553,12 +586,7 @@ def load_config(path: str | Path) -> Config:
 
     override = os.environ.get(DATA_DIR_ENV, "").strip()
     if override:
-        # Applied after relativisation and before anything reads the key, so the
-        # override is subject to exactly the same rules as a configured value:
-        # resolved, and refused if it lands inside the repository. An override
-        # that could bypass those checks would be a way to put the checkpoint
-        # ledger where the credential scanner does not look.
-        data["data_dir"] = str(Path(override).expanduser().resolve())
+        _apply_data_dir_override(data, override)
 
     root = _Reader(data, "")
     paths = resolve_paths(root.path_("data_dir"))
