@@ -1,20 +1,23 @@
-# The Playwright image, pinned to the driver version in the lockfile.
+# The Playwright image, pinned to the driver version.
 #
-# Not a convenience. The Playwright Python package carries its own Node driver
-# and a browsers.json naming exact Chromium revisions, and it refuses to run a
-# browser whose revision its driver does not know about. An image built on
-# `python:3.11-slim` plus `playwright install chromium` therefore produces a
-# *different* browser on every rebuild, weeks apart, with no way to tell from
-# the outside which one a failing selector ran against.
+# Stated precisely, because the obvious justification is wrong and the real one
+# is better. The first draft of this comment said the base image is what makes
+# the build reproducible, and that is not true: the `playwright` Python package
+# bundles a browsers.json naming exact Chromium revisions, so pinning
+# `playwright==1.63.0` and running `playwright install chromium` fetches the same
+# revision 1243 this image carries. The pin does that work, not the base.
 #
-# The browser channel is the only channel that has ever been implemented, and it
-# has never been run against live Instagram at all -- the selector is matched
-# against a committed golden fixture and a hand-transcribed DOM. A reproduction
-# environment is worth more here than a small image.
+# The base image is here for the part the pin cannot do. `playwright install
+# --with-deps` installs the browser's shared libraries from an Ubuntu package
+# list, `python:3.11-slim` is Debian, and the result is a build step that
+# depends on a distribution the browser is less tested against. So the choice is
+# python:3.11-slim (small, one apt step, Debian) versus this (2.5 GB, nothing to
+# go wrong) -- and the right answer for a tool whose primary channel has never
+# been pointed at live Instagram is the one that cannot fail at build time. Size
+# is not the constraint. "Which build failed" is.
 #
-# The tag must equal the `playwright` version in the dev environment. This image
-# was built against 1.63.0 (Chromium revision 1243); a mismatch is a launch
-# failure at first report, not a warning.
+# The tag must equal the `playwright` version installed below. A mismatch is a
+# launch failure at the first report, not a warning -- hence the shared ARG.
 ARG PLAYWRIGHT_VERSION=1.63.0
 FROM mcr.microsoft.com/playwright/python:v${PLAYWRIGHT_VERSION}-noble
 

@@ -147,15 +147,16 @@ docker compose run --rm reporter run --targets /targets/accounts.txt
 
 Three things are worth knowing before you use it, and two of them are traps.
 
-**The image exists for Chromium, not for isolation.** The Playwright Python
-package carries a Node driver and a `browsers.json` naming exact browser
-revisions, and it refuses to run a browser whose revision it does not recognise.
-An image built on `python:3.11-slim` plus `playwright install chromium`
-therefore produces a *different* browser on every rebuild, weeks apart, with no
-way to tell from the outside which one a failing selector ran against. The base
-image is `mcr.microsoft.com/playwright/python:v1.63.0-noble`, pinned to the
-driver version, because the browser channel has never been run against live
-Instagram at all and "which build" is not a question worth leaving open.
+**The image exists for Chromium, not for isolation.** The pin fixes the browser
+revision, not the base image — `playwright==1.63.0` bundles a `browsers.json`
+naming exact Chromium revisions, so `playwright install chromium` under that pin
+fetches revision 1243 whichever base you build on. The base is
+`mcr.microsoft.com/playwright/python:v1.63.0-noble` for the part the pin cannot
+do: `playwright install --with-deps` resolves the browser's shared libraries from
+an Ubuntu package list, and `python:3.11-slim` is Debian. So it is a 2.5 GB base
+that cannot fail at build time over a small one that can, because the browser
+channel has never been run against live Instagram at all and "which build failed"
+is not a question worth leaving open.
 
 It does **not** give you a different IP. A container shares its host's network
 namespace, so every lease still egresses from your address and the own-address
