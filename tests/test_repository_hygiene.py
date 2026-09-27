@@ -605,3 +605,146 @@ class TestLineEndingsAreNormalised:
             + "\n  ".join(offenders[:20])
             + "\n\nFix with `git add --renormalize .` and commit."
         )
+
+
+# ===========================================================================
+# 4. The container
+# ===========================================================================
+
+
+class TestTheDockerfileCannotDrift:
+    """A Dockerfile is a second manifest of the dependencies, and nothing makes
+    the two agree.
+
+    The usual shape of the drift: a dependency is added to ``pyproject.toml``
+    because the code needs it, the image is not rebuilt, the image is not
+    rebuilt *loudly* either, and the failure appears later as an ``ImportError``
+    in a container rather than as a failing test on a machine. The
+    ``--no-deps`` install below is what makes the gap possible at all, so this
+    is checked rather than trusted.
+    """
+
+    DOCKERFILE = REPO / "Dockerfile"
+
+    def test_it_exists_and_ships_no_secret(self):
+        text = self.DOCKERFILE.read_text(encoding="utf-8")
+
+        # An ARG or ENV carrying a credential is permanent. It is in the image,
+        # in the build cache, in `docker history`, and in anything the image is
+        # pushed to -- and this repository is public, so a pushed image is a
+        # published secret. Declared-and-empty is the correct shape, and the
+        # assignment-with-no-value below is what makes that explicit.
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith(("ARG ", "ENV ")):
+                continue
+            for name in ("SESSIONID", "PASSWORD", "SECRET", "TOKEN", "API_KEY"):
+                if name in stripped.upper():
+                    assert "=" not in stripped or stripped.endswith("="), (
+                        f"Dockerfile assigns a {name} into a build layer:\n"
+                        f"  {stripped}\n"
+                        "A credential passed as a build argument or as ENV is"
+                        " permanent, inspectable and pushed with the image."
+                        " Supply it at run time via env_file instead."
+                    )
+
+    def test_its_pinned_dependencies_are_exactly_the_runtime_ones(self):
+        import tomllib
+
+        with (REPO / "pyproject.toml").open("rb") as handle:
+            declared = {
+                spec.split(">=")[0].split("==")[0].split("[")[0].strip().lower()
+                for spec in tomllib.load(handle)["project"]["dependencies"]
+            }
+
+        text = self.DOCKERFILE.read_text(encoding="utf-8")
+        pinned = set(re.findall(r'^\s*"([A-Za-z0-9_.-]+)[=<>]', text, re.M))
+        pinned = {name.lower() for name in pinned}
+
+        assert declared == pinned, (
+            "the Dockerfile installs a different set of runtime dependencies"
+            " than pyproject declares.\n"
+            f"  only in pyproject: {sorted(declared - pinned)}\n"
+            f"  only in Dockerfile: {sorted(pinned - declared)}\n"
+            "Add it to both, or the image and the metadata have stopped"
+            " describing the same program."
+        )
+
+    def test_it_installs_the_package_without_deps_against_that_pinned_set(self):
+        text = self.DOCKERFILE.read_text(encoding="utf-8")
+        assert "--no-deps" in text, (
+            "the image installs the package with --no-deps so the pins above"
+            " hold. Without it, pip re-resolves the dependency tree and quietly"
+            " replaces every pin with whatever it picks."
+        )
+
+    def test_the_image_never_bakes_the_operators_config_or_proxy_list(self):
+        """The context is sent to the daemon whole, before any COPY runs.
+
+        So this is about ``.dockerignore`` as much as about the Dockerfile: a
+        file excluded from every ``COPY`` still arrives in the build context and
+        lands in a layer the daemon holds. The distinction between "not in the
+        final image" and "never transmitted" is the whole point of the file.
+        """
+        ignore = (REPO / ".dockerignore").read_text(encoding="utf-8")
+        for pattern, why in (
+            ("config.toml", "names real accounts and the env var holding the sessionid"),
+            ("proxies.txt", "a paid resource, and the addresses are the point of the tool"),
+            (".git", "five commits in the history carry the operator's real account id"),
+        ):
+            assert pattern in ignore, f".dockerignore does not exclude {pattern} -- {why}"
+
+    def test_the_compose_file_reads_its_secret_from_outside_the_repository(self):
+        text = (REPO / "docker-compose.yml").read_text(encoding="utf-8")
+
+        block = re.search(r"env_file:\s*\n((?:\s+-\s*\S.*\n?)+)", text)
+        assert block, (
+            "the sessionid has to reach the container from somewhere. A file"
+            " outside the repository is the only route that keeps it out of git,"
+            " out of the image, and out of the build cache -- and env_file is"
+            " the only such route compose offers."
+        )
+
+        items = re.findall(r"-\s*(\S+)", block.group(1))
+        assert items, "env_file is present but empty."
+
+        for item in items:
+            # ${VAR:-fallback} -> fallback. Read the fallback, because that is
+            # the path an operator gets who has not set the variable -- and the
+            # fallback is the one that silently lives inside the checkout.
+            fallback = item.split(":-", 1)[-1].rstrip("}")
+            # resolved, not string-tested: `REPO / "a/../b"` is not a normalised
+            # Path, so is_relative_to answers about the un-normalised form and
+            # a `..` that leaves the tree can look like it stays.
+            assert not (REPO / fallback).resolve().is_relative_to(REPO), (
+                f"the default env_file path {fallback!r} resolves to inside the"
+                " checkout"
+            )
+            assert fallback.startswith(("../", "/", "~")), (
+                f"the default env_file path is {fallback!r}. It should be one"
+                " level up from the repository, or an absolute path outside it."
+                " A secrets file under the checkout is a secrets file that the"
+                " next `git add -A` commits."
+            )
+
+    def test_the_compose_file_never_defines_the_sessionid_inline(self):
+        """The failure mode is an ``environment:`` entry, not a stray mention.
+
+        A comment saying "the sessionid comes from env_file" is the intent. An
+        ``IG_SESSIONID_ALPHA: <value>`` line is a cookie in a tracked file, and
+        it is one keystroke from being written. So the test matches a *definition*
+        -- a name followed by a YAML ``:`` or an ``=`` -- and ignores prose.
+        """
+        text = (REPO / "docker-compose.yml").read_text(encoding="utf-8")
+        defines = re.compile(r"^\s*(?:-\s*)?\w*sessionid\w*\s*[:=]", re.IGNORECASE)
+
+        offenders = [
+            line
+            for line in text.splitlines()
+            if not line.strip().startswith("#") and defines.match(line)
+        ]
+        assert not offenders, (
+            "docker-compose.yml defines the sessionid inline:\n  "
+            + "\n  ".join(offenders)
+            + "\n\nThis file is tracked. Use env_file."
+        )

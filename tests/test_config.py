@@ -343,6 +343,77 @@ max_concurrent = 1
     assert not inside.exists()
 
 
+# --- the data_dir override ---------------------------------------------------
+
+
+def test_the_data_dir_override_wins_over_a_configured_path(
+    base_config_toml, proxy_file, session_env, monkeypatch, tmp_path
+):
+    """One config file, two machines.
+
+    The operator's config names a Windows path that cannot be right in a
+    container. Without this the only alternative is a second TOML file kept in
+    step by hand, whose sole purpose is to disagree with the first one.
+    """
+    import os
+
+    from insta_report.config import DATA_DIR_ENV
+
+    elsewhere = tmp_path / "container-data"
+    monkeypatch.setenv(DATA_DIR_ENV, str(elsewhere))
+
+    config = load_config(_write(base_config_toml))
+    assert config.paths.data_dir == elsewhere.resolve()
+    assert os.environ[DATA_DIR_ENV] == str(elsewhere)
+
+
+def test_the_override_cannot_smuggle_the_ledger_into_the_repository(
+    base_config_toml, proxy_file, session_env, monkeypatch
+):
+    """The override is subject to the same rule as a configured value.
+
+    An override that bypassed the containment check would be a way to put the
+    checkpoint ledger somewhere the credential scanner does not look -- and the
+    ledger holds the report text, which is the one thing in this tool written in
+    the reporter's own voice.
+    """
+    from insta_report.support.paths import find_repo_root
+
+    from insta_report.config import DATA_DIR_ENV
+
+    inside = find_repo_root() / ".override-should-never-be-created"
+    monkeypatch.setenv(DATA_DIR_ENV, str(inside))
+
+    with pytest.raises(PathContainmentError, match="outside the work tree"):
+        load_config(_write(base_config_toml))
+    assert not inside.exists()
+
+
+def test_an_empty_override_is_not_an_override(
+    base_config_toml, proxy_file, session_env, monkeypatch
+):
+    """Whitespace means "not set", and not "the current directory".
+
+    Compose sets this variable unconditionally, and an operator commenting it
+    out in an override block leaves it set-but-empty rather than unset. Read as
+    a path, ``Path("")`` resolves to the process's working directory -- so the
+    ledger would move to wherever the container happened to be started from,
+    which is the same class of bug ``_absolutise_paths`` exists to prevent,
+    arriving through the new door.
+
+    Asserted by difference rather than by an absolute path, so the test says
+    what it means on every platform.
+    """
+    from insta_report.config import DATA_DIR_ENV
+
+    monkeypatch.delenv(DATA_DIR_ENV, raising=False)
+    configured = load_config(_write(base_config_toml)).paths.data_dir
+
+    for empty in ("", "   ", "\t\n"):
+        monkeypatch.setenv(DATA_DIR_ENV, empty)
+        assert load_config(_write(base_config_toml)).paths.data_dir == configured, empty
+
+
 # --- config-relative paths --------------------------------------------------
 
 

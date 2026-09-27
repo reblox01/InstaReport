@@ -1,0 +1,80 @@
+# Ignore rules for the build context.
+#
+# The context is sent to the daemon in full before any instruction in the
+# Dockerfile runs, so anything listed here was on the daemon's disk and in the
+# build cache whether or not a COPY mentions it. That is a different thing from
+# "not in the final image", and it is the thing that leaks credentials: a
+# file that was excluded from every COPY still lands in a layer the daemon
+# holds, and `docker history` on a pushed image will happily tell you so.
+#
+# So this list is not hygiene, it is the difference between a secret that was
+# never transmitted and one that was transmitted and is probably fine.
+
+# --- credentials and operator state ---------------------------------------
+# The operator's own config. It names real accounts, real handles, and the
+# environment variable their sessionid lives in.
+config.toml
+config.*.toml
+# A proxy list is a paid resource and its addresses are the tool's whole point
+# of existing. Mounted at run time, never copied.
+proxies.txt
+*.proxies.txt
+# Anything a sessionid could have been written into by a tool, a shell, or an
+# editor's swap file.
+*.session
+.env
+.env.*
+*cookie*.txt
+*sessionid*
+secrets/
+config/secrets/
+
+# --- run output -----------------------------------------------------------
+# The checkpoint ledger and artifacts. A volume mounts here instead; a ledger
+# baked into an image is a ledger nobody can rotate, and one that outlives the
+# run that produced it.
+runs/
+artifacts/
+data/
+insta-report-data/
+state/
+traces/
+checkpoints/
+# The accounts to report. Identifying rather than secret, and bound at run time
+# alongside the config.
+targets/
+targets.txt
+*.targets.txt
+*.checkpoint.jsonl
+*.trace.zip
+*.jsonl
+!tests/**/*.jsonl
+
+# --- git ------------------------------------------------------------------
+# The history contains the operator's real account id in five commits, which
+# is precisely why this line matters: the current tree is clean and the
+# history is not, and the daemon does not care about the difference.
+.git/
+.gitignore
+.gitattributes
+
+# --- development ----------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Not ours, and large.
+.claude-flow/
+node_modules/
+
+# The legacy single-file scripts are kept in the repo for reference and are not
+# importable, so they have no business in a runtime image.
+igban.py
+get_id.py

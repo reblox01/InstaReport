@@ -63,6 +63,18 @@ runs/
 *.checkpoint.jsonl
 *.trace.zip
 
+# --- operator input: the accounts to report, and the directory holding them ---
+#
+# A target list is real handles of real accounts, which is the same category as
+# config.toml: identifying rather than secret, and not anybody else's business.
+# The container mounts this directory read-only, so it also has to exist on the
+# host before `docker compose run` -- compose creates a missing bind-mount source
+# as a directory, and a missing target file then fails as unreadable rather than
+# absent.
+targets/
+targets.txt
+*.targets.txt
+
 # --- reference repo scratch (not part of this build) ---
 /vendor/
 /tmp/

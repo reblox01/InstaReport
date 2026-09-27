@@ -35,6 +35,7 @@ __all__ = [
     "RunConfig",
     "Config",
     "load_config",
+    "DATA_DIR_ENV",
 ]
 
 
@@ -482,6 +483,26 @@ CONFIG_PATH_KEYS: tuple[tuple[str, str], ...] = (
 )
 
 
+#: Overrides ``data_dir`` when set. The one path a container has to be able to
+#: change without the operator keeping two config files, because it is the one
+#: path whose correct value is a property of the machine rather than of the
+#: operator's intent.
+#:
+#: Exists because of ``assert_outside_repo``. The config says
+#: ``data_dir = "C:/Users/.../insta-report-data"``, which cannot be right in a
+#: container and is refused inside the image's own tree besides; the operator
+#: would otherwise have to maintain a second, near-identical TOML file whose only
+#: purpose is to disagree with the first one on two lines -- and a file kept in
+#: step by hand is a file that will drift.
+#:
+#: Deliberately *only* ``data_dir``. Every other path is an input the operator
+#: supplies and the tool reads, and a general override would mean a container
+#: could be pointed at a different proxy file or anchor set than the one an
+#: operator reviewed, which is a much worse failure than a data directory in an
+#: unexpected place.
+DATA_DIR_ENV = "INSTA_REPORT_DATA_DIR"
+
+
 def _absolutise_paths(data: dict[str, Any], base: Path) -> None:
     """Rewrite every relative path in *data* so it is relative to *base*.
 
@@ -529,6 +550,15 @@ def load_config(path: str | Path) -> Config:
             raise ConfigError(f"{config_path} is not valid TOML: {exc}") from exc
 
     _absolutise_paths(data, config_path.parent)
+
+    override = os.environ.get(DATA_DIR_ENV, "").strip()
+    if override:
+        # Applied after relativisation and before anything reads the key, so the
+        # override is subject to exactly the same rules as a configured value:
+        # resolved, and refused if it lands inside the repository. An override
+        # that could bypass those checks would be a way to put the checkpoint
+        # ledger where the credential scanner does not look.
+        data["data_dir"] = str(Path(override).expanduser().resolve())
 
     root = _Reader(data, "")
     paths = resolve_paths(root.path_("data_dir"))

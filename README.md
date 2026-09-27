@@ -46,6 +46,12 @@ Items 1–3 need two things that do not exist yet:
 - **Your consent to file a real report** from a real account against a real
   target you control.
 
+**The container is written and unproven.** `Dockerfile` and `docker-compose.yml`
+are committed and the compose file parses, but the image has not been built and
+nothing has been run from it. The browser channel is the only implemented
+channel, and it has never been pointed at live Instagram from anywhere. Treat the
+container section below as a design that has not met its first run.
+
 Until both exist, treat the channels as unverified and the terminal vocabulary as
 a recording format rather than a result.
 
@@ -130,6 +136,79 @@ python -m insta_report.probe --config config.toml --username <a handle you contr
 `run` writes a durable checkpoint **before** every submit, so an interrupted run
 resumes without double-reporting. `status` lists the targets that were dispatched
 and never resolved — the ones that may have been reported.
+
+## In a container
+
+```bash
+docker compose build
+docker compose run --rm reporter doctor --no-live      # exits 1. That is correct.
+docker compose run --rm reporter run --targets /targets/accounts.txt
+```
+
+Three things are worth knowing before you use it, and two of them are traps.
+
+**The image exists for Chromium, not for isolation.** The Playwright Python
+package carries a Node driver and a `browsers.json` naming exact browser
+revisions, and it refuses to run a browser whose revision it does not recognise.
+An image built on `python:3.11-slim` plus `playwright install chromium`
+therefore produces a *different* browser on every rebuild, weeks apart, with no
+way to tell from the outside which one a failing selector ran against. The base
+image is `mcr.microsoft.com/playwright/python:v1.63.0-noble`, pinned to the
+driver version, because the browser channel has never been run against live
+Instagram at all and "which build" is not a question worth leaving open.
+
+It does **not** give you a different IP. A container shares its host's network
+namespace, so every lease still egresses from your address and the own-address
+guard will dismiss it. Docker earns its place on a *second* host — a VPS — where
+that host's address is genuinely not yours, and for the reproducible browser. On
+this laptop it is packaging, not privacy. What actually moves the egress is a
+residential proxy, and nothing in this repository changes that.
+
+**The sessionid is supplied at run time, from outside the repository.**
+`docker-compose.yml` reads `env_file`, defaulting to `../insta-report.env` — one
+level *up*, so a secrets file cannot land in the checkout by accident. Override
+it on a VPS:
+
+```bash
+INSTA_REPORT_ENV_FILE=/run/secrets/insta-report.env docker compose run --rm reporter doctor
+```
+
+The file holds the bare cookie *value*, not the cookie:
+
+```
+IG_SESSIONID_ALPHA=<the value of the sessionid cookie>
+```
+
+It is never an `ARG` or an `ENV` in the image. That is not a style preference: a
+build argument is permanent, sitting in the image, the build cache, and
+`docker history`, and **this repository is public**, so a pushed image would be a
+published cookie. The image does declare `IG_SESSIONID_ALPHA=` — present and
+empty — so that a container started with no credential refuses to run rather than
+authenticating with a blank one.
+
+Stated plainly, because the alternative is overclaiming: the value *is* visible
+to `docker inspect` on the running container, since a process cannot read its own
+environment otherwise. The protection is that it never reaches git, the image, or
+the build cache — not that it is hidden from the machine running it.
+
+**`INSTA_REPORT_DATA_DIR` is the one config value a container may override.**
+Your config's `data_dir` is a Windows path that does not exist in the container,
+and the tool *refuses* a data directory inside the work tree, so it would be
+refused in `/app` as well. Compose sets it to `/data`, which is a bind mount onto
+`./artifacts` — a bind mount rather than a named volume because
+`docker compose down -v` would destroy a named volume, and that volume is the
+record of what was attempted against real accounts. Create `artifacts/` and
+`targets/` on the host first, owned by uid 1000: Docker silently *creates* a
+missing bind-mount source as a directory, and a missing `proxies.txt` then
+becomes a directory that is unreadable as a file, with a permission error
+standing in for "the file is not there".
+
+The offline suite runs in its own container, which is the stronger place to
+prove the offline claim because it is a clean machine:
+
+```bash
+docker compose run --rm --profile verify verify
+```
 
 ## The six outcomes
 

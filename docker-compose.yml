@@ -1,0 +1,143 @@
+# Not a service, and not a job.
+#
+# `reporter` is a tool. Every invocation is explicit, because the alternative --
+# a compose file whose `up` files reports against whatever target list happens to
+# be mounted -- is a way of finding out what this tool does by watching it
+# happen. There is no `restart:` here either: `run` is a batch process, and a
+# restart policy on a batch process turns one crash into a retry loop against
+# live Instagram, filed from an account that operator never approved for it.
+#
+#   docker compose run --rm reporter doctor --no-live
+#   docker compose run --rm reporter run --targets /targets/accounts.txt
+#   docker compose run --rm --profile verify verify
+
+name: insta-report
+
+services:
+  reporter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # The tag must equal the `playwright` version in pyproject; the Dockerfile
+      # pins both sides and the browser channel is the only channel that has
+      # ever filed anything.
+      args:
+        PLAYWRIGHT_VERSION: "1.63.0"
+    image: insta-report:local
+
+    # The sessionid, from a file that is deliberately not in this repository.
+    #
+    # It cannot be an `ARG`: a build argument is in the image, in the build
+    # cache, and in `docker history`, and this repository is public, so a pushed
+    # image would be a published cookie. It cannot be an inline `environment:`
+    # value either, for the same reason plus a second one -- the file itself is
+    # committed, and `.gitignore` cannot stop someone from removing that line.
+    #
+    # The default path is one directory *up* from this file, so the secrets file
+    # cannot end up in the checkout by accident. Override it for a VPS, where
+    # the layout is different:
+    #
+    #   INSTA_REPORT_ENV_FILE=/run/secrets/insta-report.env docker compose ...
+    #
+    # The file holds the one line the operator does not want in git:
+    #
+    #   IG_SESSIONID_ALPHA=<the value from the cookie, not the whole cookie>
+    env_file:
+      - ${INSTA_REPORT_ENV_FILE:-../insta-report.env}
+
+    environment:
+      # The one config value that is a property of the machine rather than of
+      # the operator's intent, so it is the one value a container may override.
+      # Without this the host config's `data_dir` is a Windows path that does
+      # not exist here -- and the tool *refuses* a data directory inside the
+      # work tree, so it would be refused in /app as well.
+      INSTA_REPORT_DATA_DIR: /data
+
+    volumes:
+      # The operator's own files, read-only. None of these are baked in: the
+      # config names real accounts, and the proxy list is a paid resource whose
+      # addresses are the entire point of the tool.
+      #
+      # Note the trap: Docker *creates* a bind-mount source that does not exist,
+      # as a directory. A missing proxies.txt therefore becomes a directory that
+      # is then unreadable as a file, and the error is a permission problem
+      # rather than "the file is not there". Create the files first.
+      - ./config.toml:/app/config.toml:ro
+      - ./proxies.txt:/app/proxies.txt:ro
+      - ./targets:/targets:ro
+
+      # The checkpoint ledger, and the artifacts beside it. A named volume would
+      # be more portable, but `docker compose down -v` destroys it -- and this
+      # file is the record of what was attempted against real accounts. It gets
+      # a bind mount so that it survives a `down` and can be read with ordinary
+      # tools, without a `docker exec`.
+      #
+      # Owner mismatch is the one thing that needs fixing by hand here: the
+      # container runs as uid 1000, so `mkdir artifacts` on the host as any
+      # other user produces a directory it cannot write.
+      - ${INSTA_REPORT_ARTIFACTS:-./artifacts}:/data
+
+    # Chromium reads a page's layout from shared memory and writes it back. The
+    # default is 64 MB, and exceeding it does not report a problem with shared
+    # memory -- the renderer dies, and the death reads as a selector failure.
+    # This is the single most common "the browser channel just stopped" cause.
+    shm_size: "1gb"
+
+    # Chromium wants more open file descriptors than the 1024 default, and
+    # running out does not name file descriptors in the error.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+    # Reap the zombies Chromium's process tree leaves behind. A browser killed
+    # by a timeout does not reap its own children, and without init they
+    # accumulate until the process table is the reason the run stops.
+    init: true
+
+    # Nothing here needs to escalate. Stated rather than assumed: this container
+    # opens a browser, makes HTTP requests, and writes a ledger.
+    security_opt:
+      - no-new-privileges:true
+
+  # The offline test suite, in a clean environment.
+  #
+  # A separate service rather than dev dependencies in the runtime image: the
+  # image should be the program, not the program plus everything needed to
+  # check the program. This one installs `.[dev]` and runs with the browser
+  # marker excluded, so it needs no Chromium -- and the point of running it at
+  # all is the offline guard, which is a stronger claim on a fresh machine than
+  # on the one that wrote the code.
+  #
+  # The repository-hygiene tests need a git checkout and skip without one, so
+  # this service is expected to report skips. That is the honest result, not a
+  # gap: it is checking that a *clone* of this repository has no secret in it.
+  verify:
+    image: python:3.11-slim
+    profiles: ["verify"]
+    working_dir: /src
+    volumes:
+      # Read-write, and that is a considered choice rather than an oversight.
+      # `pip install .` builds in-tree: setuptools writes `insta_report.egg-info`
+      # and `build/` into the source directory, so a read-only mount fails at
+      # the install step rather than at anything a reader would understand.
+      # Both directories are in .gitignore and .dockerignore, so the residue is
+      # inert. An editable install is not used, because `-e` makes the test run
+      # depend on this mount staying exactly where it is.
+      - .:/src
+    command:
+      - sh
+      - -c
+      - >-
+        python -m pip install --no-cache-dir -q ".[dev]" &&
+        python -m pytest -q -m "not browser" -p no:cacheprovider
+    environment:
+      # Deliberately absent: IG_SESSIONID_ALPHA. The suite must be green with no
+      # credential present, and running it with one would make it possible for a
+      # test to pass only because the credential was there.
+      #
+      # Set but empty, which means "not set" -- the configuration loader
+      # treats a blank override as absent precisely so a compose file can
+      # declare the variable unconditionally without relocating the ledger to
+      # the container's working directory.
+      INSTA_REPORT_DATA_DIR: ""
