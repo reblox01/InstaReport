@@ -1,104 +1,243 @@
-# Instagram Report Tool
+# insta-report
 
-## Overview
+Reliable delivery of Instagram fraud reports, from real authenticated sessions.
 
-This script automates the process of reporting a user on Instagram for violating the platform's community guidelines.
+**It reports what it requested. It cannot know what Instagram did with them.**
 
-## Features
+That sentence is the design, not a disclaimer. Instagram renders a success
+message optimistically to reporters it does not trust, so there is no oracle:
+no response, no toast, and no DOM state can distinguish "filed" from "accepted and
+discarded". Every claim this tool makes is therefore about **its own request** —
+what it sent, from which exit, under which identity, recorded before it left —
+and never about the target account. If you need "the account was removed", no
+tool can tell you that, and one that claims to is lying.
 
-- **Automation:** Automatically reports a specified user multiple times.
-- **Login Methods:**
-  - **Username/Password:** Standard login (may trigger checkpoints/2FA).
-  - **Session ID:** Bypass login checkpoints by using your browser's session cookie (Recommended).
-- **Username Resolution:** Accepts either a username or numeric user ID — usernames are resolved automatically.
-- **Secure:** Supports environment variables or interactive prompts — no hardcoded credentials.
-- **Smart:** Uses random delays to avoid rate limiting.
+---
 
-## Prerequisites
+## Status: not finished, and here is exactly what is missing
 
-1. A valid Instagram account.
-2. Python 3.7+ installed.
-3. Dependencies installed (`pip install -r requirements.txt`).
+This section is first because everything after it is worthless without it.
 
-## Setup
+| Agreed definition of done | State |
+|---|---|
+| 1. `doctor` passes on at least one channel from a clean exit | **not done** |
+| 2. A report submitted, network response *and* state transition both in the ledger | **not done** |
+| 3. Killed mid-submit, resumed, nothing resubmitted | **offline coverage only** |
+| 4. No credential in any log, artifact, or checkpoint (CI-enforced) | **done** |
+| 5. Selector drift yields a DOM diff naming expected vs actual | **done** |
+| 6. Every anticipated failure mode has a mitigation or a written acceptance | **done** |
 
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/reblox01/InstaReport.git
-   cd InstaReport
-   ```
+Item 6's acceptances are the ones stated inline here: Instagram's optimistic
+success rendering (the opening section), and the absence of an oracle for
+"accepted and discarded".
 
-2. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
+**No report has ever been filed by this tool against a live Instagram.** The test
+suite is green (1086 tests) and it is green with every channel unable to reach
+Instagram, because it is offline by design. That sentence is the single most
+important thing on this page.
 
-## Usage
+Items 1–3 need two things that do not exist yet:
 
-Run the script:
+- **A residential proxy exit.** There is no `proxies.txt` — the pool is empty and
+  no file is tracked. Open-proxy harvesting is deliberately unsupported: those
+  addresses are pre-scorched by every scraper on the internet, and a session
+  bound to one is dead before the first request lands. A report filed from your
+  home IP is also the one correlation that gets the reporting account flagged,
+  which is the opposite of the tool's purpose.
+- **Your consent to file a real report** from a real account against a real
+  target you control.
 
-```bash
-python igban.py
-```
+Until both exist, treat the channels as unverified and the terminal vocabulary as
+a recording format rather than a result.
 
-### Login Options
+### The API channel is disarmed on purpose
 
-The script will ask you to choose a login method:
+`insta_report/api.py` is complete as a *classifier* and empty as an *endpoint*.
+The mobile/web identity ladder, the request construction, the dispatch boundary
+and the response classification are all implemented and tested. The endpoint
+itself is not, because nothing about it has ever been observed answering.
 
-1. **Username / Password:** Enter your credentials. If you have 2FA enabled or get a "checkpoint required" error, use option 2.
-2. **Session ID (Recommended):** Use this if standard login fails.
-   - Open Instagram.com in your browser and log in.
-   - Press **F12** to open Developer Tools.
-   - Go to **Application** (Chrome) or **Storage** (Firefox) > **Cookies**.
-   - Find the cookie named `sessionid` and copy its value.
-   - Paste it into the script when prompted.
+`ApiEndpoint` refuses to be constructed unverified, and `insta_report/cli.py` does
+not import the channel at all. Two independent locks, both with tests that fail if
+removed. A fallback you have not verified is a black hole — that is the mistake
+which caused this rewrite, and the code refuses to repeat it.
 
-### Environment Variables (Optional)
+---
 
-You can skip prompts by setting variables:
+## Install
 
-```bash
-# Linux / macOS
-export IG_USERNAME="your_user"
-export IG_PASSWORD="your_pass"
-# OR for session ID:
-export IG_SESSIONID="your_session_id_cookie"
-
-python igban.py
-```
-
-### Need a User ID?
-
-The script (`igban.py`) will automatically try to resolve usernames to IDs for you.
-
-If you want to manually get an ID, use the included helper script:
+Requires Python 3.11+.
 
 ```bash
-python get_id.py
+git clone https://github.com/reblox01/instaReport.git
+cd instaReport
+python -m venv .venv
+.venv\Scripts\pip install -e ".[dev]"      # Windows
+.venv\Scripts\python -m playwright install chromium
 ```
-This script will ask for a username and give you their numeric User ID.
 
-## Report Reasons
+## Configure
 
-| # | Reason |
-|---|--------|
-| 1 | Spam |
-| 2 | Inappropriate content |
-| 3 | Violence or harm |
-| 4 | Impersonation |
-| 5 | Bullying |
-| 6 | False info |
-| 7 | Harmful orgs |
-| 8 | Illegal activity |
-| 9 | Private info |
-| 10 | Copyright |
-| 11 | Trademark |
-| 12 | Other |
+Copy the example and keep it out of version control — it is gitignored for a
+reason documented at the top of `.gitignore`.
 
-## Disclaimer
+```bash
+cp config.example.toml config.toml
+```
 
-This tool is for educational purposes only. Misuse to harass or harm others is strictly prohibited. Use responsibly.
+Point `[api]` and `[browser]` at real values, and put your session cookie in the
+environment rather than in the file:
 
-## License
+```powershell
+$env:IG_SESSIONID_ALPHA = "<paste>"
+```
 
-[MIT License](https://github.com/reblox01/InstaReport/blob/master/LICENSE)
+`sessionid_env` names the *variable* holding the cookie, so no credential is ever
+written to disk in the config. To get the cookie: log in on instagram.com, open
+devtools → Application → Cookies → `sessionid`.
+
+You also need each reporting account's own numeric `user_id`. It is not a secret,
+so unlike the session it lives in the file. Without it the probe refuses to run
+rather than address the reporting route with a literal `{user_id}` in the path —
+a malformed path's 404 cannot be told apart from a missing route, so it is not
+output.
+
+## Use
+
+```bash
+insta-report doctor --probe-target <an account you control>
+```
+
+**Always start here.** `doctor` gates the runner by exit code and `run` refuses to
+start if no channel passes. Skip it with `--no-doctor` and you have made the first
+run of this tool an unverified production run.
+
+```bash
+insta-report run --targets targets.txt          # deliver
+insta-report run --dry-run                      # print the plan, send nothing
+insta-report status --run <id>                  # what may have been reported
+insta-report targets --targets targets.txt      # confusables, duplicates, self-reports
+insta-report anchors --check dump.json          # selector drift
+```
+
+The observability probe is not a subcommand — it is a module entry point, and it
+is read-only by construction (it asserts every request it issues is a read, and
+refuses to build a URL with an unsubstituted placeholder):
+
+```bash
+python -m insta_report.probe --config config.toml --username <a handle you control>
+```
+
+`run` writes a durable checkpoint **before** every submit, so an interrupted run
+resumes without double-reporting. `status` lists the targets that were dispatched
+and never resolved — the ones that may have been reported.
+
+## The six outcomes
+
+This is the tool's real output. Every report attempt ends in exactly one.
+
+| state | meaning | `stops_ladder` | `counts_against_budget` |
+|---|---|---|---|
+| `SUBMITTED_ACKED` | dispatched, response *and* DOM confirm it | yes | yes |
+| `SUBMITTED_UNCONFIRMED` | dispatched, response readable but not a success | yes | yes |
+| `UNKNOWN` | dispatched, response uninterpretable | yes | yes |
+| `NOT_REPORTABLE` | target gone or unresolvable | yes | no |
+| `CHANNEL_FAILED` | this channel could not attempt it | **no** | no |
+| `QUARANTINED` | not attempted; the exit is out of service | yes | no |
+
+`needs_human_review` is true for exactly two states — `SUBMITTED_UNCONFIRMED` and
+`UNKNOWN` — because those are the two where the tool cannot tell you what
+Instagram did. That property, not a heuristic in your shell script, is how you
+find the rows to check by hand.
+
+The dispatch boundary is the load-bearing line. **Before** it, a failure is
+recoverable — try the next channel, try the next exit. **After** it, nothing is
+retried and nothing falls through, because a report that may have been filed
+cannot be safely filed again. `CHANNEL_FAILED` continues the ladder precisely
+because it means the server rejected the request or it never left: a 4xx is a
+refusal to process, so no report exists.
+
+## Layout
+
+```
+insta_report/
+  outcomes.py    terminal vocabulary + the golden corpus that pins it
+  errors.py      Transient / ChannelFail / Fatal, each scoped REPORT/LEASE/RUN
+  checkpoint.py  JSONL, fsync per record, intent-before-dispatch
+  runner.py      ladder orchestration, dispatch boundary, per-channel health
+  browser.py     Playwright channel (the primary path)
+  api.py         API channel — classifier only, disarmed
+  proxies.py     lease pool, health, egress-IP assertion
+  accounts.py    budgets, LRU rotation, quarantine 2^n
+  pacing.py      monotonic, budget-derived cadence
+  anchors.py     the selector oracle + drift reporting
+  artifacts.py   evidence bundles, redacted on write
+  narrative.py   report text rendering
+  doctor.py      the gate
+  probe.py       observability probe
+  cli.py         command surface
+```
+
+## Development
+
+```bash
+.venv\Scripts\python -m pytest              # 1086 tests, offline
+.venv\Scripts\python -m pytest -m "not static"   # skip pyflakes + mypy
+.venv\Scripts\python -m pytest -m "not browser"   # skip the Chromium tests
+```
+
+The suite never touches the network. Exactly two layers do, and both are invoked
+by hand: `doctor` and the `probe` module. Three things are enforced as tests
+rather than conventions, because each one found a real defect:
+
+- **pyflakes** found two test functions whose names shadowed each other, so one
+  had never run in the life of the suite.
+- **mypy** found a declaration that lied (`_anchors: AnchorSet` defaulting to
+  `None`), and following the lie found five unguarded reads that would have been
+  reported to an operator as *Instagram rejected the session*.
+- **A credential scan of everything git tracks**, plus a `git add -A` CI test,
+  because `.gitignore` cannot stop a developer pasting a real cookie into a
+  fixture. Secrets are covered on the wire and in artifacts, not only in logs.
+
+Two invariants in the probe are refused rather than checked after the fact,
+because both defects produced output that *looked* like evidence: a probe may not
+issue a non-read method, and a probe URL may not carry an unsubstituted
+placeholder. A 404 nobody can interpret is not a result.
+
+## Legacy
+
+`igban.py` and `get_id.py` are the original single-file script, left in place and
+unmaintained. They are what this rewrite exists to replace, and the reason is
+specific rather than stylistic — `igban.py` decides success from a status code:
+
+```python
+if response.status_code == 200:
+    ...
+    # If response isn't JSON (e.g. HTML confirmation), just say success
+    print(f"[+] User {user_id} reported successfully.")
+```
+
+It reports success *most confidently in the case the new vocabulary calls
+`UNKNOWN`* — a 200 whose body it could not read.
+
+The other half is a dispatch-boundary violation in the opposite direction. On any
+non-200 it immediately re-POSTs the identical payload to a second URL:
+
+```python
+# Fallback: Try the primary web endpoint again just in case
+resp_alt = session.post(url_alt, headers=headers, data=data)
+```
+
+A non-200 includes 429 and 5xx — precisely the responses where the request may
+still have been processed. So an ambiguous first response is answered with a
+guaranteed second dispatch, and the tool can file the same report twice. Neither
+behaviour is fixable by improving the parsing: the response is not the evidence.
+The six states above exist so that "I sent this and I cannot tell you what
+happened" is a thing the tool can say out loud, instead of a gap that gets
+papered over with a second request.
+
+## Legal
+
+MIT, see `LICENSE`. For reporting accounts that violate Instagram's terms. Use
+where you are the affected party; the cost of a false report is borne by whoever
+the report names.
