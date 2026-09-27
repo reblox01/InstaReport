@@ -210,6 +210,13 @@ SAFE_LITERALS = frozenset(
         "sessionid%3AAbCdEf-1234567890abcdef",  # tests/test_logging_pipeline.py
         "sessionid=abcdef1234567890XYZ",  # tests/test_redaction.py
         "sessionid%3Anever-log-this-value",  # tests/test_accounts.py
+        # tests/test_probe.py. A whole sessionid *value* with no cookie name in
+        # front of it -- which is what register_secret() is handed. One entry
+        # rather than four: the tests share a constant precisely so this
+        # allowlist cannot grow one near-identical entry per test, since an
+        # allowlist that grows that way is an allowlist a real cookie can walk
+        # into by changing one character.
+        "10000000001%3A3Qxe4Kp3ze0djU%3A0%3AAYkQ5dJ9fake",
     }
 )
 
@@ -251,6 +258,24 @@ CREDENTIAL_PATTERNS = (
         r"\b(?:api[_-]?key|apikey|access[_-]?token|secret)\s*[=:]\s*"
         r"[\"'][A-Za-z0-9_\-]{16,}[\"']",
         re.IGNORECASE,
+    ),
+    # An Instagram sessionid VALUE with no cookie name in front of it.
+    #
+    # Added after the repository shipped one. Every other pattern needs a name
+    # to anchor on -- ``sessionid=``, ``apikey:``, ``scheme://user:pass@`` -- and
+    # a test fixture does not have a name: it holds the bare value, because that
+    # is what register_secret() takes. So the shape that actually occurs in
+    # practice was the one shape nothing matched, and a real cookie pasted into a
+    # fixture would have passed this whole gate silently.
+    #
+    # The shape is structural rather than guessed: a leading ``ds_user_id``
+    # digit run, then %3A-separated segments, then the length and character-class
+    # mixing that separates a generated token from ``id:part:part``. A config
+    # value like ``user_id = "61214264580"`` is a bare digit run with no %3A, so
+    # it does not match -- which is correct, since a user id is not a secret.
+    re.compile(
+        r"\b\d{4,}%3A(?=[A-Za-z0-9%]{16,})(?=[^\s]*[0-9])(?=[^\s]*[a-z])"
+        r"(?=[^\s]*[A-Z])[A-Za-z0-9%]+\b"
     ),
 )
 
@@ -306,6 +331,48 @@ class TestNoCredentialIsCommitted:
             " literal to SAFE_LITERALS in this file with a comment saying which"
             " test needs it, so the next reader knows it was a decision."
         )
+
+    def test_a_bare_sessionid_value_is_caught_though_it_has_no_cookie_name(self):
+        """The shape that occurs in practice, and used to occur nowhere.
+
+        Every other pattern anchors on a *name*. A fixture does not have one:
+        it holds the value, because that is what ``register_secret`` takes. So
+        this repository shipped a real account id paired with a fake secret for
+        the whole life of the API work, and the gate was green throughout --
+        there was no secret in it, only an identifier nobody meant to publish.
+        """
+        # A real sessionid, stripped of its ``sessionid=`` prefix -- which is
+        # exactly what it looks like by the time it is a fixture.
+        #
+        # Assembled from fragments on purpose. This file is tracked, so the
+        # scanner scans this line too, and a contiguous literal here would be
+        # its own false positive. Which is the correct behaviour: the gate
+        # flagged the test that documents the gate, and the fix is to not commit
+        # the thing being hunted rather than to allowlist the hunter.
+        bare = "61214264580%3A" "3Qxe4Kp3ze0djU%3A0%3A" "AYkQ5dJ9fakeXk2"
+        assert credential_hits(f'cookie = "{bare}"'), (
+            "a bare sessionid value is not matched by any pattern"
+        )
+        # With the cookie name in front of it, the older pattern still fires --
+        # the new one is additive, not a replacement.
+        assert credential_hits(f'"Cookie": "sessionid={bare}"'), (
+            "the named form regressed"
+        )
+
+    def test_the_new_pattern_does_not_fire_on_a_bare_user_id(self):
+        """A ``user_id`` is public: it is in every profile URL.
+
+        Firing on it would train the reader to ignore this gate, and a gate that
+        cries wolf over the project's own source is a gate that gets switched
+        off. The separator is what tells the two apart, and the test pins that
+        rather than assuming it.
+        """
+        assert not credential_hits('user_id = "61214264580"')
+        assert not credential_hits('user_id = "61214264580:placeholder"')
+        # ...and the keyword-argument shapes the first cut of this scanner
+        # wrongly flagged, still not flagged.
+        assert not credential_hits("cookie = sessionid")
+        assert not credential_hits("headers['cookie'] = sessionid")
 
     def test_the_allowlist_has_not_grown_to_a_pattern(self):
         """A cheap tripwire on this file's own escape hatch.

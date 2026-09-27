@@ -1,4 +1,4 @@
-﻿"""T0 probe tests.
+"""T0 probe tests.
 
 The probe is the gate on the API channel, so its most important property is
 that it refuses to conclude. Everything here tests the refusal.
@@ -30,6 +30,17 @@ from insta_report.probe import (
 from insta_report.support.redaction import get_registry, register_secret
 
 CONTROL_URL = DEFAULT_CONTROL_URL
+
+#: A structurally real Instagram sessionid -- ``ds_user_id`` segment, three
+#: ``%3A`` separators, mixed case and digits -- with a synthetic value.
+#:
+#: The numeric prefix is deliberately *not* a real account. An earlier revision
+#: of this file used the operator's actual ``ds_user_id``, which cost nothing
+#: secret (the rest of the value was always fake) and still should not have been
+#: committed: it published the id of the live business account every report in
+#: this project is filed from, and no credential scanner can catch that, because
+#: nothing secret is present.
+FAKE_SESSION = "10000000001%3A3Qxe4Kp3ze0djU%3A0%3AAYkQ5dJ9fake"
 
 
 def result(
@@ -551,7 +562,7 @@ def test_headers_a_probe_carries_reach_the_network_intact(monkeypatch):
     did exactly that, and passed against the broken code: a green test that was
     asserting a property the defect never touched.
     """
-    session = "61214264580%3A3Qxe4Kp3ze0djU%3A0%3AAYkQ5dJ9fake4"
+    session = FAKE_SESSION
     register_secret(session)
     seen: list[str] = []
 
@@ -603,7 +614,7 @@ def test_the_client_level_credential_reaches_the_network_intact(monkeypatch):
     # a realistic mixed-case sessionid shape; the gate's token pattern needs a
     # literal ``sessionid=``/``sessionid%3A`` prefix to fire, and there is not
     # one in this file, so they cannot be matched by it either.
-    session = "61214264580%3A3Qxe4Kp3ze0djU%3A0%3AAYkQ5dJ9fake"
+    session = FAKE_SESSION
     register_secret(session)
     seen: list[tuple[str, str]] = []
 
@@ -644,7 +655,7 @@ def test_no_credential_reaches_a_third_party_host(monkeypatch):
     sent. This test is the belt to that braces, and it generalises to any
     future third-party call someone adds to this module.
     """
-    session = "61214264580%3A3Qxe4Kp3ze0djU%3A0%3AAYkQ5dJ9fake2"
+    session = FAKE_SESSION
     register_secret(session)
     seen: list[tuple[str, str]] = []
 
@@ -717,7 +728,7 @@ def test_the_control_and_the_probes_attach_the_credential_the_same_way(monkeypat
     is exactly the failure that shipped. Asserting they agree is cheap and
     forecloses the whole family.
     """
-    session = "61214264580%3A3Qxe4Kp3ze0djU%3A0%3AAYkQ5dJ9fake3"
+    session = FAKE_SESSION
     register_secret(session)
     cookies: list[str] = []
 

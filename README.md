@@ -32,7 +32,7 @@ success rendering (the opening section), and the absence of an oracle for
 "accepted and discarded".
 
 **No report has ever been filed by this tool against a live Instagram.** The test
-suite is green (1086 tests) and it is green with every channel unable to reach
+suite is green (1088 tests) and it is green with every channel unable to reach
 Instagram, because it is offline by design. That sentence is the single most
 important thing on this page.
 
@@ -181,13 +181,13 @@ insta_report/
 ## Development
 
 ```bash
-.venv\Scripts\python -m pytest              # 1086 tests, offline
+.venv\Scripts\python -m pytest              # 1088 tests, offline
 .venv\Scripts\python -m pytest -m "not static"   # skip pyflakes + mypy
 .venv\Scripts\python -m pytest -m "not browser"   # skip the Chromium tests
 ```
 
 The suite never touches the network. Exactly two layers do, and both are invoked
-by hand: `doctor` and the `probe` module. Three things are enforced as tests
+by hand: `doctor` and the `probe` module. Four things are enforced as tests
 rather than conventions, because each one found a real defect:
 
 - **pyflakes** found two test functions whose names shadowed each other, so one
@@ -198,6 +198,16 @@ rather than conventions, because each one found a real defect:
 - **A credential scan of everything git tracks**, plus a `git add -A` CI test,
   because `.gitignore` cannot stop a developer pasting a real cookie into a
   fixture. Secrets are covered on the wire and in artifacts, not only in logs.
+- **A pattern for a sessionid *value* carrying no cookie name.** Every other
+  pattern anchors on a name — `sessionid=`, `apikey:`, `scheme://user:pass@` —
+  and a test fixture has no name, because `register_secret()` takes the bare
+  value. So the shape that actually occurs in practice was the one shape nothing
+  matched, and this repository shipped a fixture built from the operator's real
+  account id for the whole life of the API work without the gate noticing. No
+  secret was in it, only an identifier that should not have been published —
+  which is precisely the case a credential scanner is blind to by construction.
+  The pattern is structural (`ds_user_id` digit run, `%3A` separators, length and
+  case mixing), so `user_id = "61214264580"` still does not fire.
 
 Two invariants in the probe are refused rather than checked after the fact,
 because both defects produced output that *looked* like evidence: a probe may not
