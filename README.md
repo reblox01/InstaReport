@@ -32,7 +32,7 @@ success rendering (the opening section), and the absence of an oracle for
 "accepted and discarded".
 
 **No report has ever been filed by this tool against a live Instagram.** The test
-suite is green (1139 tests) and it is green with every channel unable to reach
+suite is green (1152 tests) and it is green with every channel unable to reach
 Instagram. That sentence is the single most important thing on this page.
 
 Items 1–3 need two things that do not exist yet:
@@ -300,15 +300,41 @@ insta_report/
 Dockerfile          Playwright image, pinned to the driver version
 docker-compose.yml  bind-mounted config and artifacts, env_file for the secret
 .dockerignore       active rules matter: the build context is sent whole
+.github/            CI across the supported interpreters, and a hand-cut release
 ```
 
 ## Development
 
 ```bash
-.venv\Scripts\python -m pytest              # 1139 tests, offline
+.venv\Scripts\python -m pytest              # 1152 tests, offline
 .venv\Scripts\python -m pytest -m "not static"   # skip pyflakes + mypy
 .venv\Scripts\python -m pytest -m "not browser"   # skip the Chromium tests
 ```
+
+GitHub Actions runs exactly those commands. `.github/workflows/ci.yml` runs the
+suite across the three supported interpreters (`3.11`, `3.12`, `3.13`) — each one
+run by hand against the full suite before it was put in the matrix, because an
+untested matrix cell is a claim and this project does not make those. It runs the
+container gate in its own job so an image pull cannot delay the fast feedback
+from the suite, and then, separately from all of it, it builds the wheel and
+drives the *installed* console script in a venv that has never seen the
+repository: `--help`, `--version` (checked equal to the version the source tree
+declares), and a `doctor --no-live` that has to refuse by exit code. Everything
+above the last job tests the source tree; only that job tests the artifact an
+operator actually installs, and a packaging mistake — a missing data file, a
+broken entry point — is invisible to every other test here.
+
+`.github/workflows/release.yml` cuts a release by hand rather than on every
+push, because shipping a tool that files reports for a stranger should be a
+decision someone made. It moves both version homes with
+`.github/scripts/bump_version.py` — the one sanctioned way to change the number,
+which refuses a version that does not increase and refuses to run on an
+already-drifted pair — runs the suite at the new version, and only then tags and
+publishes. That script exists because the number lives in two files
+(`pyproject.toml` at build time, `insta_report/__init__.py` at import time) and
+nothing made them agree until `tests/test_version_harmony.py` did; a release that
+ships one number while the process prints another is the same class of small lie
+this file keeps finding.
 
 The suite never touches the network — and that is now enforced, not promised. An
 autouse fixture in `tests/conftest.py` fails any test that opens a non-loopback

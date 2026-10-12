@@ -1,0 +1,162 @@
+# Continuous integration for a tool whose whole reason to exist is that it does
+# not lie about what it did.
+#
+# Two facts shape this file:
+#
+#   * The suite is offline by design. tests/conftest.py patches sockets
+#     in-process, so nothing here reaches the network by accident; the only live
+#     bridges are the `doctor` and `probe` commands, which no test runs against
+#     the real Instagram.
+#   * The static gates (pyflakes, mypy) and the browser oracle are ordinary
+#     tests in the suite, not separate tools. So running the suite IS running
+#     the gates -- there is no second command to keep in sync with this file.
+#
+# The README already claimed a couple of things were "CI-enforced" (the
+# credential scan over tracked files, and the `git add -A` test). Those are
+# tests in the suite; this workflow is what makes the claim true rather than
+# aspirational.
+
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# A superseded push or PR should not keep burning runner minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    name: suite (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The declared floor is 3.11 (`requires-python`). Each cell here has
+        # been run against the full suite on a real machine; an unverified cell
+        # would be a claim, and claims are the thing this project refuses.
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: install the package with its dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: install the Chromium the browser oracle drives
+        run: python -m playwright install --with-deps chromium
+
+      # The container gate is deselected here on purpose: it needs a Docker
+      # daemon and builds an image, which belongs in its own job so a slow
+      # image pull cannot delay the fast feedback from the suite.
+      - name: run the suite (the static gates run as tests, so they run too)
+        run: python -m pytest -q -m "not docker"
+
+  container:
+    name: container gate (real Docker daemon)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: install the package with its dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      # The container test is written to skip when no daemon is present. On a
+      # GitHub runner a daemon *is* present, so a skip here would mean the gate
+      # silently stopped running -- a green job that checked nothing. The
+      # strictness below exists to turn that silence back into a failure.
+      - name: run the container gate, and fail if it skipped instead of running
+        run: |
+          set +e
+          python -m pytest -q -m docker > docker.log 2>&1
+          pytest_code=$?
+          set -e
+          cat docker.log
+          test "$pytest_code" -eq 0
+          grep -qE "[1-9][0-9]* passed" docker.log || {
+            echo "::error::the container gate reported no passes"
+            exit 1
+          }
+          if grep -qi "skipped" docker.log; then
+            echo "::error::the container gate skipped -- there was no daemon to test against"
+            exit 1
+          fi
+
+  cli:
+    name: the shipped wheel is the thing that runs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Everything above tests the source tree. This job tests the artifact an
+      # operator actually installs: a wheel, in a venv that has never seen the
+      # repository, driven through its console script. A packaging mistake that
+      # the in-tree suite cannot see -- a missing package data file, a broken
+      # entry point -- fails here and only here.
+      - name: build the wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+
+      - name: install the wheel into an environment that has never seen the repo
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install --quiet dist/*.whl
+
+      - name: the console script answers --help and --version
+        run: |
+          /tmp/clean/bin/insta-report --help > help.txt
+          grep -q "run" help.txt
+          # Single words only: argparse wraps help text at the terminal width,
+          # so a multi-word phrase can be split across lines and this grep would
+          # fail for a reason that has nothing to do with the tool.
+          grep -q "cannot" help.txt
+
+          # The version the artifact prints must equal the version the source
+          # tree declares. This is the drift check, applied to the shipped
+          # artifact rather than to the source.
+          declared="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          /tmp/clean/bin/insta-report --version > version.txt
+          test "$(cat version.txt)" = "insta-report ${declared}"
+
+      # `--config` is a top-level flag, so it goes before the subcommand. With
+      # a config whose accounts name an environment variable that is not set,
+      # doctor cannot run and refuses by exit code 2 -- which is the interface
+      # the README documents and test_static_gates.py pins against the code.
+      - name: doctor refuses cleanly by exit code when it cannot start
+        run: |
+          set +e
+          /tmp/clean/bin/insta-report --config config.example.toml doctor --no-live > doctor.txt 2>&1
+          doctor_code=$?
+          set -e
+          cat doctor.txt
+          echo "doctor exited: $doctor_code"
+          test "$doctor_code" -eq 2
+
+      - name: keep the wheel as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: insta-report-wheel
+          path: dist/*.whl
+          if-no-files-found: error

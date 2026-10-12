@@ -1,0 +1,106 @@
+# Continuous delivery, cut by hand rather than on every merge.
+#
+# Shipping a tool that files reports on a stranger's behalf should be a decision
+# somebody made, not a side effect of a push -- so a release starts with a human
+# typing a version and pressing run. What this workflow makes automatic is
+# everything after the decision: the version is moved by the one sanctioned
+# script, the suite has to pass at the new version before anything is tagged, and
+# the tag is cut from the exact commit that passed.
+#
+# The bump script (.github/scripts/bump_version.py) refuses a version that does
+# not strictly increase and refuses to run on top of an already-drifted pair of
+# version homes, so a mistyped version fails here rather than shipping a wheel
+# that reports one number while the source declares another.
+
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "New version, strict x.y.z (for example 0.2.0)"
+        required: true
+        type: string
+      dry_run:
+        description: "Rehearse: bump, test, and build, but do not tag or publish"
+        required: false
+        default: false
+        type: boolean
+
+# Releases are not cancelled by a later dispatch; two versions interleaving would
+# leave the tags and the branch disagreeing about which one shipped first.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: ${{ inputs.dry_run && 'rehearse' || 'publish' }} v${{ inputs.version }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the tag is pushed against a real commit, and
+          # `git rev-parse --short HEAD` in the release notes wants the commit
+          # the artifacts were actually built from.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: install the package with its dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: install the Chromium the browser oracle drives
+        run: python -m playwright install --with-deps chromium
+
+      - name: move both version homes with the one sanctioned script
+        run: python .github/scripts/bump_version.py "${{ inputs.version }}"
+
+      # A tag is a promise about the tree beneath it. The suite has to hold at
+      # the new version before the promise is made. The container gate is left to
+      # CI so a release does not rebuild the image a second time here.
+      - name: prove the tree passes at the new version
+        run: python -m pytest -q -m "not docker"
+
+      - name: build the wheel and the sdist
+        run: |
+          python -m pip install build
+          python -m build
+
+      - name: commit, tag, and push
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml insta_report/__init__.py
+          git commit -m "release v${{ inputs.version }}"
+          git tag "v${{ inputs.version }}"
+          git push origin "HEAD:${{ github.ref_name }}" "v${{ inputs.version }}"
+
+      - name: create the release with its artifacts
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ inputs.version }}" \
+            dist/*.whl dist/*.tar.gz \
+            --title "v${{ inputs.version }}" \
+            --notes "Wheel and sdist built from $(git rev-parse --short HEAD), after the suite passed at this version."
+
+      # Uploaded on a dry run too, so a rehearsal ends with something to
+      # inspect rather than a green checkmark and nothing to look at.
+      - name: keep the built artifacts either way
+        uses: actions/upload-artifact@v4
+        with:
+          name: insta-report-release-${{ inputs.version }}
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error

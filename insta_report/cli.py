@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence, TextIO
 
+from . import __version__
 from .accounts import Account, AccountPool
 from .anchors import AnchorSet, load_anchors, report_drift
 from .artifacts import ArtifactStore
@@ -917,6 +918,16 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Exit codes: 0 clean, 1 needs reading, 2 could not start, 130 interrupted.",
     )
     _add_common(parser)
+    # The version a bug report is filed against. It answers with the number the
+    # process actually imported, not the number a build script hoped for -- the
+    # two are kept equal by `.github/scripts/bump_version.py`, and
+    # tests/test_version_harmony.py holds the seam shut.
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="print the installed version and exit",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     run = sub.add_parser(
