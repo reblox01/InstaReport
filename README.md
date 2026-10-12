@@ -32,7 +32,7 @@ success rendering (the opening section), and the absence of an oracle for
 "accepted and discarded".
 
 **No report has ever been filed by this tool against a live Instagram.** The test
-suite is green (1125 tests) and it is green with every channel unable to reach
+suite is green (1139 tests) and it is green with every channel unable to reach
 Instagram. That sentence is the single most important thing on this page.
 
 Items 1–3 need two things that do not exist yet:
@@ -63,9 +63,21 @@ names; no credential is in any layer; and `doctor --no-live` finds `/data`
 writable, loads the 14 packaged anchors, and locates the browser. Each of those
 four failures is now a test.
 
-What none of it establishes is that a report can be **filed**. The browser channel
-has still never been pointed at live Instagram from anywhere, which is the whole
+What none of it establishes is that a report can be **filed**. The browser channel has
+still never been pointed at live Instagram from anywhere, which is the whole
 of the section below.
+
+One channel defect *was* found in this run, because the browser's actions finally
+ran against a real browser at all: `pick_menu_item` clicked
+`report_menu_item.selectors`, and that anchor is a text anchor with no selectors,
+so the click raised `SelectorDrift: nothing matched any of []` on every attempt --
+the channel could not get past the menu item, and no green test saw it. The click
+now matches the menu item's label exactly, and `tests/test_browser_actions.py`
+drives every action (open the menu, pick the item, choose a category, submit)
+against a clickable fixture whose `<a href="#...">` reactions record *which*
+element was clicked, so a click that lands on the wrong node out of several that
+match fails. The read-only half of the driver had this coverage; the click half
+has it now.
 
 Until both exist, treat the channels as unverified and the terminal vocabulary as
 a recording format rather than a result.
@@ -293,7 +305,7 @@ docker-compose.yml  bind-mounted config and artifacts, env_file for the secret
 ## Development
 
 ```bash
-.venv\Scripts\python -m pytest              # 1125 tests, offline
+.venv\Scripts\python -m pytest              # 1139 tests, offline
 .venv\Scripts\python -m pytest -m "not static"   # skip pyflakes + mypy
 .venv\Scripts\python -m pytest -m "not browser"   # skip the Chromium tests
 ```

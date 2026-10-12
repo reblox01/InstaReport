@@ -1251,7 +1251,48 @@ class BrowserDriver:
         await self._click_first(self._anchor_set().report_dialog_trigger.selectors)
 
     async def pick_menu_item(self) -> None:
-        await self._click_first(self._anchor_set().report_menu_item.selectors)
+        """Click the overflow-menu entry that opens the report flow.
+
+        The menu entry is a *text* anchor (``[report_dialog] menu_item_text``)
+        with no selectors, because Instagram announces the entry by its label
+        rather than by a stable test id, and the anchor file says nothing may be
+        inferred. ``read`` treats that label loosely on purpose -- the anchor
+        also fires on "Thanks for **report**ing this account", which is
+        documented and pinned in test_anchor_drift.py as a deliberate false hit.
+
+        A click cannot be loose. A substring click on this label would match the
+        reason dialog's own heading ("Why are you *report*ing this account?") and
+        select the wrong node, so the click is an exact-text match. The label
+        still lives in the anchor file; this method only supplies the *mechanism*
+        for turning a label into a click.
+
+        Before this, the method clicked ``report_menu_item.selectors`` -- and a
+        text anchor has none, so ``_click_first`` fell through its loop and
+        raised ``SelectorDrift: nothing matched any of []`` on every real run.
+        The browser channel could not get past its second step, and the suite
+        never saw it: the fake driver appends the step name and is handed the
+        capability.
+        """
+        anchor = self._anchor_set().report_menu_item
+        if anchor.selectors:
+            await self._click_first(anchor.selectors)
+            return
+        if self._page is None:
+            raise ChannelFailError("no page is open", scope=ErrorScope.RUN)
+        text = anchor.texts[0] if anchor.texts else ""
+        if not text:
+            raise SelectorDrift(
+                "the report menu item anchor carries neither a selector nor a "
+                "text label, so there is nothing to click",
+                missing=(anchor.name,),
+            )
+        locator = self._page.get_by_text(text, exact=True)
+        if await locator.count() == 0:
+            raise SelectorDrift(
+                f"the report menu item labelled {text!r} is not on the page",
+                missing=(anchor.name,),
+            )
+        await locator.first.click(timeout=self.navigation_timeout_ms)
 
     async def choose_category(self, category: str) -> None:
         """Click the row whose visible text matches the chosen category.

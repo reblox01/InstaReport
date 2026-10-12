@@ -1,0 +1,46 @@
+<!doctype html>
+<!--
+  INTERACTIVE FIXTURE -- the driver's ACTIONS, not its readings.
+
+  tests/golden/ is a static, script-free corpus: it exists so the anchor matcher
+  can be checked against a fixed DOM, and tests/test_anchor_drift.py pins it.
+  This file is the other half of the driver, and it is deliberately NOT part of
+  that corpus. It lives in its own directory so test_anchor_drift.py never sees
+  it, because an action test needs the page to *react* to a click and a static
+  page cannot.
+
+  No JavaScript is used. Every affordance is an <a href="#...">, so a click is
+  observable as a fragment change in the page URL. That is the whole point: it
+  lets a test assert WHICH element the driver clicked, not merely that a locator
+  matched. Clicking the wrong element out of several that match is the failure a
+  fake driver cannot represent -- a fake is handed the answer.
+
+  The attributes here satisfy selectors in insta_report/data/anchors.toml. If a
+  selector there changes, change the attribute here with it; only a real browser
+  can tell you whether the change still hits.
+
+  Note there is no wrapper element carrying the same text as the menu item
+  ("Report"): an exact-text match must resolve to the clickable element itself,
+  not to a parent that happens to read the same and does nothing when clicked.
+-->
+<html lang="en">
+<head><meta charset="utf-8"><title>wizard</title></head>
+<body>
+  <!-- [report_dialog].trigger_selectors[0] -->
+  <a data-testid="option-button" href="#menu-open">More options</a>
+
+  <div role="dialog">
+    <h2>Why are you reporting this account?</h2>
+    <!-- [report_dialog.reason_list].container_selectors[0] -->
+    <div role="menu">
+      <!-- [report_dialog].menu_item_text = "Report" (a TEXT anchor: no selector) -->
+      <a role="menuitem" href="#report-item">Report</a>
+      <!-- reason rows, for choose_category -->
+      <a role="menuitem" href="#cat-spam">Spam</a>
+      <a role="menuitem" href="#cat-impersonation">Impersonation</a>
+    </div>
+    <!-- [submit].selectors[0] -->
+    <a data-testid="submit-report-button" href="#submitted">Submit</a>
+  </div>
+</body>
+</html>
