@@ -343,7 +343,7 @@ def _load_accounts(raw: Mapping[str, Any]) -> tuple[AccountConfig, ...]:
     return tuple(accounts)
 
 
-def _load_proxies(reader: _Reader) -> ProxyConfig:
+def _load_proxies(reader: _Reader, *, require_file: bool = True) -> ProxyConfig:
     source = reader.str_("source", default="file")
     if source not in {"file", "provider"}:
         raise ConfigError(
@@ -357,7 +357,13 @@ def _load_proxies(reader: _Reader) -> ProxyConfig:
     file_path = reader.path_("file_path")
     if source == "file" and not file_path:
         raise ConfigError("[proxies] source='file' requires file_path")
-    if file_path and not file_path.exists():
+    # The existence check is skippable by the offline demo, and only by it. A
+    # run that cannot lease an exit must fail here, at load, naming the file --
+    # not thirty seconds later as a channel failure that reads as "Instagram
+    # rejected us". The demo builds no pool and leases nothing, so refusing it
+    # over a file it will never open is a false refusal of exactly the kind
+    # the dry-run exemption to the doctor gate already names.
+    if file_path and require_file and not file_path.exists():
         raise ConfigError(f"[proxies] file_path does not exist: {file_path}")
 
     return ProxyConfig(
@@ -570,8 +576,15 @@ def _absolutise_paths(data: dict[str, Any], base: Path) -> None:
         table[key] = str((base / candidate).resolve())
 
 
-def load_config(path: str | Path) -> Config:
-    """Read, validate, and register secrets for a config file."""
+def load_config(path: str | Path, *, require_proxy_file: bool = True) -> Config:
+    """Read, validate, and register secrets for a config file.
+
+    ``require_proxy_file=False`` is the demo's seam: the offline demo builds
+    no pool, so a missing proxy list is nothing to it, while a run must fail
+    here naming the file rather than later as a misgraded channel failure.
+    The default keeps every existing caller strict; only the demo passes
+    ``False``, and a test pins that a run still refuses without it.
+    """
     config_path = Path(path).expanduser().resolve()
     if not config_path.exists():
         raise ConfigError(f"config file not found: {config_path}")
@@ -594,7 +607,7 @@ def load_config(path: str | Path) -> Config:
     # Validate everything before creating anything. A rejected config must not
     # leave a half-built data directory behind.
     accounts = _load_accounts(root.table("accounts").raw)
-    proxies = _load_proxies(root.table("proxies"))
+    proxies = _load_proxies(root.table("proxies"), require_file=require_proxy_file)
     browser = _load_browser(root.table("browser"), paths)
     api = _load_api(root.table("api"))
     run = _load_run(root.table("run"))

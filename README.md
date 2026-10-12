@@ -32,7 +32,7 @@ success rendering (the opening section), and the absence of an oracle for
 "accepted and discarded".
 
 **No report has ever been filed by this tool against a live Instagram.** The test
-suite is green (1119 tests) and it is green with every channel unable to reach
+suite is green (1138 tests) and it is green with every channel unable to reach
 Instagram. That sentence is the single most important thing on this page.
 
 Items 1–3 need two things that do not exist yet:
@@ -116,6 +116,21 @@ insta-report doctor --probe-target <an account you control>
 **Always start here.** `doctor` gates the runner by exit code and `run` refuses to
 start if no channel passes. Skip it with `--no-doctor` and you have made the first
 run of this tool an unverified production run.
+
+Sixty seconds, zero risk, zero network -- the hackathon demo (see
+`HACKATHON.md` for the script judges run):
+
+```bash
+insta-report demo --with-browser   # real Chromium, golden dialog, no clicks
+insta-report demo                  # offline half only, no Chromium needed
+```
+
+Live dispatch names its owner or it does not start:
+
+```bash
+insta-report run --targets targets.txt --run-id live-1 \
+  --consent-owned <an-account-you-control> --max-reports 1
+```
 
 ```bash
 insta-report run --targets targets.txt          # deliver
@@ -254,6 +269,7 @@ insta_report/
   narrative.py   report text rendering
   doctor.py      the gate
   probe.py       observability probe
+  demo.py        the 60-second offline demo (synthetic, sends nothing)
   cli.py         command surface
 
 Dockerfile          Playwright image, pinned to the driver version
@@ -264,7 +280,7 @@ docker-compose.yml  bind-mounted config and artifacts, env_file for the secret
 ## Development
 
 ```bash
-.venv\Scripts\python -m pytest              # 1119 tests, offline
+.venv\Scripts\python -m pytest              # 1138 tests, offline
 .venv\Scripts\python -m pytest -m "not static"   # skip pyflakes + mypy
 .venv\Scripts\python -m pytest -m "not browser"   # skip the Chromium tests
 ```
@@ -285,9 +301,8 @@ uptime without anyone deciding to. They passed in CI and would have failed on a
 plane. Two layers do reach the network, and both are invoked by hand: `doctor`
 and the `probe` module.
 
-Six things are enforced as tests rather than conventions, because each one
+Eight things are enforced as tests rather than conventions, because each one
 found a real defect:
-
 - **pyflakes** found two test functions whose names shadowed each other, so one
   had never run in the life of the suite.
 - **mypy** found a declaration that lied (`_anchors: AnchorSet` defaulting to
@@ -315,6 +330,11 @@ found a real defect:
   the suite quietly grew past both — so the number is now read out of pytest's
   own collection and compared. A figure in a README is a claim about the suite,
   and a claim nobody checks is how the other claims in this file got made.
+- **The consent gate and the demo's honesty labels.** A live `run` without
+  `--consent-owned` is exit 2 with an empty ledger, and the demo's outcome
+  carries no dispatch timestamp by construction. Both were verified by removing
+  them and watching the suite fail -- a gate that has only ever seen a clean
+  tree is indistinguishable from one that always passes.
 
 The container adds four more, in `tests/test_repository_hygiene.py`: the pinned
 dependency set in the image must equal the one `pyproject` declares, no `ARG` or

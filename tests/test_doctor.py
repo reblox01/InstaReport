@@ -129,8 +129,17 @@ def run_cli(operator, monkeypatch):
 
     def invoke(*argv: str) -> tuple[int, str]:
         out = io.StringIO()
+        args = list(argv)
+        # Same default as the CLI suite's fixture: consent is part of a valid
+        # live invocation, and the gate's own tests drive cli.main directly.
+        if (
+            args[:1] == ["run"]
+            and "--dry-run" not in args
+            and "--consent-owned" not in args
+        ):
+            args += ["--consent-owned", "spammer_one"]
         code = cli.main(
-            ["--config", str(operator.config_path), *argv],
+            ["--config", str(operator.config_path), *args],
             stream=out,
             fetch_impl=_ok_probe,
             direct_fetch_impl=_ok_direct,
@@ -774,7 +783,15 @@ class TestTheGateInFrontOfARun:
         assert run_cli.channel.calls, "and the run then went ahead"
 
     def test_a_named_probe_target_wins(self, run_cli):
-        code, _ = run_cli("run", "--run-id", "gate-named", "--probe-target", "mine")
+        code, _ = run_cli(
+            "run",
+            "--run-id",
+            "gate-named",
+            "--probe-target",
+            "mine",
+            "--consent-owned",
+            "mine",
+        )
         assert code == 0
         assert [h for h, _ in run_cli.channel.rehearsed] == ["mine"], (
             "the operator's handle is the one to open a dialog against"
