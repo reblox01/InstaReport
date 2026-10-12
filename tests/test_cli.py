@@ -216,20 +216,8 @@ def run_cli(workspace, monkeypatch):
 
     def invoke(*argv: str) -> tuple[int, str]:
         out = io.StringIO()
-        args = list(argv)
-        # Consent is part of a valid live invocation since the anti-brigading
-        # gate landed: production runs name --consent-owned explicitly, so the
-        # fixture supplies the workspace default rather than repeating it at
-        # every call site. Tests of the gate itself bypass this fixture and
-        # drive cli.main directly.
-        if (
-            args[:1] == ["run"]
-            and "--dry-run" not in args
-            and "--consent-owned" not in args
-        ):
-            args += ["--consent-owned", "spammer_one"]
         code = cli.main(
-            ["--config", str(workspace.config), *args],
+            ["--config", str(workspace.config), *argv],
             stream=out,
             fetch_impl=_ok_probe,
             direct_fetch_impl=_ok_direct,
@@ -289,15 +277,7 @@ class TestExitCodes:
         invoke, channel = run_cli
         targets = workspace.data_dir / "self.txt"
         targets.write_text("reporter.one\nother_scammer\n", encoding="utf-8")
-        code, output = invoke(
-            "run",
-            "--targets",
-            str(targets),
-            "--run-id",
-            "r2",
-            "--consent-owned",
-            "reporter.one",
-        )
+        code, output = invoke("run", "--targets", str(targets), "--run-id", "r2")
         assert code == 1, output
         assert "self-report" in output
         assert "STOPPED EARLY" in output
@@ -396,9 +376,7 @@ class TestExitCodes:
         monkeypatch.delenv("IG_PROXY_KEY", raising=False)
         out = io.StringIO()
         code = cli.main(
-            ["--config", str(config), "run", "--run-id", "never",
-             "--consent-owned", "spammer_one"],
-            stream=out,
+            ["--config", str(config), "run", "--run-id", "never"], stream=out
         )
         assert code == 2
         assert "IG_PROXY_KEY" in out.getvalue()

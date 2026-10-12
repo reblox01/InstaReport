@@ -522,13 +522,6 @@ class DoctorRequest:
     submit: bool = False
     #: Lease an exit and open a browser. ``False`` cannot satisfy the gate.
     live: bool = True
-    #: File live reports over the operator's own connection, with no proxy
-    #: exit. ``False`` is the default because a report filed from the address
-    #: Instagram already associates with the operator identifies the reporting
-    #: account -- the one correlation this tool exists to avoid. Setting it is
-    #: a conscious, logged decision, and it is only meaningful for a run
-    #: against accounts the operator controls.
-    allow_home_egress: bool = False
 
 
 async def _run(
@@ -571,17 +564,7 @@ async def _run(
         )
 
     pool = _build_accounts(config)
-    if doctor is not None and doctor.allow_home_egress:
-        print(
-            "WARNING: --allow-home-egress. Reports will leave from this "
-            "machine's own address with no proxy exit, which is the address "
-            "Instagram associates with you. Only ever do this against accounts "
-            "you control.",
-            file=stream,
-        )
-        proxies = None
-    else:
-        proxies = _build_proxies(config, fetch_impl or fetch, direct_fetch_impl)
+    proxies = _build_proxies(config, fetch_impl or fetch, direct_fetch_impl)
     anchors = _load_anchors(config)
     artifacts = ArtifactStore(config.paths, run_id, allow_trace=False)
     channels = _build_channels(config, anchors, artifacts)
@@ -611,7 +594,6 @@ async def _run(
                 live=doctor.live,
                 fetch_impl=fetch_impl,
                 direct_fetch_impl=direct_fetch_impl,
-                allow_home_egress=doctor.allow_home_egress,
             )
             print("", file=stream)
             print(verdict.render(), file=stream)
@@ -993,26 +975,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="with --probe-target, file one real report to verify the last step",
     )
-    run.add_argument(
-        "--consent-owned",
-        metavar="HANDLE",
-        help=(
-            "required for any live dispatch: the account you control that this "
-            "run may touch. Must match --probe-target (default: the first "
-            "target). Instagram forbids misusing reporting channels, so a run "
-            "that cannot name the account its operator owns does not start."
-        ),
-    )
-    run.add_argument(
-        "--allow-home-egress",
-        action="store_true",
-        help=(
-            "file without a proxy exit, from this machine's own address. Only "
-            "for runs against accounts you control: the egress identifies the "
-            "reporting account. Without it, a run with no usable exit refuses "
-            "to bind rather than going direct quietly."
-        ),
-    )
     run.set_defaults(handler=_cmd_run)
 
     status = sub.add_parser(
@@ -1085,82 +1047,12 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument(
         "--json", action="store_true", help="machine-readable, for a wrapper"
     )
-    doctor.add_argument(
-        "--allow-home-egress",
-        action="store_true",
-        help=(
-            "rehearse without leasing a proxy exit. The rehearsal opens a "
-            "browser from this machine's own address; only use it against "
-            "accounts you control."
-        ),
-    )
     doctor.set_defaults(handler=_cmd_doctor)
-
-    demo = sub.add_parser(
-        "demo",
-        help="the 60-second offline demo (synthetic, sends nothing)",
-        description=(
-            "Run the offline demo: setup checks with no network, a real "
-            "Chromium reading the committed golden dialog (with --with-browser, "
-            "still no clicks, no network past loopback), and a synthetic "
-            "intent/outcome round-trip proving the ledger holds. Writes a "
-            "self-contained evidence bundle. Files nothing, leases nothing."
-        ),
-    )
-    demo.add_argument("--run-id", metavar="ID", help="default: a UTC timestamp")
-    demo.add_argument(
-        "--with-browser",
-        action="store_true",
-        help="open the golden dialog in Chromium (local file only)",
-    )
-    demo.set_defaults(handler=_cmd_demo)
 
     return parser
 
 
 # -- handlers --------------------------------------------------------------
-
-
-def _normalise_handle(handle: str) -> str:
-    """Handles compare case-insensitively, with or without the @."""
-    return handle.strip().lstrip("@").casefold()
-
-
-def _require_live_consent(
-    *, consent: str | None, probe_target: str | None, pending: int
-) -> None:
-    """Refuse a live dispatch that cannot name the account its operator owns.
-
-    Two refusals, and the order is deliberate. A missing consent is refused
-    before anything is compared, so the error names the missing flag rather
-    than a mismatch against a target the operator never confirmed. A consent
-    naming a different account than the rehearsal target is refused because it
-    is evidence the operator does not know which list they are running -- and
-    a run whose operator cannot say whose account it touches is how a
-    reporting channel gets misused, which Instagram's terms forbid and which
-    costs the reporting account, not the target.
-
-    ``probe_target=None`` means nothing is pending, so nothing can dispatch;
-    any non-empty consent satisfies the gate then, because the gate guards
-    dispatch and there is none.
-    """
-    if not consent or not consent.strip():
-        raise ConfigError(
-            "live dispatch needs --consent-owned HANDLE naming an account you "
-            "control (it must match the rehearsal target). Reporting channels "
-            "may not be used against accounts you do not own; a run that "
-            "cannot name its owner's account does not start. "
-            "Use --dry-run to preview with no consent needed."
-        )
-    if probe_target is None:
-        return
-    if _normalise_handle(consent) != _normalise_handle(probe_target):
-        raise ConfigError(
-            f"--consent-owned {consent!r} does not match the rehearsal target "
-            f"{probe_target!r}. The run touches the rehearsal target first, "
-            "so consent for a different account is consent for nothing. "
-            "Name the account this run will actually open."
-        )
 
 
 def _cmd_run(
@@ -1241,17 +1133,6 @@ def _cmd_run(
         first = next(iter(targets.pending()), None)
         probe_target = first.handle if first is not None else None
 
-    # The anti-brigading gate. Before anything is built that costs money or
-    # opens a browser, because a refusal that arrives after a thirty-second
-    # rehearsal trains the operator to route around it. Dry runs preview
-    # text; they dispatch nothing and need no consent.
-    if not args.dry_run:
-        _require_live_consent(
-            consent=args.consent_owned,
-            probe_target=probe_target,
-            pending=len(list(targets.pending())),
-        )
-
     try:
         return asyncio.run(
             _run(
@@ -1268,7 +1149,6 @@ def _cmd_run(
                     enabled=not args.no_doctor,
                     probe_target=probe_target,
                     submit=bool(args.submit),
-                    allow_home_egress=bool(args.allow_home_egress),
                 ),
             )
         )
@@ -1290,7 +1170,6 @@ async def _doctor(
     live: bool,
     fetch_impl: Callable[..., Any] | None,
     direct_fetch_impl: Callable[[str], Any] | None = None,
-    allow_home_egress: bool = False,
 ) -> DoctorReport:
     """Build whatever the requested checks need, then run them.
 
@@ -1301,13 +1180,7 @@ async def _doctor(
     itself a surprise.
     """
     pool = (
-        None
-        if allow_home_egress
-        else (
-            _build_proxies(config, fetch_impl or fetch, direct_fetch_impl)
-            if live
-            else None
-        )
+        _build_proxies(config, fetch_impl or fetch, direct_fetch_impl) if live else None
     )
     channels: list[Any] = []
     if live and probe_target:
@@ -1382,7 +1255,6 @@ def _cmd_doctor(
             live=not args.no_live,
             fetch_impl=fetch_impl,
             direct_fetch_impl=direct_fetch_impl,
-            allow_home_egress=bool(args.allow_home_egress),
         )
     )
 
@@ -1396,45 +1268,6 @@ def _cmd_doctor(
         return EXIT_REFUSED
     if report.warnings:
         return EXIT_NEEDS_REVIEW
-    return EXIT_OK
-
-
-def _cmd_demo(
-    args: argparse.Namespace, *, stream: TextIO, fetch_impl: Any = None, direct_fetch_impl: Any = None
-) -> int:
-    """The offline demo. Builds nothing that costs anything.
-
-    No pool, no channels, no fetch implementations -- the demo takes none as
-    parameters on purpose, so a future edit cannot quietly hand it a network
-    transport. ``fetch_impl`` is accepted and ignored only because the
-    dispatcher passes it to every handler.
-    """
-    from .demo import run_demo  # noqa: PLC0415 - demo-only import
-
-    # The demo builds no pool, so a missing proxy list is nothing to it. The
-    # seam is explicit rather than a try/except around load_config, because an
-    # exception caught here would also swallow the misconfigurations the demo
-    # does need to refuse -- a bad data_dir, an unset session variable.
-    config = load_config(_resolve_config(args.config), require_proxy_file=False)
-    run_id = args.run_id if args.run_id is not None else f"demo-{_utc_stamp()}"
-    try:
-        check_run_id(run_id)
-    except RunIdError as exc:
-        raise ConfigError(str(exc)) from exc
-
-    result = asyncio.run(
-        run_demo(
-            config,
-            run_id=run_id,
-            with_browser=bool(args.with_browser),
-            stream=stream,
-            verbose=args.verbose,
-        )
-    )
-    print("", file=stream)
-    print(result.render(), file=stream)
-    if result.failed():
-        return EXIT_REFUSED
     return EXIT_OK
 
 
