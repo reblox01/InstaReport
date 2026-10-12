@@ -15,6 +15,16 @@
 # environment variable their sessionid lives in.
 config.toml
 config.*.toml
+# Re-included on purpose. The rule above is written broad because under-excluding
+# an operator config leaks real handles, and the direction to fail in is the safe
+# one -- but broad catches this committed template too, and the Dockerfile COPYs
+# it. Left unfixed the build fails at that instruction, which is how this was
+# found; the failure is loud, which is the point.
+#
+# The negation is only safe because both directions are tested: this path
+# survives, and `config.toml` / `config.local.toml` do NOT. Remove the negation
+# and the build stops; remove the broad rule instead and the test stops.
+!config.example.toml
 # A proxy list is a paid resource and its addresses are the tool's whole point
 # of existing. Mounted at run time, never copied.
 proxies.txt

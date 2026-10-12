@@ -52,6 +52,11 @@ markers = [
   # see -- so they run by default, but CI can deselect them with -m "not
   # browser" on a machine without the browser download.
   "browser: launches Chromium against a committed golden fixture",
+  # Builds the image and inspects the result. This is the only container check
+  # that is evidence rather than reading, and it costs minutes on a cold cache
+  # -- `-m "not docker"` for the inner loop. It skips itself when no daemon is
+  # listening, so the suite still runs on a machine without Docker.
+  "docker: builds the image and inspects it; needs a running daemon",
   # Static analysis, run as tests so that "the suite is green" and "the code
   # type checks" cannot drift apart. Costs about twenty seconds, so it is a
   # marker: `-m "not static"` for a fast inner loop, and no marker in CI.

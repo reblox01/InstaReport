@@ -63,7 +63,17 @@ services:
       # is then unreadable as a file, and the error is a permission problem
       # rather than "the file is not there". Create the files first.
       - ./config.toml:/app/config.toml:ro
-      - ./proxies.txt:/app/proxies.txt:ro
+
+      # Mounted at the path the *config* already names, rather than at /app.
+      # `config.example.toml` sets `file_path = "~/proxies.txt"`, and inside this
+      # container `~` is `/home/pwuser` -- the home of the user the image runs
+      # as. Mounting it at /app/proxies.txt left an operator who followed both
+      # files exactly with `file_path does not exist: /home/pwuser/proxies.txt`,
+      # which is the same shape of defect as the uid comment that used to sit
+      # here: a document that disagrees with the artifact it describes. A test
+      # in the repository-hygiene file now ties this target to that setting.
+      - ./proxies.txt:/home/pwuser/proxies.txt:ro
+
       - ./targets:/targets:ro
 
       # The checkpoint ledger, and the artifacts beside it. A named volume would
@@ -73,8 +83,14 @@ services:
       # tools, without a `docker exec`.
       #
       # Owner mismatch is the one thing that needs fixing by hand here: the
-      # container runs as uid 1000, so `mkdir artifacts` on the host as any
-      # other user produces a directory it cannot write.
+      # container runs as `pwuser`, uid 1001, so `mkdir artifacts` on the host as
+      # any other user produces a directory it cannot write. That uid is the base
+      # image's rather than this repository's -- the Dockerfile no longer invents
+      # one, because a number invented here is a number that collides with the
+      # base image eventually -- and it is written down here precisely because an
+      # operator has to match it by hand:
+      #
+      #   mkdir -p artifacts && sudo chown -R 1001:1001 artifacts
       - ${INSTA_REPORT_ARTIFACTS:-./artifacts}:/data
 
     # Chromium reads a page's layout from shared memory and writes it back. The

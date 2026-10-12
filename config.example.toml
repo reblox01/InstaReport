@@ -1,10 +1,16 @@
 # instareport -- example configuration
 #
-# Copy to a location OUTSIDE the repo and edit. The tool refuses to start if
-# data_dir resolves inside the working tree, because runtime artifacts contain
+# Copy it and edit. It may live inside the repository -- `.gitignore` excludes
+# `config.toml` by exact name, and the container walkthrough expects it at
+# `./config.toml` -- or outside it, which is the safer habit if you ever inline a
+# sessionid instead of naming the environment variable that holds it.
+#
+# What must NOT resolve inside the working tree is `data_dir`, below: the tool
+# refuses to start in that case, because the runtime artifacts it holds contain
 # live session cookies.
 #
-#   cp config.example.toml ~/insta-report.toml   # then edit
+#   cp config.example.toml ./config.toml         # for `docker compose`, or
+#   cp config.example.toml ~/insta-report.toml   # anywhere else, then edit
 #   export IG_SESSIONID_ALPHA='...'              # keep secrets out of the file
 
 data_dir = "~/.insta-report"          # must be OUTSIDE the working tree

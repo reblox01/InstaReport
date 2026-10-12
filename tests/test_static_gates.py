@@ -391,3 +391,49 @@ class TestTheSuiteIsOffline:
             + "\n\nEither the transport belongs behind an injection seam, or the"
             " README's 'the suite is offline' needs to stop being said."
         )
+
+
+class TestTheDocumentationMatchesTheCode:
+    """Prose is not checked by the thing it describes.
+
+    The README's container walkthrough told an operator that ``doctor --no-live``
+    "exits 1. That is correct." It exits 2, and it had exited 2 the whole time --
+    ``EXIT_REFUSED``, because an offline run cannot rehearse a channel and the
+    tool refuses to call an unproven setup runnable. The mapping in ``cli.py``
+    was right and a test enforced it. The sentence describing it was wrong, and a
+    sentence is what an operator reads at 2am.
+
+    So the documented number is compared against the constant, not against a
+    copy of itself somewhere else in the documentation.
+    """
+
+    def test_the_documented_doctor_exit_code_is_the_one_the_cli_returns(self):
+        from insta_report import cli
+
+        readme = (REPO / "README.md").read_text(encoding="utf-8")
+        documented = re.findall(r"doctor --no-live[^\n]*#[^\n]*?exits? (\d+)", readme)
+        assert documented, (
+            "the README no longer states an exit code for `doctor --no-live`."
+            " An operator running that smoke test has to be told a non-zero exit"
+            " there is the correct answer, or they will read it as a container"
+            " that failed to start. If the walkthrough moved, move this check"
+            " with it."
+        )
+        for code in documented:
+            assert int(code) == cli.EXIT_REFUSED, (
+                f"the README says `doctor --no-live` exits {code}; `_cmd_doctor`"
+                f" returns EXIT_REFUSED ({cli.EXIT_REFUSED}) for every report"
+                " that is not runnable, and an offline run cannot produce one."
+                " 0 would mean a channel was actually rehearsed, and 1 is a `run`"
+                " verdict rather than a doctor one."
+            )
+
+        # The Dockerfile makes the same claim in the comment that decides
+        # whether a HEALTHCHECK belongs here. A wrong number in that comment
+        # argues for the wrong thing.
+        dockerfile = (REPO / "Dockerfile").read_text(encoding="utf-8")
+        for code in re.findall(r"exits (\d+) \*by design\*", dockerfile):
+            assert int(code) == cli.EXIT_REFUSED, (
+                "the Dockerfile's no-HEALTHCHECK comment says `doctor --no-live`"
+                f" exits {code}, and it exits {cli.EXIT_REFUSED}"
+            )

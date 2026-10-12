@@ -21,11 +21,27 @@
 ARG PLAYWRIGHT_VERSION=1.63.0
 FROM mcr.microsoft.com/playwright/python:v${PLAYWRIGHT_VERSION}-noble
 
-# Stated rather than inherited, because "runs as root in a container" is a
-# default nobody chose. The tool opens a browser, makes HTTP requests, and
-# writes a ledger; none of that needs root, and /data is the only thing it owns.
-ARG UID=1000
-ARG GID=1000
+# Re-declared, and this line is load-bearing rather than tidy. An ARG declared
+# before FROM is a *global* ARG: it is substituted into the FROM line and then
+# goes out of scope for the stage. Without this line the pin below expands to
+# `playwright==`, pip rejects that as an invalid requirement, and the message
+# names neither the ARG nor the cause. A static read of this file shows the pin
+# present and plausible.
+ARG PLAYWRIGHT_VERSION
+
+# No uid is declared here, and the absence is the fix rather than an omission.
+#
+# An earlier revision created its own user: `ARG UID=1000` / `ARG GID=1000` and
+# a `groupadd reporter`. The build failed with `groupadd` exit 4, which is "GID
+# not unique" -- 1000 is the base image's own `ubuntu` account and 1001 is
+# `pwuser`. The mistake was not the number; it was choosing one at all. A uid
+# written into this file is a claim about what the base image has not already
+# used, and nothing but a build can check that claim. So the claim is made
+# smaller: the Playwright images ship `pwuser` for exactly this, and the `USER`
+# below names it.
+#
+# That is still an assumption about the base image, so it is verified rather
+# than trusted -- a test builds this image and refuses it if `id -u` inside is 0.
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -54,14 +70,21 @@ RUN python -m pip install --no-cache-dir --no-deps . \
  && rm -rf /root/.cache
 
 # The operator's config is bind-mounted at run time, never copied. The example
-# is here because a first run needs to see the real key names rather than infer
-# them, and because the anchors file it points at has to exist somewhere.
+# is here so a first run can read the real key names instead of guessing them,
+# and so `docker run --rm insta-report:local cat /app/config.example.toml` is
+# answerable without a clone. Nothing resolves it at run time; the entrypoint
+# points at /app/config.toml, which is the mount.
+#
+# `.dockerignore` excludes `config.*.toml` and re-includes this one file. A test
+# asserts both halves of that; without it the pair is a trap.
 COPY config.example.toml ./config.example.toml
 
-RUN groupadd --gid "${GID}" reporter \
- && useradd --uid "${UID}" --gid "${GID}" --create-home --shell /usr/sbin/nologin reporter \
- && mkdir -p /data \
- && chown -R "${UID}:${GID}" /data /app \
+# The one path the tool writes to. Note that this ownership is the *image's*
+# default and a bind mount replaces it: compose mounts ./artifacts over /data,
+# and the host directory's owner is what matters there -- which is why the
+# compose file names the uid an operator has to match by hand.
+RUN mkdir -p /data \
+ && chown pwuser:pwuser /data \
  && chmod -R go-w /app
 
 # Declared and deliberately empty. The sessionid arrives at run time from
@@ -77,21 +100,23 @@ RUN groupadd --gid "${GID}" reporter \
 # cannot act on.
 ENV IG_SESSIONID_ALPHA=
 
-USER reporter
+USER pwuser
 
 # No HEALTHCHECK, on purpose.
 #
 # `insta-report run` is a batch process: the container is alive exactly while
 # the job is, and a health status on it reports nothing an orchestrator can act
 # on. The usual next step is a check that runs `doctor --no-live`, and that
-# exits 1 *by design* -- it verified the configuration and explicitly proved
-# nothing about the ability to file a report, which is what its verdict says. A
+# exits 2 *by design* -- `EXIT_REFUSED`, because it verified the configuration
+# and explicitly proved nothing about the ability to file a report, which is
+# what its verdict says. (Exit 0 would mean a channel was actually rehearsed;
+# exit 1 is a `run` verdict and never a `doctor --no-live` one.) A
 # HEALTHCHECK demanding exit 0 would mark this container permanently unhealthy
 # for being honest, which is how health statuses stop being read.
 #
 # The smoke test is a command, in the README, run by a person:
 #     docker compose run --rm reporter doctor --no-live
-# An exit of 1 there is the correct answer and is documented as such.
+# An exit of 2 there is the correct answer and is documented as such.
 #
 # No CMD that files reports. The image is a tool, not a job, and a default CMD
 # that acts on whatever target list happens to be mounted is a default nobody

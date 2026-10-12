@@ -30,6 +30,14 @@ config.local.toml
 secrets/
 credentials/
 *.sessionid
+# The proxy list, for the same reason as the config above: `docker-compose.yml`
+# mounts `./proxies.txt` out of the checkout, so it is a file the project invites
+# an operator to create inside the repository. It is a paid resource and its
+# addresses are the tool's whole point of existing. `.dockerignore` already
+# excluded it from the build context; this is the same rule for git, and it was
+# missing here until a test compared the two files.
+proxies.txt
+*.proxies.txt
 
 # --- RUNTIME STATE: checkpoints, artifacts, traces ---
 # The tool defaults its data directory OUTSIDE the working tree, and

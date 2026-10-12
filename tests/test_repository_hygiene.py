@@ -25,6 +25,19 @@ worthless, and a gate written after a real failure tends to be written narrowly
       tree, so every ``git add`` on Windows emitted a warning. A warning on all
       traffic is a warning nobody reads.
 
+    * The container had never been built, and building it found three separate
+      instructions claiming something the file did not do. ``COPY
+      config.example.toml`` named a path ``.dockerignore`` excluded under its own
+      ``config.*.toml`` rule, so the build stopped there. The comment above that
+      COPY said the example points at an anchors file; the example omits
+      ``anchors_path`` on purpose. And ``"playwright==${PLAYWRIGHT_VERSION}"``
+      expanded to ``playwright==`` -- an ``ARG`` declared before ``FROM`` is
+      substituted into the FROM line and is then out of scope for the stage, so
+      pip rejected it as an invalid requirement. The test for pinned
+      dependencies passed through all three, because it matches the pin's *name*
+      in the text and a name is not a version. Reading a Dockerfile as prose
+      answers a different question from reading it the way the builder reads it.
+
 Everything here is offline and hermetic. The ``git add -A`` gate builds its own
 scratch repository from the real ``.gitignore`` rather than staging anything in
 the checkout, so running the suite can never commit, unstage, or modify the
@@ -35,6 +48,7 @@ something.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -76,6 +90,127 @@ def is_checkout() -> bool:
     return (REPO / ".git").exists()
 
 
+# ===========================================================================
+# Reading a Dockerfile the way the builder reads it
+# ===========================================================================
+#
+# A static reading of the Dockerfile asked "is the pin written down". The
+# builder asked "does the pin have a value", and the distance between those two
+# questions is where a container that had never been built was living. So these
+# helpers do the builder's two jobs: apply the stage's variable scope, and apply
+# the context's exclusion rules. Both are deliberately small and both are
+# guarded -- a gate that guesses at syntax it does not implement is worse than
+# no gate, because it answers confidently.
+
+
+#: The .dockerignore syntax these helpers implement: an optional leading ``!``,
+#: ``*`` that does not cross a slash, ``**`` that does, ``[abc]`` classes, and a
+#: trailing ``/`` meaning a directory and its contents. A rule outside this set
+#: fails a test rather than being quietly mis-read.
+_SUPPORTED_RULE = re.compile(r"^!?[A-Za-z0-9_.*?\-/\[\]]+$")
+
+_VAR_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def logical_instructions(text: str) -> list[str]:
+    """Dockerfile lines rejoined where they continue, comments and blanks gone."""
+    logical: list[str] = []
+    pending = ""
+    for raw in text.splitlines():
+        if raw.lstrip().startswith("#"):
+            continue
+        line = raw.rstrip()
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        pending += line
+        if pending.strip():
+            logical.append(pending.strip())
+        pending = ""
+    if pending.strip():
+        logical.append(pending.strip())
+    return logical
+
+
+def declared_names(instruction: str) -> set[str]:
+    """The names an ``ARG`` or ``ENV`` instruction introduces.
+
+    An ``ENV A=1 B=2`` declares both; so does a continued one, which is why the
+    continuations are joined before this sees it.
+    """
+    head, _, body = instruction.partition(" ")
+    if head.upper() not in ("ARG", "ENV"):
+        return set()
+    return {
+        name
+        for name in re.findall(r"(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)(?==|\s|$)", body)
+    }
+
+
+def referenced_names(instruction: str) -> set[str]:
+    """Every ``$NAME`` / ``${NAME}`` the instruction expands."""
+    return {braced or bare for braced, bare in _VAR_REF.findall(instruction)}
+
+
+def active_ignore_rules() -> list[str]:
+    """``.dockerignore`` as rules rather than as text: a comment is not a rule."""
+    return [
+        line.strip()
+        for line in (REPO / ".dockerignore").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def rule_matches(rule: str, path: str) -> bool:
+    """Does one active ignore rule match this context-relative path?"""
+    body = rule[1:] if rule.startswith("!") else rule
+    as_directory = body.endswith("/")
+    body = body.strip("/")
+    if as_directory and (path == body or path.startswith(body + "/")):
+        return True
+
+    pattern = ""
+    index = 0
+    while index < len(body):
+        if body[index:index + 3] == "**/":
+            pattern += "(?:.*/)?"
+            index += 3
+            continue
+        if body[index:index + 2] == "**":
+            pattern += ".*"
+            index += 2
+            continue
+        char = body[index]
+        if char == "*":
+            pattern += "[^/]*"
+        elif char == "?":
+            pattern += "[^/]"
+        elif char == "[":
+            close = body.find("]", index)
+            pattern += body[index:close + 1]
+            index = close + 1
+            continue
+        else:
+            pattern += re.escape(char)
+        index += 1
+    return re.fullmatch(pattern, path) is not None
+
+
+def ignored_by_rules(path: str, rules: list[str]) -> bool:
+    """Last matching rule wins, and a parent's verdict reaches its children --
+    which is the mechanism behind a bare ``secrets/`` excluding what is inside
+    it."""
+    path = path.replace("\\", "/").strip("/")
+    parts = path.split("/")
+    ignored = False
+    for depth in range(1, len(parts) + 1):
+        prefix = "/".join(parts[:depth])
+        for rule in rules:
+            if rule_matches(rule, prefix):
+                ignored = not rule.startswith("!")
+    return ignored
+
+
 needs_git = pytest.mark.skipif(
     not shutil.which("git"), reason="git is not on PATH"
 )
@@ -109,6 +244,30 @@ def ignored(*paths: str) -> set[str]:
     out = git("ls-files", "-z", "--others", "--ignored", "--exclude-standard",
               "--", *paths, cwd=REPO)
     return {p for p in out.split("\0") if p}
+
+
+def would_git_ignore(path: str) -> bool:
+    """Would ``git add`` refuse to stage this path -- or anything inside it?
+
+    Asked of git rather than re-derived from the ignore file, because
+    ``check-ignore`` is the same code path that decides what ``git add`` stages.
+
+    Two queries, because the operator has not created these paths yet and git
+    answers a directory rule (``targets/``) only for a path it can see *is* a
+    directory. The bare name ``targets`` therefore reports "not ignored" for a
+    rule that does ignore everything the operator would put there -- which is
+    the shape of a gate that fails for a reason that is not a defect.
+    """
+    for probe in (f"{path}/", path):
+        done = subprocess.run(
+            ["git", "check-ignore", "--quiet", "--", probe],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+        )
+        if done.returncode == 0:
+            return True
+    return False
 
 
 # ===========================================================================
@@ -678,6 +837,51 @@ class TestTheDockerfileCannotDrift:
             " replaces every pin with whatever it picks."
         )
 
+    def test_every_build_variable_is_in_scope_in_the_stage_that_reads_it(self):
+        """A pin with an empty value passes a text search and fails a build.
+
+        ``ARG`` declared before ``FROM`` is a *global* argument: it is
+        substituted into the FROM line and then goes out of scope for the stage.
+        An earlier revision relied on one inside a ``RUN``, so
+        ``"playwright==${PLAYWRIGHT_VERSION}"`` expanded to ``playwright==`` and
+        pip rejected it as an invalid requirement -- naming neither the argument
+        nor the cause. The test above passed throughout, because it matches the
+        pin's *name* in the text and a name is not a version.
+
+        So this checks scope rather than text, using the builder's rule: a
+        variable is readable only if the stage declares it before the line that
+        reads it.
+        """
+        instructions = logical_instructions(self.DOCKERFILE.read_text(encoding="utf-8"))
+        first_from = next(
+            index
+            for index, instruction in enumerate(instructions)
+            if instruction.upper().startswith("FROM ")
+        )
+
+        declared: set[str] = set()
+        seen: set[str] = set()
+        problems: list[str] = []
+        for instruction in instructions[first_from + 1:]:
+            reads = referenced_names(instruction)
+            for name in sorted(reads - declared):
+                problems.append(f"  {instruction[:78]}\n    reads ${name}")
+            seen |= reads
+            declared |= declared_names(instruction)
+
+        assert not problems, (
+            "the Dockerfile reads build variables that are not in scope:\n"
+            + "\n".join(problems)
+            + "\nAn ARG declared before FROM is visible to the FROM line only."
+            " Re-declare it inside the stage -- a bare `ARG NAME` with no value"
+            " -- or the expansion is the empty string and the failure surfaces"
+            " in pip, several layers from the cause."
+        )
+        assert "PLAYWRIGHT_VERSION" in seen, (
+            "the scope check never saw the version argument read inside the"
+            " stage, so it is not checking the thing it exists to check"
+        )
+
     def test_the_image_never_bakes_the_operators_config_or_proxy_list(self):
         """The context is sent to the daemon whole, before any COPY runs.
 
@@ -734,6 +938,153 @@ class TestTheDockerfileCannotDrift:
                 " baked into an image outlives the run that produced it and is"
                 " not covered by the credential scan, which reads the work tree."
             )
+
+    def test_every_tracked_file_the_dockerfile_copies_survives_the_ignore_rules(self):
+        """A COPY source has to be in the build *context*, not merely on disk.
+
+        ``.dockerignore`` filters the context before any instruction runs, so a
+        COPY naming an excluded path fails the build -- which is how this was
+        found. The broad ``config.*.toml`` rule excluded the committed
+        ``config.example.toml`` the Dockerfile COPYs, and the build stopped
+        there with a checksum error naming neither the file nor the rule.
+
+        Checked over *tracked* files rather than over the working tree, because
+        excluding build junk is the ignore file doing its job and not a defect.
+        The direction that must hold is the other one: every file the repository
+        says is part of the program is in the context.
+        """
+        rules = active_ignore_rules()
+
+        # The matcher below implements a subset of .dockerignore syntax. A rule
+        # outside that subset would be mis-read silently, and a gate that answers
+        # confidently about syntax it does not implement is worse than no gate.
+        for rule in rules:
+            assert _SUPPORTED_RULE.match(rule), (
+                f"the ignore-rule matcher in this file does not implement {rule!r}."
+                " Extend it, or restrict the rule -- do not leave it guessing."
+            )
+        assert len(rules) > 20, (
+            "the ignore rules were not read; this gate is inspecting nothing"
+        )
+
+        sources: list[str] = []
+        for instruction in logical_instructions(self.DOCKERFILE.read_text(encoding="utf-8")):
+            if not instruction.upper().startswith("COPY "):
+                continue
+            operands = [
+                token for token in instruction.split()[1:] if not token.startswith("--")
+            ]
+            sources.extend(operands[:-1])  # the final operand is the destination
+
+        assert sources, "no COPY source was found; this gate is inspecting nothing"
+
+        for source in sources:
+            tracked = git("ls-files", "--", source, cwd=REPO).splitlines()
+            assert tracked, (
+                f"COPY {source} names a path git does not track, so nothing about"
+                " it was verified"
+            )
+            for path in tracked:
+                assert not ignored_by_rules(path, rules), (
+                    f"COPY {source} names a path .dockerignore excludes:\n"
+                    f"  {path}\n"
+                    "The context is filtered before the Dockerfile runs, so the"
+                    " build stops at that COPY -- or, for a file inside a copied"
+                    " directory, ships an image quietly missing it."
+                )
+
+    @pytest.mark.docker
+    def test_the_image_builds_and_is_what_the_dockerfile_says_it_is(self):
+        """Every other check here is reading. This one is evidence.
+
+        A Dockerfile is prose until something runs it, and this one was wrong in
+        four places that a green suite and a careful read both missed. So while a
+        daemon is listening, build it and inspect the result: it builds at all,
+        it carries the file it COPYs, it does not run as root, and no layer
+        carries a credential.
+
+        Skipped without a daemon -- a machine with no Docker should still be able
+        to run the suite, and the reading gates above are the fast approximation
+        of this one.
+        """
+        docker = shutil.which("docker")
+        if docker is None:
+            pytest.skip("docker is not on PATH")
+
+        def docker_run(*args: str, timeout: int = 600) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [docker, *args],
+                cwd=REPO,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+            )
+
+        if docker_run("info", timeout=45).returncode != 0:
+            pytest.skip("no docker daemon is listening")
+
+        tag = "insta-report:hygiene-gate"
+        build = docker_run("build", "-t", tag, ".", timeout=1800)
+        assert build.returncode == 0, (
+            "the image does not build:\n"
+            + build.stdout[-3000:]
+            + build.stderr[-2000:]
+        )
+
+        # Not root, and specifically the base image's own unprivileged user. The
+        # uid is asserted rather than merely "not 0" because the compose file
+        # tells an operator to `chown 1001` the artifacts directory by hand, so
+        # a silent renumbering in the base image would make that advice wrong.
+        who = docker_run("run", "--rm", "--entrypoint", "id", tag, "-u")
+        assert who.stdout.strip() == "1001", (
+            f"`docker run` reported uid {who.stdout.strip()!r}. This image must"
+            " not run as root, and the uid is the base image's `pwuser` -- if the"
+            " base image renumbered it, the artifacts-ownership note in"
+            " docker-compose.yml is now wrong as well."
+        )
+
+        # The one file the Dockerfile COPYs for an operator to read. Reaching
+        # this line already means the ignore rules did not swallow it, because
+        # the build would have stopped; this makes it a fact rather than an
+        # inference.
+        inside = docker_run(
+            "run",
+            "--rm",
+            "--entrypoint",
+            "sh",
+            tag,
+            "-c",
+            "test -f /app/config.example.toml && echo present",
+        )
+        assert "present" in inside.stdout, (
+            "the image built but /app/config.example.toml is not inside it:\n"
+            + inside.stdout
+            + inside.stderr
+        )
+
+        env = json.loads(
+            docker_run("inspect", "--format", "{{json .Config.Env}}", tag).stdout or "[]"
+        )
+        declared = 0
+        for entry in env:
+            name, _, value = entry.partition("=")
+            if not any(
+                word in name.upper()
+                for word in ("SESSIONID", "SECRET", "TOKEN", "PASSWORD", "API_KEY")
+            ):
+                continue
+            declared += 1
+            assert value == "", (
+                f"{name} carries a value in the image configuration. A secret"
+                " baked into a layer is in the image, in the build cache, in"
+                " `docker history`, and in every pushed copy of it."
+            )
+        assert declared, (
+            "the image declares no credential-shaped variable at all, so the"
+            " check above verified nothing"
+        )
 
     def test_the_compose_file_reads_its_secret_from_outside_the_repository(self):
         text = (REPO / "docker-compose.yml").read_text(encoding="utf-8")
@@ -818,4 +1169,99 @@ class TestTheDockerfileCannotDrift:
             "docker-compose.yml defines the sessionid inline:\n  "
             + "\n  ".join(offenders)
             + "\n\nThis file is tracked. Use env_file."
+        )
+
+    def test_the_proxy_file_the_config_names_is_mounted_where_the_container_looks(self):
+        """Two files agree on a path, or the operator is told a file is missing.
+
+        ``config.example.toml`` sets ``file_path = "~/proxies.txt"``. Inside the
+        container ``~`` is the home of the user the image runs as, so the config
+        looks in ``/home/pwuser``; compose mounted the file at ``/app``. An
+        operator who copied the example and used the compose file verbatim got
+        ``file_path does not exist: /home/pwuser/proxies.txt`` -- a paid proxy
+        list correctly mounted and correctly invisible, which reads as a bad
+        file rather than as two documents disagreeing about a path.
+
+        The home directory is derived from the image's ``USER`` rather than
+        written down here, so changing the user moves this check with it instead
+        of leaving it asserting yesterday's answer.
+        """
+        dockerfile = self.DOCKERFILE.read_text(encoding="utf-8")
+        users = re.findall(r"(?m)^USER\s+(\S+)\s*$", dockerfile)
+        assert len(users) == 1, (
+            f"expected exactly one USER instruction in the Dockerfile, found"
+            f" {users}. The mount target this gate checks depends on which user"
+            " the container runs as, so it has to be unambiguous."
+        )
+        user = users[0]
+
+        example = (REPO / "config.example.toml").read_text(encoding="utf-8")
+        named = re.findall(r'(?m)^\s*file_path\s*=\s*"(~/[^"]+)"', example)
+        assert len(named) == 1, (
+            f"expected one `file_path = \"~/...\"` in config.example.toml, found"
+            f" {named}. This gate ties that setting to the compose mount, so it"
+            " must be able to read the setting an operator would actually copy."
+        )
+        proxy_file = named[0][2:]  # drop the leading "~/"
+
+        compose = (REPO / "docker-compose.yml").read_text(encoding="utf-8")
+        mounts = re.findall(r"(?m)^\s*-\s*\./(\S+?):(\S+?):ro\s*$", compose)
+        assert len(mounts) >= 3, (
+            "the read-only bind mounts were not read, so this gate is inspecting"
+            f" nothing. Mounts found: {mounts}"
+        )
+        by_source = dict(mounts)
+        assert proxy_file in by_source, (
+            f"the example config's proxy file is `~/{proxy_file}`, so compose"
+            f" must bind-mount `./{proxy_file}` read-only. Read-only mounts"
+            f" found: {sorted(by_source)}"
+        )
+
+        expected = f"/home/{user}/{proxy_file}"
+        assert by_source[proxy_file] == expected, (
+            f"compose mounts ./{proxy_file} at {by_source[proxy_file]}, but the"
+            f" example config's `~/{proxy_file}` resolves to {expected} inside"
+            f" the container, because `~` is the home of `USER {user}`. An"
+            " operator following both files exactly would be told the file does"
+            " not exist -- which reads as a bad proxy file, not as a mismatch."
+        )
+
+    def test_every_in_repo_file_compose_mounts_is_one_git_refuses_to_commit(self):
+        """compose mounts these *from the checkout*, so git has to refuse them.
+
+        Two operator files are bind-mounted out of the repository root: the
+        config and the proxy list. Both are named in ``.dockerignore`` -- the
+        image was thought about -- and the proxy list was never named in
+        ``.gitignore``. So the walkthrough invited an operator to drop a paid
+        proxy list in the working tree, where the next ``git add -A`` stages it.
+        One of the two had a rule and the other did not, which is how an omission
+        survives a review: the shape looks handled.
+
+        Asked of git rather than re-derived from the ignore file, because
+        ``git check-ignore`` is the same code path that decides what ``git add``
+        stages. A source already tracked is skipped -- that is the committed
+        example, and committing it was a decision rather than an accident.
+        """
+        compose = (REPO / "docker-compose.yml").read_text(encoding="utf-8")
+        mounts = re.findall(r"(?m)^\s*-\s*\./(\S+?):(\S+?):ro\s*$", compose)
+        assert len(mounts) >= 3, f"the read-only bind mounts were not read: {mounts}"
+
+        checked = 0
+        for source, _target in mounts:
+            if (REPO / source).resolve().parent != REPO:
+                continue  # a source below the root is outside this gate's claim
+            checked += 1
+            if tracked(source):
+                continue  # committed on purpose, so not an accident waiting
+            assert would_git_ignore(source), (
+                f"docker-compose.yml bind-mounts ./{source} from inside the"
+                " checkout, but git does not ignore it, so the next `git add -A`"
+                " stages it -- and the walkthrough tells an operator to create it"
+                " there. Add it to .gitignore, or mount it from outside the"
+                " repository."
+            )
+        assert checked >= 3, (
+            f"only {checked} in-repo mount source(s) were examined, but compose"
+            " mounts the config, the proxy list and the target directory from the"
+            " root -- finding fewer means this gate is looking at the wrong thing"
         )

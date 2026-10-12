@@ -32,7 +32,7 @@ success rendering (the opening section), and the absence of an oracle for
 "accepted and discarded".
 
 **No report has ever been filed by this tool against a live Instagram.** The test
-suite is green (1119 tests) and it is green with every channel unable to reach
+suite is green (1125 tests) and it is green with every channel unable to reach
 Instagram. That sentence is the single most important thing on this page.
 
 Items 1–3 need two things that do not exist yet:
@@ -46,11 +46,26 @@ Items 1–3 need two things that do not exist yet:
 - **Your consent to file a real report** from a real account against a real
   target you control.
 
-**The container is written and unproven.** `Dockerfile` and `docker-compose.yml`
-are committed and the compose file parses, but the image has not been built and
-nothing has been run from it. The browser channel is the only implemented
-channel, and it has never been pointed at live Instagram from anywhere. Treat the
-container section below as a design that has not met its first run.
+**The container is built, and building it broke four of the Dockerfile's own
+claims.** It was committed before it was ever executed. The first build failed
+three times: `.dockerignore`'s own `config.*.toml` rule excluded the
+`config.example.toml` the `COPY` needed; the comment above that `COPY` described
+an anchors file the example does not point at; and
+`"playwright==${PLAYWRIGHT_VERSION}"` expanded to `playwright==`, because an
+`ARG` declared before `FROM` is substituted into the `FROM` line and is then out
+of scope for the stage. The fourth is why the image runs as the base image's own
+`pwuser`: the file had invented `uid 1000`, which is the base image's `ubuntu`
+account, and `groupadd` refused it.
+
+Observed inside the image, not asserted: `docker run` reports `uid=1001`; Chromium
+launches as that user and reports revision 1243, which is the revision the pin
+names; no credential is in any layer; and `doctor --no-live` finds `/data`
+writable, loads the 14 packaged anchors, and locates the browser. Each of those
+four failures is now a test.
+
+What none of it establishes is that a report can be **filed**. The browser channel
+has still never been pointed at live Instagram from anywhere, which is the whole
+of the section below.
 
 Until both exist, treat the channels as unverified and the terminal vocabulary as
 a recording format rather than a result.
@@ -141,9 +156,15 @@ and never resolved — the ones that may have been reported.
 
 ```bash
 docker compose build
-docker compose run --rm reporter doctor --no-live      # exits 1. That is correct.
+docker compose run --rm reporter doctor --no-live   # exits 2. That is correct.
 docker compose run --rm reporter run --targets /targets/accounts.txt
 ```
+
+`--no-live` cannot rehearse a channel, so `doctor` returns `EXIT_REFUSED` (2)
+rather than claim a setup is runnable. Exit 0 would mean a channel was actually
+rehearsed, and exit 1 (`EXIT_NEEDS_REVIEW`) is a `run` verdict — never a `doctor
+--no-live` one. An exit of 2 there is the tool being honest, not a container that
+failed to start.
 
 Three things are worth knowing before you use it, and two of them are traps.
 
@@ -199,10 +220,18 @@ refused in `/app` as well. Compose sets it to `/data`, which is a bind mount ont
 `./artifacts` — a bind mount rather than a named volume because
 `docker compose down -v` would destroy a named volume, and that volume is the
 record of what was attempted against real accounts. Create `artifacts/` and
-`targets/` on the host first, owned by uid 1000: Docker silently *creates* a
+`targets/` on the host first, owned by uid 1001 — the base image's `pwuser`, which
+is the account the container runs as: Docker silently *creates* a
 missing bind-mount source as a directory, and a missing `proxies.txt` then
 becomes a directory that is unreadable as a file, with a permission error
 standing in for "the file is not there".
+
+Create `proxies.txt` on the host too, and note where it lands: it is mounted
+read-only at `/home/pwuser/proxies.txt`, *not* at `/app/proxies.txt`. That is
+because the config you copied says `file_path = "~/proxies.txt"`, and `~` inside
+this container is the home of the user the image runs as. A test asserts the two
+agree, because they did not, and an operator following both files exactly got
+`file_path does not exist` for their trouble.
 
 The offline suite runs in its own container, which is the stronger place to
 prove the offline claim because it is a clean machine:
@@ -264,7 +293,7 @@ docker-compose.yml  bind-mounted config and artifacts, env_file for the secret
 ## Development
 
 ```bash
-.venv\Scripts\python -m pytest              # 1119 tests, offline
+.venv\Scripts\python -m pytest              # 1125 tests, offline
 .venv\Scripts\python -m pytest -m "not static"   # skip pyflakes + mypy
 .venv\Scripts\python -m pytest -m "not browser"   # skip the Chromium tests
 ```
@@ -316,13 +345,31 @@ found a real defect:
   own collection and compared. A figure in a README is a claim about the suite,
   and a claim nobody checks is how the other claims in this file got made.
 
-The container adds four more, in `tests/test_repository_hygiene.py`: the pinned
-dependency set in the image must equal the one `pyproject` declares, no `ARG` or
-`ENV` may carry a credential, the compose file may not define the sessionid
-inline, and its default secrets path must resolve *outside* the checkout. Each was
-verified by breaking it. That last one was wrong on the first attempt — it
-matched a substring, so commenting a rule out satisfied it, which is the same
-trap this repository's own `.gitignore` documents.
+The container adds a group of gates, mostly in
+`tests/test_repository_hygiene.py`, and they exist because the Dockerfile was
+wrong in ways nothing executed. The pinned dependency set in the image must equal
+the one `pyproject` declares; every variable a build instruction reads must be
+declared *inside* the stage that reads it, which is the `ARG`-before-`FROM` rule
+that produced a bare `playwright==`; no `ARG` or `ENV` may carry a credential;
+every path a `COPY` names must be tracked by git **and** survive `.dockerignore`,
+with the ignore rules read the way the builder reads them; the compose file may
+not define the sessionid inline, its default secrets path must resolve *outside*
+the checkout, and the proxy file it mounts has to land where the example config's
+`~/proxies.txt` actually resolves; and, when a Docker daemon is listening, the
+image is built and inspected — that it builds, that it carries the file it COPYs,
+that it does not run as root, and that no layer holds a credential.
+
+Several of them were wrong on the first attempt, and they were the same mistake in
+different clothing. The `.dockerignore` check matched a substring, so commenting a
+rule out satisfied it. The dependency-pin check matched the pin's *name* in the
+text, which stayed green while the pin's *value* was empty and the build was
+failing. The proxies gate exists because the compose file mounted a file at a path
+the config it was serving never looked at. And the exit code this file documented
+for `doctor --no-live` was `1` while the code returned `EXIT_REFUSED` (`2`) — the
+code was right and tested, the prose describing it was wrong, and prose is what an
+operator acts on. Each was rewritten to check the property rather than its
+spelling, and that last one now compares the number in the prose to the constant
+in `insta_report/cli.py` rather than to a copy of itself.
 
 ## The own-address guard
 
