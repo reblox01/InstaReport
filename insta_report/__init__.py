@@ -5,4 +5,4 @@ The package exists to fix a specific failure: the previous version printed
 decision in here traces back to that.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
