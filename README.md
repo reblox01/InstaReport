@@ -32,7 +32,7 @@ success rendering (the opening section), and the absence of an oracle for
 "accepted and discarded".
 
 **No report has ever been filed by this tool against a live Instagram.** The test
-suite is green (1186 tests) and it is green with every channel unable to reach
+suite is green (1216 tests) and it is green with every channel unable to reach
 Instagram. That sentence is the single most important thing on this page.
 
 Items 1–3 need two things that do not exist yet:
@@ -289,6 +289,7 @@ insta_report/
   api.py         API channel — classifier only, disarmed
   proxies.py     lease pool, health, egress-IP assertion
   accounts.py    budgets, LRU rotation, quarantine 2^n
+  reputation.py  budgets and failure streaks, across restarts
   pacing.py      monotonic, budget-derived cadence
   anchors.py     the selector oracle + drift reporting
   artifacts.py   evidence bundles, redacted on write
@@ -306,7 +307,7 @@ docker-compose.yml  bind-mounted config and artifacts, env_file for the secret
 ## Development
 
 ```bash
-.venv\Scripts\python -m pytest              # 1186 tests, offline
+.venv\Scripts\python -m pytest              # 1216 tests, offline
 .venv\Scripts\python -m pytest -m "not static"   # skip pyflakes + mypy
 .venv\Scripts\python -m pytest -m "not browser"   # skip the Chromium tests
 ```
@@ -479,6 +480,43 @@ counts. Point `[proxies] probe_url` elsewhere to pick a different echo: a bare-I
 one (`https://api.ipify.org?format=json`) answers the own-address question and
 nothing else, and with it every address grades `unknown` — a trade you make
 knowingly, not a gap you discover on the third attempt to raise a floor.
+
+## Reputation that survives a restart
+
+The daily budget and the failure streak used to live only in memory, so every
+restart reset both: Ctrl-C, run again, twenty more reports. A self-imposed
+budget that a keystroke re-approves is not a budget, and the forum's standing
+rule is stricter than the tool was — *reputation is cumulative, there is no
+reset*.
+
+`run` reads `reputation.json` from the data directory before anything can
+dispatch, and writes it back in the run's own `finally`:
+
+- **The budget carries across a restart on the same calendar day** — spent is
+  spent. A file from a previous day does not charge today: the new day still
+  resets it, because persistence must not pin the budget to last Tuesday.
+- **The failure streak never resets.** The quarantine deadline is wall-clock
+  and decays while the tool is off; the streak is what survives. The first
+  failure after a restart therefore backs off from where the last run stopped
+  — five, ten, twenty minutes — not from a fresh five.
+- **The deadline crosses the process boundary as an epoch**, because a
+  monotonic clock from a dead process means nothing to a live one. It is
+  re-anchored on load to the pool's own clock — the same one eligibility is
+  judged with, so one deadline never means two things.
+- **A file that cannot be read is a refusal, not a fresh start.** Corrupt
+  JSON, a version this tool does not write, a hand-edited field of the wrong
+  type: the run stops and names the file and the entry, because starting
+  anyway would silently clear every budget the file holds — the exact hole
+  the file closes. An account that has since left the config is ignored,
+  not fatal.
+
+The file holds counters, a reason, and a deadline — no credential; a test
+pushes a real-looking `sessionid` through the pool and proves it never
+reaches the file. Writing is atomic (temp, fsync, replace): a reader sees the
+old file or the new one, never a truncated one. The save is best effort — if
+it fails, the run warns and keeps its own result, because the checkpoint, not
+this file, owns the question of what was dispatched. A dry run writes nothing
+at all.
 
 ## Legacy
 

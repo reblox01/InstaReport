@@ -280,6 +280,16 @@ class AccountPool:
         self._roll_day()
         return [a.status(now) for a in self._accounts.values()]
 
+    def monotonic(self) -> float:
+        """This pool's clock, in the domain ``quarantined_until`` lives in.
+
+        Exposed for persistence: a quarantine deadline is written down as a
+        wall-clock epoch and read back into this domain, and the conversion
+        must use the same clock eligibility is judged with. Two clocks behind
+        one deadline would be a deadline that means two different things.
+        """
+        return self._monotonic()
+
     def _roll_day(self) -> None:
         today = self._wall_clock()
         for account in self._accounts.values():

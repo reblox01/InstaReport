@@ -60,6 +60,7 @@ from .doctor import DoctorReport, run_doctor
 from .narrative import NarrativeBuilder, build_builder
 from .pacing import Pacer, PacingConfig
 from .proxies import ProxyPool, build_pool, make_direct_fetch
+from .reputation import ReputationStore
 from .runner import (
     ChannelHealth,
     ChannelSpec,
@@ -565,6 +566,12 @@ async def _run(
         )
 
     pool = _build_accounts(config)
+    # Before anything can dispatch, and before the doctor gate: the file holds
+    # today's spent budget and the failure streaks, and a run that started
+    # without them would re-approve a budget the last run already spent --
+    # which is the whole reason this file exists.
+    reputation = ReputationStore(config.paths.data_dir / "reputation.json")
+    reputation.load_into(pool)
     proxies = _build_proxies(config, fetch_impl or fetch, direct_fetch_impl)
     anchors = _load_anchors(config)
     artifacts = ArtifactStore(config.paths, run_id, allow_trace=False)
@@ -641,6 +648,17 @@ async def _run(
                 await spec.channel.aclose()
             except Exception as exc:  # noqa: BLE001
                 print(f"warning: a browser did not close cleanly: {exc}", file=stream)
+        if not options.dry_run:
+            # Same rule as the closes above: state that will not write warns,
+            # it does not replace the run's own result. A dry run is exempt
+            # because it charged nothing worth persisting.
+            try:
+                reputation.save(pool)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"warning: account reputation was not saved: {exc}",
+                    file=stream,
+                )
         store.close()
 
     print(file=stream)

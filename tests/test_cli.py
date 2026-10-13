@@ -37,6 +37,7 @@ import json
 import signal
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -695,6 +696,86 @@ class TestResume:
         assert code == 1
         assert "MAY HAVE LANDED" in output
         assert "spammer_one" in output
+
+
+# --- reputation across restarts --------------------------------------------
+
+
+class TestReputationPersistence:
+    """The end-to-end half of upgrade 3: main() actually writes the file.
+
+    Unit tests prove ReputationStore converts correctly; these prove the CLI
+    reaches for it at all -- a store nobody calls would leave every unit test
+    green and the budget reset on every restart.
+    """
+
+    @staticmethod
+    def _entry(workspace) -> dict:
+        path = workspace.data_dir / "reputation.json"
+        return json.loads(path.read_text(encoding="utf-8"))["accounts"]["alpha"]
+
+    def test_a_real_run_writes_reputation_charged_for_what_it_sent(
+        self, run_cli, workspace
+    ):
+        invoke, _ = run_cli
+        code, output = invoke(
+            "run", "--targets", str(workspace.targets), "--run-id", "p1"
+        )
+        assert code == 0, output
+        assert (workspace.data_dir / "reputation.json").is_file()
+        entry = self._entry(workspace)
+        # Two targets went out; both are charged unconditionally -- the budget
+        # is spent by the dispatch, not by the response.
+        assert entry["used_today"] == 2
+        assert entry["total_reports"] == 2
+        assert entry["day"] == date.today().isoformat()
+
+    def test_a_dry_run_persists_nothing(self, run_cli, workspace):
+        invoke, _ = run_cli
+        code, output = invoke(
+            "run",
+            "--targets",
+            str(workspace.targets),
+            "--run-id",
+            "p2",
+            "--dry-run",
+        )
+        assert code == 0, output
+        assert not (workspace.data_dir / "reputation.json").exists()
+
+    def test_the_second_run_is_charged_for_the_first(self, run_cli, workspace):
+        """The Ctrl-C hole, closed, through the real command.
+
+        A second run in a fresh process must start from the first run's
+        spent budget rather than from zero: four reports charged in total,
+        not two twice.
+        """
+        invoke, _ = run_cli
+        code, output = invoke(
+            "run", "--targets", str(workspace.targets), "--run-id", "p3"
+        )
+        assert code == 0, output
+        code, output = invoke(
+            "run", "--targets", str(workspace.targets), "--run-id", "p4"
+        )
+        assert code == 0, output
+        entry = self._entry(workspace)
+        assert entry["total_reports"] == 4
+        assert entry["used_today"] == 4
+
+    def test_a_reputation_file_that_cannot_be_written_warns_without_failing_the_run(
+        self, run_cli, workspace
+    ):
+        """Best effort at the edge: the temp path is occupied, the write fails,
+        and the run's own result must survive that -- with a warning, not a
+        traceback and not silence."""
+        (workspace.data_dir / "reputation.json.tmp").mkdir()
+        invoke, _ = run_cli
+        code, output = invoke(
+            "run", "--targets", str(workspace.targets), "--run-id", "p5"
+        )
+        assert code == 0, output
+        assert "account reputation was not saved" in output
 
 
 # --- read-only commands ----------------------------------------------------
