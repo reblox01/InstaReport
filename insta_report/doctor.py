@@ -46,6 +46,8 @@ from pathlib import Path
 from typing import Any, Protocol, Sequence, runtime_checkable
 
 from .config import Config
+from .preflight import preflight_account
+from .probe import IdentityError
 from .support.paths import Paths
 
 __all__ = [
@@ -61,6 +63,7 @@ __all__ = [
     "check_targets",
     "check_playwright",
     "check_proxies",
+    "check_api_channel",
 ]
 
 
@@ -403,6 +406,119 @@ def check_proxies(pool: Any) -> Check:
     return Check(name, CheckStatus.PASS, detail)
 
 
+def check_api_channel(config: Config, *, pool: Any | None) -> Check:
+    """The API tier, asked the only question it can answer without filing.
+
+    Preflight is read-only: the known-good control first, then a GET to the
+    reporting route through the same ladder machinery the probe uses. A pass
+    proves one thing -- from this exit, each configured session answers, and
+    the route is reachable. It proves nothing about submission, the endpoint
+    shape, the signature, or removal; see ``preflight`` for the full
+    boundary, and note that a pass deliberately does *not* make
+    ``ApiEndpoint.verified`` true.
+
+    This check can WARN but never FAIL, and the reason is the run gate's own
+    bar: ``runnable`` requires zero failures anywhere, while a dark API tier
+    leaves the browser channel fully working. Failing here would turn a
+    partial outage into a total one and train the operator to reach for
+    ``--no-doctor`` -- the exact habit the gate exists to prevent. The
+    channel itself is refused where it would be relied on (whoever wires
+    ``ApiChannel`` calls ``assert_answers`` first); this row's job is to say
+    the state out loud, cheapest-first, with the fix.
+
+    Never a silent skip either: with ``[api] enabled = true`` the operator
+    asked for this channel, so an unanswerable one is always on the report.
+    """
+    name = "api channel"
+    if not config.api.enabled:
+        return Check(
+            name,
+            CheckStatus.SKIP,
+            "disabled ([api] enabled=false)",
+            "Set [api] enabled = true (with its mobile user agents and app id) "
+            "to preflight the API tier from every doctor run, or run "
+            "'python -m insta_report.preflight' by hand.",
+        )
+
+    # Local before network, same order as every other check in this file.
+    active = config.active_accounts
+    if not active:
+        return Check(
+            name,
+            CheckStatus.WARN,
+            "not preflighted: no enabled account to ask as",
+            "The credentials check above carries this failure.",
+        )
+
+    lease: Any | None = None
+    proxy: str | None = None
+    if pool is not None:
+        try:
+            lease = pool.acquire()
+        except Exception as exc:  # noqa: BLE001
+            # Not this check's failure to own: check_proxies ran first and
+            # already failed the run when the pool itself is the problem.
+            return Check(
+                name,
+                CheckStatus.WARN,
+                f"not preflighted: no exit to ask from ({type(exc).__name__})",
+                "The exits check above carries this failure. Preflight runs "
+                "from the same exit a run would use; with no exit, there is "
+                "nothing to ask.",
+            )
+        proxy = lease.endpoint.url
+
+    try:
+        rows: list[str] = []
+        failures = 0
+        for account in active:
+            try:
+                pre = preflight_account(config, proxy=proxy, account_ref=account.ref)
+            except IdentityError as exc:
+                rows.append(f"{account.ref}: identity unavailable ({exc})")
+                failures += 1
+                continue
+            except Exception as exc:  # noqa: BLE001
+                # A raised transport or parse error is itself a finding about
+                # this account; it must not escape and swallow the rest.
+                rows.append(
+                    f"{account.ref}: preflight raised {type(exc).__name__}: {exc}"
+                )
+                failures += 1
+                continue
+            if pre.answers:
+                control = pre.report.control
+                route = pre.route
+                rows.append(
+                    f"{account.ref}: answers "
+                    f"(control {control.status if control else '-'}, "
+                    f"route {route.status if route else '-'})"
+                )
+            else:
+                rows.append(f"{account.ref}: DOES NOT ANSWER ({pre.verdict.value})")
+                failures += 1
+    finally:
+        if pool is not None and lease is not None:
+            pool.release(lease)
+
+    exit_label = proxy or "the direct connection"
+    if failures:
+        return Check(
+            name,
+            CheckStatus.WARN,
+            f"{failures} of {len(active)} account(s) do not answer from "
+            f"{exit_label}",
+            " | ".join(rows)
+            + ". Run 'python -m insta_report.preflight' for the control and "
+            "route rows, or set [api] enabled=false to stop preflighting.",
+        )
+    return Check(
+        name,
+        CheckStatus.PASS,
+        f"{len(active)} account(s) answer from {exit_label}: " + "; ".join(rows),
+    )
+
+
 # ===========================================================================
 # 2. The report
 # ===========================================================================
@@ -585,6 +701,7 @@ async def run_doctor(
         return report
 
     report.add(check_proxies(pool))
+    report.add(check_api_channel(config, pool=pool))
 
     if not probe_target:
         report.add(

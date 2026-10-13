@@ -11,12 +11,14 @@ import re
 import httpx
 import pytest
 
+from insta_report.config import load_config
 from insta_report.outcomes import NetworkVerdict
 from insta_report.probe import (
     DEFAULT_CONTROL_URL,
     DEFAULT_PROBES,
     DEFAULT_USER_AGENT,
     READ_ONLY_METHODS,
+    IdentityError,
     Probe,
     ProbeResult,
     ProbeVerdict,
@@ -25,9 +27,12 @@ from insta_report.probe import (
     _main,
     _interpretation,
     render_url,
+    resolve_channel_identity,
     run_probe,
 )
 from insta_report.support.redaction import get_registry, register_secret
+
+from .conftest import FAKE_SESSIONID
 
 CONTROL_URL = DEFAULT_CONTROL_URL
 
@@ -1031,3 +1036,100 @@ def test_main_never_substitutes_the_web_identity_for_the_mobile_tier(
     )
     assert "Mozilla/5.0" not in ua, ua
     assert ua == DEFAULT_USER_AGENT
+
+
+# --- resolve_channel_identity: one assembly for two callers ------------------
+#
+# The probe's entry point and the API channel's preflight share this one
+# function, so its refusals are load-bearing for both: a message that does
+# not say where to edit costs the operator a second round trip, and a silent
+# fallback to the wrong account would label evidence with the wrong name.
+
+
+def test_resolver_refuses_an_account_with_no_user_id(
+    base_config_toml, session_env, proxy_file, write_config
+):
+    """The message names the section *and* the key.
+
+    The generic placeholder guard can only say what is missing; a config
+    error has to say where to put it, or the guard fires again on the next
+    run and the operator has learned nothing either time.
+    """
+    config = load_config(write_config(base_config_toml))
+    with pytest.raises(IdentityError) as excinfo:
+        resolve_channel_identity(config)
+    message = str(excinfo.value)
+    assert "[accounts.alpha]" in message
+    assert "user_id" in message
+
+
+def test_resolver_refuses_when_no_account_is_enabled(
+    base_config_toml, session_env, proxy_file, write_config
+):
+    disabled = base_config_toml.replace(
+        "[accounts.alpha]", "[accounts.alpha]\nenabled = false"
+    )
+    config = load_config(write_config(disabled))
+    with pytest.raises(IdentityError, match="no enabled accounts"):
+        resolve_channel_identity(config)
+
+
+def test_resolver_selects_the_named_account(
+    base_config_toml, session_env, proxy_file, write_config
+):
+    """Two accounts, two identities -- and no silent fallback.
+
+    An unknown ref must refuse rather than pick the first account: a
+    preflight labelled with account A exercising account B's session would
+    send the operator to fix the wrong account entirely.
+    """
+    body = (
+        base_config_toml.replace(
+            "[browser]",
+            "[accounts.bravo]\n"
+            'username = "reporter.two"\n'
+            'sessionid_env = "IG_SESSIONID_ALPHA"\n'
+            'user_id = "555000222"\n\n'
+            "[browser]",
+        )
+        .replace(
+            'sessionid_env = "IG_SESSIONID_ALPHA"',
+            'sessionid_env = "IG_SESSIONID_ALPHA"\nuser_id = "555000111"',
+            1,
+        )
+    )
+    config = load_config(write_config(body))
+
+    first = resolve_channel_identity(config)
+    assert (first.account_ref, first.user_id) == ("alpha", "555000111")
+
+    second = resolve_channel_identity(config, account_ref="bravo")
+    assert (second.account_ref, second.user_id) == ("bravo", "555000222")
+
+    with pytest.raises(IdentityError, match="charlie"):
+        resolve_channel_identity(config, account_ref="charlie")
+
+
+def test_resolver_bundles_the_session_with_the_mobile_tier(
+    base_config_toml, session_env, proxy_file, write_config
+):
+    """One client, assembled once.
+
+    The cookie and the tier's user agent travel together because a session
+    presented with the wrong tier's agent is the misconfiguration that made
+    a perfectly reachable API report as inconclusive -- bundling is what
+    stops that being assembled by accident. And no app id is configured
+    here, so no header is sent: an absent header is a claim too.
+    """
+    config = load_config(
+        write_config(
+            base_config_toml.replace(
+                "[accounts.alpha]",
+                '[accounts.alpha]\nuser_id = "555000111"',
+            )
+        )
+    )
+    identity = resolve_channel_identity(config)
+    assert identity.headers["Cookie"] == f"sessionid={FAKE_SESSIONID}"
+    assert "X-IG-App-ID" not in identity.headers
+    assert identity.user_agent == DEFAULT_USER_AGENT

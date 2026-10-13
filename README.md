@@ -32,7 +32,7 @@ success rendering (the opening section), and the absence of an oracle for
 "accepted and discarded".
 
 **No report has ever been filed by this tool against a live Instagram.** The test
-suite is green (1266 tests) and it is green with every channel unable to reach
+suite is green (1301 tests) and it is green with every channel unable to reach
 Instagram. That sentence is the single most important thing on this page.
 
 Items 1–3 need two things that do not exist yet:
@@ -93,6 +93,15 @@ itself is not, because nothing about it has ever been observed answering.
 not import the channel at all. Two independent locks, both with tests that fail if
 removed. A fallback you have not verified is a black hole — that is the mistake
 which caused this rewrite, and the code refuses to repeat it.
+
+`insta_report/preflight.py` is the observation those locks wait for: a read-only
+gate that asks whether the channel *answers* — the known-good control first, then
+a GET to the reporting route, through the same identity assembly the probe uses.
+`doctor` runs it automatically when `[api] enabled = true`, and whoever wires the
+channel calls `assert_answers` first. A pass proves one thing: from this exit,
+this session answers and the route is reachable. It does not prove a report was
+filed, that the endpoint shape is right, or that a signature was ever observed —
+those still require a watched submission, and there has never been one.
 
 ---
 
@@ -159,6 +168,17 @@ refuses to build a URL with an unsubstituted placeholder):
 ```bash
 python -m insta_report.probe --config config.toml --username <a handle you control>
 ```
+
+The API channel's preflight is the same machinery pointed at one question, and it
+shares the probe's identity assembly so the observed identity and the would-be
+filing identity cannot drift apart:
+
+```bash
+python -m insta_report.preflight --config config.toml [--proxy <exit>] [--json]
+```
+
+Exit 0 means every named exit answers, 1 means finished with reading to do, 2
+means the config never let a request out.
 
 `run` writes a durable checkpoint **before** every submit, so an interrupted run
 resumes without double-reporting. `status` lists the targets that were dispatched
@@ -297,6 +317,7 @@ insta_report/
   narrative.py   report text rendering
   doctor.py      the gate
   probe.py       observability probe
+  preflight.py   api-channel liveness gate
   cli.py         command surface
 
 Dockerfile          Playwright image, pinned to the driver version
@@ -308,7 +329,7 @@ docker-compose.yml  bind-mounted config and artifacts, env_file for the secret
 ## Development
 
 ```bash
-.venv\Scripts\python -m pytest              # 1266 tests, offline
+.venv\Scripts\python -m pytest              # 1301 tests, offline
 .venv\Scripts\python -m pytest -m "not static"   # skip pyflakes + mypy
 .venv\Scripts\python -m pytest -m "not browser"   # skip the Chromium tests
 ```

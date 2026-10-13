@@ -146,9 +146,17 @@ navigation_timeout_ms = 30000
 confirmation_timeout_ms = 10000
 
 [api]
-# Stays false until the T0 probe confirms these endpoints exist. The previous
-# version of this tool shipped against unverified endpoints and reported
-# success while sending nothing.
+# Stays false until the preflight proves the channel answers. The probe
+# (python -m insta_report.probe) established that the host is observable at
+# all; the preflight (python -m insta_report.preflight) asks the narrower
+# question this channel needs answered -- does this account's session reach
+# the reporting route from an exit a run would actually use -- and doctor
+# runs it automatically once enabled = true. A pass proves liveness only:
+# no report is filed by it, and ApiEndpoint still refuses an unverified
+# construction until a real submission has been watched end to end.
+#
+# The previous version of this tool shipped against unverified endpoints
+# and reported success while sending nothing.
 enabled = false
 # mobile_user_agent = "Instagram 3xx.y.z Android (24/7.0; 640dpi; 1440x2560; samsung; SM-G930F; herolte; samsungexynos8890; en_US; 138226743)"
 # web_user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"

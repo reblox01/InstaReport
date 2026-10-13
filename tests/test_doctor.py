@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import io
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -46,6 +47,7 @@ from insta_report.doctor import (
     CheckStatus,
     ChannelProbe,
     DoctorReport,
+    check_api_channel,
     check_anchors,
     check_credentials,
     check_paths,
@@ -54,6 +56,7 @@ from insta_report.doctor import (
     run_doctor,
 )
 from insta_report.pacing import Pacer
+from insta_report.probe import IdentityError
 from insta_report.proxies import EgressObservation
 from insta_report.runner import ChannelSpec
 from insta_report.support.paths import Paths
@@ -69,6 +72,7 @@ from .test_browser_channel import (
     happy_pages,
 )
 from .test_cli import CONFIG_TEMPLATE, PROXY_LINES, _no_wait, _ok_direct, _ok_probe
+from .test_preflight import a_preflight
 from .test_runner import FakeChannel
 
 # ===========================================================================
@@ -543,6 +547,181 @@ class _Endpoint:
 class _Lease:
     endpoint = _Endpoint()
     egress = EgressObservation(ip="45.9.148.20", asn=21408, country="NL")
+
+
+# ===========================================================================
+# 2b. The API channel's preflight
+# ===========================================================================
+
+
+def _api_enabled(config: Config) -> Config:
+    """``[api] enabled = true`` on a config whose accounts can answer.
+
+    The user_id is added per account because the identity assembly refuses an
+    account without one -- and a test that wanted PASS would otherwise be
+    testing the refusal instead. The UA and app id stay unset: the identity's
+    mobile default is the correct one, and preflight proves that path.
+    """
+    return replace(
+        config,
+        accounts=tuple(replace(a, user_id="555000111") for a in config.accounts),
+        api=replace(config.api, enabled=True),
+    )
+
+
+class _UrlEndpoint:
+    label = ""
+    host = "proxy.example:8080"
+    url = "http://proxy.example:8080"
+
+
+class TestTheApiChannelCheck:
+    """``check_api_channel`` -- the API tier asked, read-only, before reliance.
+
+    The status contract under test is the load-bearing one: this check can
+    WARN but never FAIL, because the run gate treats any FAIL as a total
+    outage while a dark API tier leaves the browser channel working. A second
+    channel's problem has to look like a second channel's problem.
+    """
+
+    def test_disabled_is_a_skip_and_asks_nothing(self, operator, monkeypatch):
+        """The default state costs nothing -- not a request, not a lease."""
+
+        def explode(*args, **kwargs):
+            raise AssertionError("a disabled channel must not be preflighted")
+
+        monkeypatch.setattr("insta_report.doctor.preflight_account", explode)
+        check = check_api_channel(operator.config, pool=None)
+        assert check.status is CheckStatus.SKIP
+        assert "enabled=false" in check.detail
+
+    def test_enabled_and_answering_is_a_pass(self, operator, monkeypatch):
+        monkeypatch.setattr(
+            "insta_report.doctor.preflight_account",
+            lambda *a, **kw: a_preflight(answers=True),
+        )
+        check = check_api_channel(_api_enabled(operator.config), pool=None)
+        assert check.status is CheckStatus.PASS
+        assert "account(s) answer from" in check.detail
+        assert "answers (control 200, route 405)" in check.detail
+
+    def test_a_channel_that_does_not_answer_warns_and_never_blocks(
+        self, operator, monkeypatch
+    ):
+        """A WARN whose whole purpose is *not* changing the run's verdict.
+
+        ``runnable`` requires zero failures anywhere in the report; if this
+        check could FAIL, one dark exit would refuse a run whose browser
+        channel is perfectly healthy, and the operator would learn that the
+        gate cries wolf. So the non-blocking property is asserted next to the
+        WARN itself -- they are one design, not two facts.
+        """
+        monkeypatch.setattr(
+            "insta_report.doctor.preflight_account",
+            lambda *a, **kw: a_preflight(answers=False),
+        )
+        check = check_api_channel(_api_enabled(operator.config), pool=None)
+        assert check.status is CheckStatus.WARN
+        assert "DOES NOT ANSWER" in check.remedy
+        assert "inconclusive" in check.remedy
+
+        report = DoctorReport(checks=[check], channels=[a_probe(ok=True)])
+        assert report.runnable is True
+
+    def test_a_missing_identity_names_the_account(self, operator, monkeypatch):
+        """The refusal that used to be a generic "substitution missing" is
+        now a message naming the file's section, and the check must pass it
+        through rather than swallow it into a count."""
+
+        def raise_identity(config, **kwargs):
+            raise IdentityError("[accounts.alpha] has no user_id, ...")
+
+        monkeypatch.setattr("insta_report.doctor.preflight_account", raise_identity)
+        check = check_api_channel(_api_enabled(operator.config), pool=None)
+        assert check.status is CheckStatus.WARN
+        assert "[accounts.alpha]" in check.remedy
+
+    def test_a_pool_that_cannot_lease_is_the_exits_check_s_failure(
+        self, operator, monkeypatch
+    ):
+        """No exit to ask from is carried by the check that owns it.
+
+        check_proxies runs first and FAILs the whole report when the pool is
+        the problem; this row must stay a warning so the gate's single source
+        of truth for "no exits" is not duplicated -- and contested.
+        """
+
+        class Broken:
+            def acquire(self):
+                raise RuntimeError("pool is empty")
+
+            def release(self, lease):
+                raise AssertionError("never leased, so never released")
+
+        monkeypatch.setattr(
+            "insta_report.doctor.preflight_account",
+            lambda *a, **kw: a_preflight(answers=True),
+        )
+        check = check_api_channel(_api_enabled(operator.config), pool=Broken())
+        assert check.status is CheckStatus.WARN
+        assert "exits check" in check.remedy
+
+    def test_the_lease_is_released_whatever_the_preflight_does(
+        self, operator, monkeypatch
+    ):
+        """The lease outlives every path out of the loop -- including the one
+        that raises. A leaked lease is a proxy slot burned per doctor run."""
+
+        released = []
+
+        class Pool:
+            def acquire(self):
+                lease = type("L", (), {})()
+                lease.endpoint = _UrlEndpoint()
+                return lease
+
+            def release(self, lease):
+                released.append(lease)
+
+        monkeypatch.setattr(
+            "insta_report.doctor.preflight_account",
+            lambda *a, **kw: a_preflight(answers=True),
+        )
+        check_api_channel(_api_enabled(operator.config), pool=Pool())
+        assert len(released) == 1
+
+        def boom(config, **kwargs):
+            raise RuntimeError("transport died mid-preflight")
+
+        monkeypatch.setattr("insta_report.doctor.preflight_account", boom)
+        check = check_api_channel(_api_enabled(operator.config), pool=Pool())
+        assert len(released) == 2, "a raised preflight must not strand the lease"
+        assert check.status is CheckStatus.WARN
+        assert "RuntimeError" in check.remedy
+
+    def test_the_row_lives_in_the_live_section_after_the_exits(self, operator):
+        """Placement is part of the contract: after the exits check (it needs
+        an exit to ask through) and before the browser rehearsal (it is two
+        HTTP calls where a browser launch is seconds)."""
+        report = _run(
+            run_doctor(
+                operator.config, pool=None, channels=[], probe_target=None, live=True
+            )
+        )
+        names = [c.name for c in report.checks]
+        assert names.index("proxies") < names.index("api channel")
+        assert names.index("api channel") < names.index("channels")
+
+    def test_the_offline_half_does_not_pretend_to_have_looked(self, operator):
+        """`--no-live` adds no api row at all, rather than a skip that could
+        be misread as a disabled channel: the exits row speaks for the whole
+        offline half, and a second "didn't look" row is noise."""
+        report = _run(
+            run_doctor(
+                operator.config, pool=None, channels=[], probe_target=None, live=False
+            )
+        )
+        assert "api channel" not in [c.name for c in report.checks]
 
 
 # ===========================================================================

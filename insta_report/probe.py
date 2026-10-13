@@ -39,7 +39,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
 import httpx
 
@@ -47,12 +47,19 @@ from .outcomes import NetworkVerdict, classify_network
 from .support.redaction import get_registry
 from .support.urls import PLACEHOLDER, missing_placeholders, render_url
 
+if TYPE_CHECKING:
+    from .config import Config
+
 __all__ = [
     "ProbeVerdict",
     "ProbeResult",
     "ProbeReport",
     "run_probe",
     "DEFAULT_PROBES",
+    "FLAG_ROUTE_URL",
+    "ChannelIdentity",
+    "IdentityError",
+    "resolve_channel_identity",
 ]
 
 log = logging.getLogger(__name__)
@@ -311,6 +318,13 @@ class Probe:
     body: str | None = None
 
 
+#: The reporting route, as a template. Named because two modules now address
+#: it -- the probe table below and the API channel's preflight -- and two copies
+#: of a URL is two chances for them to disagree about which host a report is
+#: filed against, which is the same class of bug as the literal ``{user_id}``
+#: that once went out on its own.
+FLAG_ROUTE_URL = "https://i.instagram.com/api/v1/users/{user_id}/flag_user/"
+
 #: Endpoints whose liveness T0 is trying to establish. Deliberately read-only:
 #: nothing here submits a report, so a run cannot harm a target.
 #:
@@ -353,7 +367,7 @@ DEFAULT_PROBES: tuple[Probe, ...] = (
         # by name to hide the contradiction. D5's entire claim is that the mobile
         # identity on the mobile host is the primary path; a liveness check aimed
         # anywhere else cannot support it.
-        url="https://i.instagram.com/api/v1/users/{user_id}/flag_user/",
+        url=FLAG_ROUTE_URL,
         # GET, and asserted. See the note above -- a 405 here still proves the
         # route is real, and nothing here can report anyone.
         method="GET",
@@ -600,6 +614,120 @@ def run_across_exits(
     return [run_probe(proxy=exit, **kwargs) for exit in exits]
 
 
+# --- the channel identity ---------------------------------------------------
+#
+# One assembly, used by this module's entry point and by the API channel's
+# preflight. Two implementations would be two chances to drift, and a drifted
+# identity is a conclusion drawn from the probe's own misconfiguration -- which
+# is exactly how a working API once got reported as unreachable.
+
+
+class IdentityError(ValueError):
+    """The config cannot say who is asking, and the fix is in the file.
+
+    Raised before any request goes out, so a missing identity never costs a
+    network round trip -- and never goes out half-assembled. A ``ValueError``
+    rather than a :class:`~insta_report.config.ConfigError` because the config
+    *parsed*; what is missing only becomes an error at the moment something
+    needs it, and that moment is here.
+    """
+
+
+@dataclass(frozen=True)
+class ChannelIdentity:
+    """One account's presentation to the mobile API tier, assembled once.
+
+    The session cookie, the app id and the user agent travel together because
+    they describe a single client. Sending one account's session with another
+    tier's user agent is the misconfiguration that made the first T0 run report
+    INCONCLUSIVE on a perfectly working API, and bundling them is what makes
+    that failure impossible to assemble by accident.
+    """
+
+    account_ref: str
+    user_id: str
+    user_agent: str
+    #: ``Cookie`` and (when configured) ``X-IG-App-ID``. The User-Agent is its
+    #: own field because ``run_probe`` takes it separately.
+    headers: Mapping[str, str]
+
+
+def resolve_channel_identity(
+    config: Config, *, account_ref: str | None = None
+) -> ChannelIdentity:
+    """Assemble one account's mobile identity, or refuse with the file to edit.
+
+    The caller passes ``account_ref`` to pick a named account; ``None`` means
+    the first enabled one, which is what a single-account setup wants anyway.
+    An unknown ref is an error rather than a silent fall back to the first
+    account: a preflight that labels its evidence with account A while
+    exercising account B's session is worse than no preflight at all.
+
+    Raises :class:`IdentityError` for the three ways this can be refused: no
+    enabled account, an unknown ref, and an account with no ``user_id`` -- the
+    last with a message that names the key and the section to edit, because
+    the generic guard from ``_assert_placeholders`` says *what* is missing and
+    this has to say *where to put it*.
+    """
+    accounts = [a for a in config.accounts if a.enabled]
+    if not accounts:
+        raise IdentityError("no enabled accounts in config")
+
+    if account_ref is None:
+        chosen = accounts[0]
+    else:
+        found = next((a for a in accounts if a.ref == account_ref), None)
+        if found is None:
+            known = ", ".join(a.ref for a in accounts)
+            raise IdentityError(
+                f"no enabled account with ref {account_ref!r} (enabled: {known})"
+            )
+        chosen = found
+
+    # Reading sessionid here is what registers it with the redactor, so any
+    # excerpt printed below has already been scrubbed.
+    headers: dict[str, str] = {"Cookie": f"sessionid={chosen.sessionid}"}
+    if config.api.app_id:
+        headers["X-IG-App-ID"] = config.api.app_id
+
+    # The target is the *mobile* API host, so the identity presented must be a
+    # mobile one. Falling back to the web user agent is what made the first T0
+    # run report INCONCLUSIVE on a reachable API: with [api] mobile_user_agent
+    # unset, a desktop Chrome string went to i.instagram.com and every route
+    # answered "useragent mismatch". A wrong-tier identity is a configuration
+    # error, so it is named rather than papered over: the built-in default is
+    # mobile and is correct; the web agent never is.
+    if config.api.mobile_user_agent:
+        user_agent = config.api.mobile_user_agent
+    else:
+        user_agent = DEFAULT_USER_AGENT
+        if config.api.web_user_agent:
+            log.warning(
+                "[api] mobile_user_agent is unset; using the built-in mobile "
+                "default %r. The web user agent is deliberately NOT used here: "
+                "these probes target the mobile API tier, which rejects a "
+                "desktop identity with 'useragent mismatch'.",
+                DEFAULT_USER_AGENT.split(" Android ")[0] + " ...",
+            )
+
+    if not chosen.user_id:
+        raise IdentityError(
+            f"[accounts.{chosen.ref}] has no user_id, and the reporting route is "
+            "addressed by numeric id. Add user_id = \"<ds_user_id>\" to that "
+            "account. It is the account's own id and is not a secret. It is "
+            "needed because a request path with an unsubstituted {user_id} is "
+            "malformed, and a malformed path's 404 cannot be told apart from a "
+            "missing route."
+        )
+
+    return ChannelIdentity(
+        account_ref=chosen.ref,
+        user_id=chosen.user_id,
+        user_agent=user_agent,
+        headers=headers,
+    )
+
+
 # --- entry point ------------------------------------------------------------
 
 #: Authenticated, read-only, and known to answer when credentials are good. This
@@ -674,40 +802,16 @@ def _main(argv: Sequence[str] | None = None) -> int:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
 
-    accounts = [a for a in config.accounts if a.enabled]
-    if not accounts:
-        print("no enabled accounts in config", file=sys.stderr)
+    # Resolved first and as one unit: no enabled account, an unknown --account,
+    # or an account with no user_id all refuse here -- before a single request,
+    # with the file and the key to edit in the message. The assembly itself
+    # lives in resolve_channel_identity because the API channel's preflight
+    # needs the same identity and two assemblies are two chances to drift.
+    try:
+        identity = resolve_channel_identity(config, account_ref=args.account)
+    except IdentityError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
         return 2
-    chosen = next((a for a in accounts if a.ref == args.account), accounts[0])
-
-    # Reading sessionid here is what registers it with the redactor, so any
-    # excerpt printed below has already been scrubbed.
-    headers = {"Cookie": f"sessionid={chosen.sessionid}"}
-    if config.api.app_id:
-        headers["X-IG-App-ID"] = config.api.app_id
-
-    # The probe set targets the *mobile* API host, so the identity presented must
-    # be a mobile one. Falling back to the web user agent here is what made the
-    # first T0 run report INCONCLUSIVE on a perfectly reachable API: with
-    # [api] mobile_user_agent unset, the run sent a desktop Chrome string to
-    # i.instagram.com and got "useragent mismatch" back from every route.
-    #
-    # A wrong-tier identity is a configuration error, so it is named rather than
-    # papered over. Falling back to the module default -- which is mobile, and
-    # which the comment above explains -- is correct; falling back to the *web*
-    # agent is not, and never was.
-    if config.api.mobile_user_agent:
-        probe_ua = config.api.mobile_user_agent
-    else:
-        probe_ua = DEFAULT_USER_AGENT
-        if config.api.web_user_agent:
-            log.warning(
-                "[api] mobile_user_agent is unset; using the built-in mobile "
-                "default %r. The web user agent is deliberately NOT used here: "
-                "these probes target the mobile API tier, which rejects a "
-                "desktop identity with 'useragent mismatch'.",
-                DEFAULT_USER_AGENT.split(" Android ")[0] + " ...",
-            )
 
     exits: list[str | None] = list(args.proxy) or [None]
     if len(exits) < 2:
@@ -717,30 +821,13 @@ def _main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
 
-    # The reporting route is addressed by numeric id, and the reporting account's
-    # own id is what identifies it here. Checked with a config-shaped message
-    # rather than left to ``_assert_placeholders``: the generic guard says "a
-    # substitution is missing", this says which key in which file to edit. Both
-    # exist -- the generic one is the invariant, this one is the instruction.
-    if not chosen.user_id:
-        print(
-            f"config error: [accounts.{chosen.ref}] has no user_id, and the "
-            "default probe set addresses the reporting route by numeric id. "
-            "Add user_id = \"<ds_user_id>\" to that account. It is the account's "
-            "own id and is not a secret. It is needed because a request path "
-            "with an unsubstituted {user_id} is malformed, and a malformed "
-            "path's 404 cannot be told apart from a missing route.",
-            file=sys.stderr,
-        )
-        return 2
-
     reports = run_across_exits(
         exits,
         control_url=args.control,
-        substitutions={"username": args.username, "user_id": chosen.user_id},
+        substitutions={"username": args.username, "user_id": identity.user_id},
         timeout=args.timeout,
-        user_agent=probe_ua,
-        extra_headers=headers,
+        user_agent=identity.user_agent,
+        extra_headers=identity.headers,
     )
 
     if args.json:
