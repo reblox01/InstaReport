@@ -69,6 +69,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, ClassVar, Protocol, runtime_checkable
+from urllib.parse import unquote, urlsplit
 
 from .anchors import AnchorSet
 from .artifacts import ArtifactStore, FailureContext
@@ -82,6 +83,7 @@ from .errors import (
     SelectorDrift,
     SessionExpired,
 )
+from .fingerprint import resolve_timezone
 from .outcomes import BrowserEvidence, Outcome, TerminalState, classify_browser, utc_now
 from .proxies import ProxyLease
 from .targets import Target
@@ -895,6 +897,57 @@ class SubmitPolicy:
 # ===========================================================================
 
 
+def playwright_proxy(proxy_url: str | None) -> dict[str, str] | None:
+    """Playwright's ``ProxySettings`` for a lease URL, or None for a direct run.
+
+    The split is not cosmetic: Chromium's proxy flag does not carry userinfo,
+    and Playwright's own ``username``/``password`` fields are where credentials
+    belong. A URL with no credentials yields the server alone -- which is also
+    what an authenticated proxy degrades to when the provider rotates
+    credentials the pool does not know, so the shape is exercised both ways.
+    """
+    if not proxy_url:
+        return None
+    parsed = urlsplit(proxy_url)
+    if not parsed.hostname:
+        raise ValueError(
+            f"proxy url {proxy_url!r} has no host; a lease endpoint must be "
+            "scheme://host:port"
+        )
+    server = f"{parsed.scheme}://{parsed.hostname}"
+    if parsed.port is not None:
+        server = f"{server}:{parsed.port}"
+    settings: dict[str, str] = {"server": server}
+    if parsed.username:
+        settings["username"] = unquote(parsed.username)
+    if parsed.password:
+        settings["password"] = unquote(parsed.password)
+    return settings
+
+
+def build_context_options(
+    *, locale: str, timezone_id: str | None, proxy_url: str | None
+) -> dict[str, Any]:
+    """The options every context is opened with -- pure, so the launch shape
+    is testable without a browser.
+
+    ``proxy`` appears only when there is one. Playwright treats an explicit
+    ``proxy=None`` and an absent key identically today, but "the browser has
+    no proxy configured" and "the browser was asked for no proxy" are different
+    facts to a reader of the launch log, and only one of them is ours to
+    assert.
+    """
+    options: dict[str, Any] = {
+        "locale": locale,
+        "timezone_id": timezone_id,
+        "viewport": {"width": 1280, "height": 900},
+    }
+    proxy = playwright_proxy(proxy_url)
+    if proxy is not None:
+        options["proxy"] = proxy
+    return options
+
+
 @runtime_checkable
 class PageDriver(Protocol):
     """Everything the channel needs from a page.
@@ -906,7 +959,13 @@ class PageDriver(Protocol):
     that a method changed shape.
     """
 
-    async def start(self, anchors: AnchorSet) -> Any: ...
+    async def start(
+        self,
+        anchors: AnchorSet,
+        *,
+        proxy: str | None = None,
+        egress_country: str | None = None,
+    ) -> Any: ...
     async def goto_profile(self, handle: str) -> None: ...
     async def read(self, name: str, *, require_enabled: bool) -> str | None: ...
     async def selected_category(self) -> str | None: ...
@@ -948,6 +1007,15 @@ class BrowserDriver:
     #: Set when a persistent context could not be opened, so the next call
     #: fails immediately with the real reason instead of trying again.
     _session_error: str | None = field(default=None, repr=False)
+    #: What the live context was actually launched with: ``(proxy, locale,
+    #: timezone)``. A persistent context fixes all three at launch, so this is
+    #: the only way to notice -- before a report goes out -- that the egress
+    #: underneath an already-running context has changed. None means no launch
+    #: has succeeded yet, and a successful launch overwrites it, so a failed
+    #: launch can never leave a stale key claiming a session that is not there.
+    _session_key: tuple[str | None, str, str | None] | None = field(
+        default=None, repr=False
+    )
 
     _playwright: Any = field(default=None, repr=False)
     _browser: Any = field(default=None, repr=False)
@@ -972,8 +1040,14 @@ class BrowserDriver:
     async def __aexit__(self, *exc: object) -> None:
         await self.close()
 
-    async def start(self, anchors: AnchorSet) -> "BrowserDriver":
-        """Launch, open a persistent context, and attach the capture.
+    async def start(
+        self,
+        anchors: AnchorSet,
+        *,
+        proxy: str | None = None,
+        egress_country: str | None = None,
+    ) -> "BrowserDriver":
+        """Launch (or relaunch) on this session's egress, and attach the capture.
 
         The user data directory is why a persistent context is used at all. A
         ``sessionid`` alone cannot reconstruct a session: Instagram reads the
@@ -981,15 +1055,38 @@ class BrowserDriver:
         header-reconstructed session is exactly the shape it flags. A real
         directory holds the whole browser profile, so the session arrives as the
         browser state it actually is.
+
+        The keyword arguments are the session's *egress*: the proxy to browse
+        through and the country that proxy was observed to leave from. Both are
+        fixed into the context at launch, so a call that changes either closes
+        the running context and opens a new one on the same directory -- the
+        profile is what persists, not the process, and a context that keeps the
+        old proxy while the account's lease moves is a context browsing from
+        the wrong address while the ledger records the right one.
         """
-        # Idempotent, and the guard is on the *context*, not the browser. A
-        # persistent context owns its own browser and leaves ``_browser`` as
-        # None, so a check on ``_browser`` would relaunch on every call -- and a
-        # second launch on a directory the first one still holds fails with a
-        # lock error that reads like a corrupt profile.
+        timezone_id = resolve_timezone(egress_country, default=self.timezone_id)
+        session = (proxy, self.locale, timezone_id)
+        # Idempotent for an unchanged session, and the guard is on the *context*,
+        # not the browser. A persistent context owns its own browser and leaves
+        # ``_browser`` as None, so a check on ``_browser`` would relaunch on
+        # every call -- and a second launch on a directory the first one still
+        # holds fails with a lock error that reads like a corrupt profile.
         if self._context is not None or self._browser is not None:
-            self._anchors = anchors
-            return self
+            if self._session_key == session:
+                self._anchors = anchors
+                return self
+            # The egress changed underneath a live context. Proxy and clock are
+            # launch-time facts -- there is no reconfigure, only a relaunch -- and
+            # close() releases the profile's lock, so the new context opens the
+            # same directory with the session's own proxy and the country's own
+            # clock. An egress change with no live context (first launch, or a
+            # previous launch that failed) is not a restart; it just launches.
+            log.info(
+                "relaunching the browser profile: egress changed (%s -> %s)",
+                self._session_key,
+                session,
+            )
+            await self.close()
         self._anchors = anchors
         try:
             from playwright.async_api import async_playwright
@@ -1002,11 +1099,11 @@ class BrowserDriver:
             ) from exc
 
         self._playwright = await async_playwright().start()
-        context_options: dict[str, Any] = {
-            "locale": self.locale,
-            "timezone_id": self.timezone_id,
-            "viewport": {"width": 1280, "height": 900},
-        }
+        context_options: dict[str, Any] = build_context_options(
+            locale=self.locale,
+            timezone_id=timezone_id,
+            proxy_url=proxy,
+        )
         # The full chromium build, not the headless shell: the shell is an
         # optional download that does not land reliably everywhere, and a
         # channel that cannot launch cannot report.
@@ -1058,6 +1155,10 @@ class BrowserDriver:
         # recording requests, which is the same class of silent failure as the
         # original tool.
         self._page.on("response", self._on_response)
+        # Recorded only now, after every fallible step above: a launch that
+        # raised never reaches this line, so the key cannot describe a context
+        # that does not exist.
+        self._session_key = session
         return self
 
     async def close(self) -> None:
@@ -1457,8 +1558,16 @@ class _RecordingDriver:
     def capture(self) -> SubmitCapture:
         return self.inner.capture
 
-    async def start(self, anchors: AnchorSet) -> Any:
-        return await self.inner.start(anchors)
+    async def start(
+        self,
+        anchors: AnchorSet,
+        *,
+        proxy: str | None = None,
+        egress_country: str | None = None,
+    ) -> Any:
+        return await self.inner.start(
+            anchors, proxy=proxy, egress_country=egress_country
+        )
 
     async def read(self, name: str, *, require_enabled: bool) -> str | None:
         found = await self.inner.read(name, require_enabled=require_enabled)
@@ -1664,7 +1773,24 @@ class BrowserChannel:
         # channel failure against Instagram, which is the exact misdiagnosis
         # this project exists to eliminate. Idempotent, so the doctor can start
         # a driver to prove the build launches without starting it twice.
-        await self.driver.start(self.anchors)
+        #
+        # The lease comes along because the session's egress is a launch-time
+        # fact: the browser must browse *through* the address the pool leased,
+        # under the clock of the country that address was observed in. Without
+        # this the click would leave from the operator's own connection while
+        # every record downstream claimed the lease's origin -- a tool whose
+        # evidence names one address and whose traffic uses another is lying
+        # about the one thing it is for. With no lease the session is direct,
+        # and says so by passing nothing.
+        await self.driver.start(
+            self.anchors,
+            proxy=lease.endpoint.url if lease is not None else None,
+            egress_country=(
+                lease.egress.country
+                if lease is not None and lease.egress is not None
+                else None
+            ),
+        )
         await self.driver.goto_profile(target.handle)
 
         for _ in range(wizard.max_observations):

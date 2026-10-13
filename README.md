@@ -32,7 +32,7 @@ success rendering (the opening section), and the absence of an oracle for
 "accepted and discarded".
 
 **No report has ever been filed by this tool against a live Instagram.** The test
-suite is green (1216 tests) and it is green with every channel unable to reach
+suite is green (1244 tests) and it is green with every channel unable to reach
 Instagram. That sentence is the single most important thing on this page.
 
 Items 1–3 need two things that do not exist yet:
@@ -286,6 +286,7 @@ insta_report/
   checkpoint.py  JSONL, fsync per record, intent-before-dispatch
   runner.py      ladder orchestration, dispatch boundary, per-channel health
   browser.py     Playwright channel (the primary path)
+  fingerprint.py egress country -> the browser's clock binding
   api.py         API channel — classifier only, disarmed
   proxies.py     lease pool, health, egress-IP assertion
   accounts.py    budgets, LRU rotation, quarantine 2^n
@@ -307,7 +308,7 @@ docker-compose.yml  bind-mounted config and artifacts, env_file for the secret
 ## Development
 
 ```bash
-.venv\Scripts\python -m pytest              # 1216 tests, offline
+.venv\Scripts\python -m pytest              # 1244 tests, offline
 .venv\Scripts\python -m pytest -m "not static"   # skip pyflakes + mypy
 .venv\Scripts\python -m pytest -m "not browser"   # skip the Chromium tests
 ```
@@ -480,6 +481,43 @@ counts. Point `[proxies] probe_url` elsewhere to pick a different echo: a bare-I
 one (`https://api.ipify.org?format=json`) answers the own-address question and
 nothing else, and with it every address grades `unknown` — a trade you make
 knowingly, not a gap you discover on the third attempt to raise a floor.
+
+## Fingerprint isolation
+
+A session is more than its cookies. Instagram reads the page's clock against
+the address the page arrived on, and a Frankfurt exit browsing under an
+America/New_York timezone — visible to any script through
+`Intl.DateTimeFormat().resolvedOptions().timeZone` — is a louder signal than
+anything the pool's trust tiering measures. Three things keep the signals
+pointing the same way:
+
+- **The browser leaves from the leased address.** Every report passes its
+  lease down to the launch: the proxy URL becomes Chromium's own proxy
+  settings (credentials split out of the URL, because the proxy flag does not
+  carry them), so the click, the probe, and the ledger all name the same
+  egress. Until this existed the browser went out from the operator's own
+  connection while every record named the lease's origin — evidence and
+  traffic disagreeing about the one fact this tool exists to establish. No
+  lease means a direct session, passed as nothing rather than as an empty
+  claim.
+- **The clock follows the egress's country.** `[browser] timezone` omitted
+  means derived — the promise `config.example.toml` always made. The country
+  the pool observed the exit in selects that country's zone from the table in
+  `fingerprint.py`: one representative zone per country, the same one every
+  time, so a sticky exit's clock never moves between runs. A country the
+  table does not know falls back to `[browser] timezone`; a run with no lease
+  falls back to the machine's own zone. Both are stated floors, not guesses —
+  the table is validated entry by entry in the suite, because a typo'd zone
+  would silently degrade to exactly the mismatch it exists to prevent.
+- **The profile is per account, and survives a relaunch.** Proxy and clock
+  are fixed when a context launches, so when a lease rebinds to a new address
+  the context closes and reopens *the same profile directory* with the new
+  egress. The session is the directory, not the process.
+
+The locale deliberately does not follow the country: the wizard's anchors are
+exact English text, and a menu Instagram chooses to localize would be a
+channel that cannot read its own selectors. `[browser] locale` stays the
+operator's setting.
 
 ## Reputation that survives a restart
 

@@ -132,7 +132,8 @@ max_concurrent = 2                   # must be <= number of accounts
 locale = "en-US"
 # timezone omitted => derived from the egress IP geolocation. A Frankfurt exit
 # paired with an America/New_York timezone is one loud correlation across three
-# signals at once.
+# signals at once. An egress country the table in fingerprint.py does not know
+# falls back to this value; a run with no lease falls back to the machine zone.
 # timezone = "Europe/Berlin"
 navigation_timeout_ms = 30000
 confirmation_timeout_ms = 10000

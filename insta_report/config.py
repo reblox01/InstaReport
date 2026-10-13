@@ -130,7 +130,10 @@ class BrowserConfig:
     locale: str = "en-US"
     # None means "derive from the egress IP's geolocation" -- see review
     # finding 10. A residential exit in Frankfurt paired with an en-US
-    # timezone is a single loud correlation across three signals.
+    # timezone is a single loud correlation across three signals. The
+    # derivation lives in fingerprint.py; a country the map does not know
+    # falls back to this value, and a run with no lease at all falls back to
+    # the machine's own zone.
     timezone: str | None = None
     user_data_dir: Path = field(default_factory=lambda: Path(".browser-profile"))
     navigation_timeout_ms: int = 30_000

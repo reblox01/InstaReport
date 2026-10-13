@@ -55,6 +55,7 @@ from insta_report.browser import (
 )
 from insta_report.errors import AccountChallenged, ErrorScope, SessionExpired
 from insta_report.outcomes import TerminalState
+from insta_report.proxies import EgressObservation, ProxyEndpoint, ProxyLease
 from insta_report.support.paths import Paths
 from insta_report.targets import Target
 
@@ -120,6 +121,10 @@ class FakeDriver:
         if not pages:
             raise ValueError("a scenario needs at least one page")
         self.pages = list(pages)
+        #: The keyword arguments the channel last started this driver with --
+        #: the session's egress. Recorded so a test can assert what the driver
+        #: was told, not merely that it was told something.
+        self.started_with: dict[str, Any] = {}
         self.capture = capture if capture is not None else SubmitCapture()
         #: What the page shows after the submit click, one entry per reading.
         #: This is the only way a post-submit flow that re-renders -- a toast
@@ -255,9 +260,10 @@ class FakeDriver:
     async def close(self) -> None:
         self.events.append("close")
 
-    async def start(self, anchors) -> "FakeDriver":
+    async def start(self, anchors, **kwargs) -> "FakeDriver":
         self._maybe_fail("start")
         self.events.append("start")
+        self.started_with = dict(kwargs)
         return self
 
 
@@ -688,8 +694,20 @@ class TestOutcomeBookkeeping:
         class Lease:
             lease_id = "lease-abc"
             endpoint = type(
-                "E", (), {"origin": "http://203.0.113.10:8080"}
+                "E",
+                (),
+                {
+                    "origin": "http://203.0.113.10:8080",
+                    # The channel passes endpoint.url to the browser as the
+                    # proxy to launch on, so a stub without it is not a lease
+                    # the channel accepts -- same contract as egress below.
+                    "url": "http://203.0.113.10:8080",
+                },
             )()
+            # The channel reads the observed egress off the lease to bind the
+            # driver's clock, so a stub without it is not a lease the channel
+            # accepts -- which is the field's contract, pinned by this line.
+            egress = None
 
         driver = FakeDriver(happy_pages())
         outcome = await a_channel(driver).report(
@@ -938,6 +956,78 @@ class TestTheChannelOwnsItsDriverLifecycle:
             asyncio.run(channel.report(a_target(), on_dispatch=lambda: None))
         # And it did not get as far as pretending to look at the page.
         assert "close" not in driver.events
+
+
+def a_lease(
+    *, url: str = "http://user:pw@203.0.113.9:8080", country: str | None = "DE"
+) -> ProxyLease:
+    """A real lease with the two fields the channel reads off it."""
+    return ProxyLease(
+        lease_id="lease-1",
+        endpoint=ProxyEndpoint(url=url),
+        sticky_expires_at=4_102_444_800.0,  # 2100-01-01, far beyond any run
+        acquired_at=0.0,
+        egress=EgressObservation(ip="203.0.113.9", country=country),
+    )
+
+
+class TestTheDriverStartsOnTheLeasesEgress:
+    """The browser must leave from the address the records say it left from.
+
+    Before this seam existed the channel started its driver with no proxy and
+    no country at all: the click went out from the operator's own connection
+    while every artifact, every probe line, and every ledger entry named the
+    lease's origin. A tool whose evidence and traffic disagree about the one
+    fact it exists to establish is worse than one that proxies nothing, so
+    the channel passes the lease's URL and the observed country down to the
+    launch, and a test pins each field of that handoff.
+    """
+
+    def test_a_lease_reaches_the_driver_as_proxy_and_country(self):
+        driver = FakeDriver(happy_pages())
+        channel = a_channel(driver)
+        report = asyncio.run(
+            channel.report(a_target(), on_dispatch=lambda: None, lease=a_lease())
+        )
+        assert report.was_dispatched
+        assert driver.started_with == {
+            "proxy": "http://user:pw@203.0.113.9:8080",
+            "egress_country": "DE",
+        }
+
+    def test_no_lease_starts_the_session_direct(self):
+        """Direct has to mean direct, loudly, by passing nothing.
+
+        An empty-string proxy or a fabricated country would both be claims --
+        "there is an egress" -- when there is none. The absence of the lease
+        is the fact, and None is how it is carried.
+        """
+        driver = FakeDriver(happy_pages())
+        channel = a_channel(driver)
+        asyncio.run(channel.report(a_target(), on_dispatch=lambda: None))
+        assert driver.started_with == {"proxy": None, "egress_country": None}
+
+    def test_a_lease_whose_egress_was_never_observed_keeps_the_proxy_only(
+        self,
+    ):
+        """An unprobed lease still routes; it just claims no geography.
+
+        ``egress`` is None when the probe never returned an observation. The
+        proxy is still real -- the URL came from the file -- but the country
+        is a fact we do not have, and inventing one would give the driver a
+        timezone to bind to that no probe ever confirmed.
+        """
+        driver = FakeDriver(happy_pages())
+        channel = a_channel(driver)
+        asyncio.run(
+            channel.report(
+                a_target(), on_dispatch=lambda: None, lease=a_lease(country=None)
+            )
+        )
+        assert driver.started_with == {
+            "proxy": "http://user:pw@203.0.113.9:8080",
+            "egress_country": None,
+        }
 
 
 class TestAnUnstartedDriverSaysSo:

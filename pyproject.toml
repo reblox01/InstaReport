@@ -31,6 +31,13 @@ dev = [
     # tests/test_static_gates.py asserts this list, so removing it is a test
     # failure rather than a silent loss of the check.
     "mypy>=1.8",
+    # Zone-name validation for the egress->timezone map in fingerprint.py.
+    # Windows ships no system tz database, so zoneinfo raises there without
+    # this; Linux and macOS use their own system data and ignore it. Declared
+    # with a platform marker so CI does not carry a second copy of the
+    # database, and because tests/test_fingerprint.py refuses to skip: a
+    # typo'd zone name in the map must fail somewhere, not everywhere.
+    "tzdata ; sys_platform == 'win32'",
 ]
 
 [project.scripts]
