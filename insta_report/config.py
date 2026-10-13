@@ -195,6 +195,11 @@ class RunConfig:
     # "send every 2 seconds" while the tool sends every 8 is a lie in a file.
     floor_gap_seconds: float = 30.0
     jitter_fraction: float = 0.25
+    #: Probability a gap is stretched 1.5-3.5x by a human-shaped pause. The
+    #: product default is deliberately on: a cadence with a ceiling on every
+    #: gap is periodic however wide the band, and the budget this stretches
+    #: against is self-imposed. Set 0 to get the raw derived schedule.
+    pause_chance: float = 0.10
     #: Per-step damping factor, NOT the fraction of the horizon the run will
     #: use. It compounds, because the gap is recomputed against a shrinking
     #: horizon each step. See :class:`insta_report.pacing.PacingConfig`.
@@ -470,6 +475,10 @@ def _load_run(reader: _Reader) -> RunConfig:
             "your config did not ask for. Lower it, or raise the cap deliberately."
         )
     jitter = reader.float_("jitter_fraction", 0.25, minimum=0.0, maximum=1.0)
+    # Default 0.10 here, not 0: this is where operator-facing defaults live
+    # (the dataclass default of 0 exists so tests and seeded replays are
+    # deterministic). An operator who wants the raw schedule types 0.
+    pause_chance = reader.float_("pause_chance", 0.10, minimum=0.0, maximum=1.0)
     horizon_fraction = reader.float_("horizon_fraction", 0.85, minimum=0.01, maximum=0.99)
 
     # None rather than a default, so the CLI can tell "not set here" from "set
@@ -492,6 +501,7 @@ def _load_run(reader: _Reader) -> RunConfig:
         max_concurrent=max_concurrent,
         floor_gap_seconds=floor_gap,
         jitter_fraction=jitter,
+        pause_chance=pause_chance,
         horizon_fraction=horizon_fraction,
         narrative_seed=reader.str_("narrative_seed") or "",
         max_detail_length=reader.int_("max_detail_length", 400, minimum=1),

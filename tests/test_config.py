@@ -198,6 +198,7 @@ exit_rotations = 4
 channel_failure_threshold = 9
 floor_gap_seconds = 45
 jitter_fraction = 0.5
+pause_chance = 0.3
 horizon_fraction = 0.6
 narrative_seed = "seeded"
 max_detail_length = 120
@@ -211,6 +212,7 @@ max_detail_length = 120
     assert run.channel_failure_threshold == 9
     assert run.floor_gap_seconds == 45.0
     assert run.jitter_fraction == 0.5
+    assert run.pause_chance == 0.3
     assert run.horizon_fraction == 0.6
     assert run.narrative_seed == "seeded"
     assert run.max_detail_length == 120
@@ -268,7 +270,7 @@ def test_a_pacing_floor_above_the_cap_is_refused(
         load_config(_write(body))
 
 
-@pytest.mark.parametrize("key", ["jitter_fraction", "horizon_fraction"])
+@pytest.mark.parametrize("key", ["jitter_fraction", "horizon_fraction", "pause_chance"])
 def test_out_of_range_pacing_fractions_are_refused(
     key, base_config_toml, proxy_file, session_env
 ):

@@ -292,6 +292,7 @@ def _pacer_factory(config: Config) -> Callable[[], Pacer]:
     pacing = PacingConfig(
         floor_gap=config.run.floor_gap_seconds,
         jitter_fraction=config.run.jitter_fraction,
+        pause_chance=config.run.pause_chance,
         horizon_fraction=config.run.horizon_fraction,
         default_horizon_seconds=config.run.horizon_seconds,
     )

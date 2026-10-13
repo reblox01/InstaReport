@@ -24,6 +24,11 @@ Everything is measured with :func:`time.monotonic`. A wall clock would let an NT
 correction or a DST transition double a gap or collapse one to zero, and a
 collapsed gap is indistinguishable from not pacing at all. The clock is
 injectable so the tests can run years of schedule in microseconds.
+
+On top of the derivation sits the part that is not arithmetic: uniform jitter,
+and — with :attr:`PacingConfig.pause_chance` — an occasional pause a person
+would take. A schedule with a ceiling on every gap is periodic however wide
+the band, and periodicity is the signal, not slowness.
 """
 
 from __future__ import annotations
@@ -36,7 +41,13 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-__all__ = ["Pacer", "PacingConfig", "MIN_GAP_SECONDS"]
+__all__ = [
+    "Pacer",
+    "PacingConfig",
+    "MIN_GAP_SECONDS",
+    "PAUSE_STRETCH_MIN",
+    "PAUSE_STRETCH_MAX",
+]
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +65,15 @@ MIN_GAP_SECONDS = 8.0
 #: per report, so an hour is generous headroom that only a genuinely
 #: over-provisioned run reaches.
 MAX_GAP_SECONDS = 3600.0
+
+#: The pause multiplier band. When a pause fires (see
+#: :attr:`PacingConfig.pause_chance`) the gap is multiplied by a uniform draw
+#: from this range. Multiplicative so it scales with the cadence it lands on:
+#: a pause on top of a 15-minute gap is a coffee break, on top of the 8-second
+#: floor it is a glance away. The pair (chance, stretch) is chosen so the
+#: throughput cost stays near 15% -- see ``compute_gap``.
+PAUSE_STRETCH_MIN = 1.5
+PAUSE_STRETCH_MAX = 3.5
 
 
 @dataclass(frozen=True)
@@ -76,6 +96,17 @@ class PacingConfig:
 
     floor_gap: float = 30.0
     jitter_fraction: float = 0.25
+    #: Probability that a gap is stretched by a human-sized factor
+    #: (:data:`PAUSE_STRETCH_MIN`..:data:`PAUSE_STRETCH_MAX`), drawn after
+    #: the jitter so a pause is a pause on top of the normal variation.
+    #:
+    #: Zero here on purpose. This is the library component, and a default that
+    #: draws from the generator would change every seeded schedule in every
+    #: test and every incident replay -- a coin no test can pin. The *product*
+    #: default is 0.10, set where operator config is parsed (``[run]
+    #: pause_chance``): the tool humanizes by default, the component does it
+    #: only when asked, and the two defaults are one line apart in cli.py.
+    pause_chance: float = 0.0
     #: Share of the remaining horizon one report's gap is allowed to claim.
     horizon_fraction: float = 0.85
     #: Used when no horizon is supplied -- an attended run is assumed to be
@@ -163,7 +194,23 @@ class Pacer:
 
         jitter = base * cfg.jitter_fraction
         gap = base + self._rng.uniform(-jitter, jitter)
-        return max(MIN_GAP_SECONDS, gap)
+
+        # The part arithmetic cannot derive: a person steps away from the
+        # task. Without this every gap sits inside one narrow band -- however
+        # wide the band -- and a band has a ceiling, which is periodicity with
+        # better manners. With probability pause_chance the gap stretches by
+        # a human-sized factor instead. Multiplicative, so the pause scales
+        # with the cadence it lands on. At the shipped pairing (0.10 chance,
+        # 1.5-3.5x) this costs about 15% of throughput: the price of not
+        # being periodic, against a budget that is self-imposed anyway.
+        if cfg.pause_chance > 0.0 and self._rng.random() < cfg.pause_chance:
+            gap *= self._rng.uniform(PAUSE_STRETCH_MIN, PAUSE_STRETCH_MAX)
+
+        # Both clamps on the final figure rather than the base, because the
+        # base is not what the schedule waits: jitter can push a capped base
+        # back over MAX, and a pause multiplies whatever it is handed. The
+        # contract is about the gap, so the gap is what gets bounded.
+        return min(MAX_GAP_SECONDS, max(MIN_GAP_SECONDS, gap))
 
     # -- waiting --------------------------------------------------------
 

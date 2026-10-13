@@ -328,6 +328,107 @@ def test_jitter_never_pushes_below_the_absolute_minimum():
         assert gap >= MIN_GAP_SECONDS
 
 
+# --- human-shaped pauses ----------------------------------------------------
+
+
+def test_pause_chance_zero_keeps_every_gap_exactly_on_the_derived_figure():
+    """The library default, and the reason it is zero.
+
+    A pause that fires from an invisible coin would make every seeded
+    schedule -- and every incident replayed from one -- a different schedule
+    each run. With chance 0 the generator is not even consulted for the
+    pause, so the sequence is bit-identical to what it was before pauses
+    existed.
+    """
+    pacer = make_pacer(jitter_fraction=0.0, floor_gap=30.0, pause_chance=0.0)
+    gaps = [
+        pacer.compute_gap(
+            budget_remaining=100, budget_total=100, horizon_remaining=10 * 60.0
+        )
+        for _ in range(50)
+    ]
+    assert set(gaps) == {30.0}
+
+
+def test_when_the_pause_draw_fires_the_gap_stretches_human_sized():
+    """Chance 1.0, so every gap is a pause and the band is checkable."""
+    pacer = make_pacer(jitter_fraction=0.0, floor_gap=60.0, pause_chance=1.0)
+    gaps = [
+        pacer.compute_gap(
+            budget_remaining=100, budget_total=100, horizon_remaining=10 * 60.0
+        )
+        for _ in range(200)
+    ]
+    assert all(60.0 * 1.5 <= g <= 60.0 * 3.5 for g in gaps), (min(gaps), max(gaps))
+    assert len(set(gaps)) > 1, "a pause band that never varies is a constant"
+
+
+def test_the_product_default_pauses_about_one_gap_in_ten():
+    """The shipped pairing, pinned statistically so it cannot drift.
+
+    ``config.run`` defaults pause_chance to 0.10 and the stretch band is
+    1.5-3.5x, so in a floor regime one gap in ten should sit above
+    base*1.5 and nine in ten should sit exactly on base. A change to either
+    default moves this count, and should -- silently moving it would change
+    every operator's cadence at once.
+    """
+    pacer = make_pacer(jitter_fraction=0.0, floor_gap=30.0, pause_chance=0.10)
+    gaps = [
+        pacer.compute_gap(
+            budget_remaining=100, budget_total=100, horizon_remaining=10 * 60.0
+        )
+        for _ in range(2000)
+    ]
+    paused = [g for g in gaps if g > 30.0 * 1.5]
+    assert 100 < len(paused) < 400, len(paused)
+
+
+def test_the_shipped_pairing_costs_about_fifteen_percent_throughput():
+    """The documented cost of not being periodic, asserted rather than asserted
+    in prose.
+
+    Chance 0.10 with a 1.5-3.5x stretch has mean multiplier
+    1 + 0.10 * (2.5 - 1) = 1.15. If a future change to either number moves
+    this, the README's "~15%" is suddenly a lie and the horizon a 20-report
+    budget fits in has moved too -- both worth a failing test over.
+    """
+    pacer = make_pacer(jitter_fraction=0.0, floor_gap=30.0, pause_chance=0.10)
+    gaps = [
+        pacer.compute_gap(
+            budget_remaining=100, budget_total=100, horizon_remaining=10 * 60.0
+        )
+        for _ in range(5000)
+    ]
+    assert (sum(gaps) / len(gaps)) / 30.0 == pytest.approx(1.15, abs=0.05)
+
+
+def test_a_pause_is_capped_by_max_gap_even_at_the_top_of_its_band():
+    """The stretch multiplies a near-cap base into four figures; the contract
+    is that no gap ever exceeds the cap, and the cap is on the *gap*."""
+    pacer = make_pacer(jitter_fraction=0.0, floor_gap=3000.0, pause_chance=1.0)
+    for _ in range(50):
+        gap = pacer.compute_gap(
+            budget_remaining=100, budget_total=100, horizon_remaining=10 * 60.0
+        )
+        assert gap <= MAX_GAP_SECONDS
+
+
+def test_jitter_alone_cannot_push_a_capped_gap_over_max():
+    """A pre-existing hole this change closed: the cap was applied to the
+    base, then jitter could carry the waiting figure 25% past it."""
+    pacer = Pacer(
+        PacingConfig(floor_gap=MAX_GAP_SECONDS, jitter_fraction=0.25),
+        monotonic=FakeClock(),
+        rng=random.Random(11),
+    )
+    for _ in range(100):
+        gap = pacer.compute_gap(
+            budget_remaining=500, budget_total=500, horizon_remaining=10 * 60.0
+        )
+        assert gap <= MAX_GAP_SECONDS
+        assert gap >= MIN_GAP_SECONDS
+
+
 # --- waiting ----------------------------------------------------------------
 
 

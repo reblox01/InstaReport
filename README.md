@@ -32,7 +32,7 @@ success rendering (the opening section), and the absence of an oracle for
 "accepted and discarded".
 
 **No report has ever been filed by this tool against a live Instagram.** The test
-suite is green (1244 tests) and it is green with every channel unable to reach
+suite is green (1251 tests) and it is green with every channel unable to reach
 Instagram. That sentence is the single most important thing on this page.
 
 Items 1–3 need two things that do not exist yet:
@@ -291,7 +291,7 @@ insta_report/
   proxies.py     lease pool, health, egress-IP assertion
   accounts.py    budgets, LRU rotation, quarantine 2^n
   reputation.py  budgets and failure streaks, across restarts
-  pacing.py      monotonic, budget-derived cadence
+  pacing.py      monotonic, budget-derived cadence, human-shaped pauses
   anchors.py     the selector oracle + drift reporting
   artifacts.py   evidence bundles, redacted on write
   narrative.py   report text rendering
@@ -308,7 +308,7 @@ docker-compose.yml  bind-mounted config and artifacts, env_file for the secret
 ## Development
 
 ```bash
-.venv\Scripts\python -m pytest              # 1244 tests, offline
+.venv\Scripts\python -m pytest              # 1251 tests, offline
 .venv\Scripts\python -m pytest -m "not static"   # skip pyflakes + mypy
 .venv\Scripts\python -m pytest -m "not browser"   # skip the Chromium tests
 ```
@@ -518,6 +518,34 @@ The locale deliberately does not follow the country: the wizard's anchors are
 exact English text, and a menu Instagram chooses to localize would be a
 channel that cannot read its own selectors. `[browser] locale` stays the
 operator's setting.
+
+## A cadence that is not a metronome
+
+The gap between reports is *derived* — budget left against horizon left, so
+an account slows down before it stops — and then it is humanized, because a
+derived schedule is still a schedule:
+
+- **Jitter** (`jitter_fraction`, default 0.25) perturbs every gap by up to a
+  quarter in either direction.
+- **Pauses** (`pause_chance`, default 0.10) stretch roughly one gap in ten by
+  1.5–3.5×. A band with a ceiling is periodic however wide the band, and
+  periodicity is the signal, not slowness — the pause is the coffee break a
+  person takes and a metronome never does. The shipped pairing costs about
+  15% of throughput: the price of not being periodic, against a budget that
+  is self-imposed anyway. `pause_chance = 0` returns the raw derived
+  schedule.
+- **The floor and the cap bind the final figure** — pause and jitter
+  included. No configuration, seed, or draw schedules a gap under 8 seconds
+  or over an hour; the clamp sits after the randomness, not before it.
+
+The component itself defaults `pause_chance` to 0, because a seeded pacer
+must replay identically or an incident cannot be reconstructed; the product
+default of 0.10 is set where operator config is parsed, one line apart in
+`cli.py` deliberately.
+
+What this does not do: model time of day. A run that files at 4 a.m. files
+at 4 a.m. — the tool paces inside the horizon it was given, and choosing
+that horizon is the operator's clock.
 
 ## Reputation that survives a restart
 

@@ -176,6 +176,9 @@ channel_failure_threshold = 3         # consecutive no-dispatch failures before 
 # because a burst is the shape of a challenge.
 floor_gap_seconds = 30
 jitter_fraction = 0.25                # 0..1, randomness on top of the derived gap
+pause_chance = 0.10                   # 0..1, chance a gap is stretched 1.5-3.5x by a
+                                      # human-shaped pause. Costs ~15% of throughput;
+                                      # 0 gives the raw derived schedule.
 horizon_fraction = 0.85               # per-step damping factor, NOT a utilisation target.
                                      # It compounds, because the gap is recomputed
                                      # against a shrinking horizon at each step.
