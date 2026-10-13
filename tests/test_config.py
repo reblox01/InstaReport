@@ -106,6 +106,34 @@ def test_boolean_is_not_accepted_as_an_integer(base_config_toml, proxy_file, ses
         load_config(_write(body))
 
 
+def test_warmup_floor_round_trips_from_the_account_table(
+    base_config_toml, proxy_file, session_env
+):
+    config = load_config(_write(base_config_toml))
+    assert config.accounts[0].warmup_floor == 0
+
+
+def test_warmup_floor_defaults_to_three_when_the_line_is_absent(
+    base_config_toml, proxy_file, session_env
+):
+    """The product default is *on*. A config that says nothing about
+    warming still warms: the ramp is this tool's default restraint, not an
+    opt-in the uninformed operator has to discover (0 is the opt-out)."""
+    body = base_config_toml.replace("warmup_floor = 0\n", "")
+    assert "warmup_floor = " not in body, "the line should be gone, not duplicated"
+    config = load_config(_write(body))
+    assert config.accounts[0].warmup_floor == 3
+
+
+def test_a_negative_warmup_floor_is_refused(
+    base_config_toml, proxy_file, session_env
+):
+    """Negative headroom is nonsense; the reader's floor is 0 = ramp off."""
+    body = base_config_toml.replace("warmup_floor = 0", "warmup_floor = -1")
+    with pytest.raises(ConfigError, match=r"warmup_floor must be >= 0"):
+        load_config(_write(body))
+
+
 # --- proxies ----------------------------------------------------------------
 
 

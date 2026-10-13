@@ -194,6 +194,7 @@ def _build_accounts(config: Config) -> AccountPool:
             username=entry.username,
             sessionid=entry.sessionid,
             daily_budget=entry.daily_budget,
+            warmup_floor=entry.warmup_floor,
             enabled=entry.enabled,
         )
         for entry in config.active_accounts

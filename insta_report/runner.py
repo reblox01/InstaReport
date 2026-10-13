@@ -518,12 +518,12 @@ class _Slot:
         if self.lease is None:
             return 0
         account = self._pool.get(self.lease.account_ref)
-        return max(0, account.daily_budget - account.used_today)
+        return max(0, account.effective_budget - account.used_today)
 
     def budget_total(self) -> int:
         if self.lease is None:
             return 0
-        return self._pool.get(self.lease.account_ref).daily_budget
+        return self._pool.get(self.lease.account_ref).effective_budget
 
     def needs_binding(self) -> bool:
         if self.lease is None:

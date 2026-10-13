@@ -62,6 +62,10 @@ data_dir = "{data_dir}"
 username = "reporter.one"
 sessionid_env = "IG_SESSIONID_ALPHA"
 daily_budget = 20
+# Ramp off: this template pins dispatch/rotation behaviour at a known
+# budget (test_cli asserts what a run dispatches). The warming ramp has
+# its own tests; set warmup_floor to exercise it here.
+warmup_floor = 0
 
 [proxies]
 source = "file"
@@ -776,6 +780,40 @@ class TestReputationPersistence:
         )
         assert code == 0, output
         assert "account reputation was not saved" in output
+
+
+# --- warming ----------------------------------------------------------------
+
+
+class TestTheWarmingFloorReachesThePool:
+    def test_config_reaches_the_account_and_gates_a_fresh_identity(self, workspace):
+        """The passthrough in ``_build_accounts``: config says 7, the pool's
+        fresh account enforces 7. Config parsed but not passed would leave
+        the ramp silently off, and a gate that is silently off is a gate
+        nobody installed."""
+        from insta_report.cli import _build_accounts
+        from insta_report.config import load_config
+
+        body = workspace.config.read_text(encoding="utf-8").replace(
+            "warmup_floor = 0", "warmup_floor = 7"
+        )
+        workspace.config.write_text(body, encoding="utf-8")
+
+        account = _build_accounts(load_config(workspace.config)).get("alpha")
+        assert account.warmup_floor == 7
+        assert account.effective_budget == 7
+        assert account.remaining == 7
+
+    def test_the_template_opt_out_reaches_the_pool_too(self, workspace):
+        """Every other test here dispatches against a known ceiling through
+        this template; this pins the wiring that keeps them true."""
+        from insta_report.cli import _build_accounts
+        from insta_report.config import load_config
+
+        account = _build_accounts(load_config(workspace.config)).get("alpha")
+        assert account.warmup_floor == 0
+        assert account.effective_budget == 20
+        assert not account.warming
 
 
 # --- read-only commands ----------------------------------------------------

@@ -32,7 +32,7 @@ success rendering (the opening section), and the absence of an oracle for
 "accepted and discarded".
 
 **No report has ever been filed by this tool against a live Instagram.** The test
-suite is green (1251 tests) and it is green with every channel unable to reach
+suite is green (1266 tests) and it is green with every channel unable to reach
 Instagram. That sentence is the single most important thing on this page.
 
 Items 1–3 need two things that do not exist yet:
@@ -289,7 +289,7 @@ insta_report/
   fingerprint.py egress country -> the browser's clock binding
   api.py         API channel — classifier only, disarmed
   proxies.py     lease pool, health, egress-IP assertion
-  accounts.py    budgets, LRU rotation, quarantine 2^n
+  accounts.py    budgets, warming ramp, LRU rotation, quarantine 2^n
   reputation.py  budgets and failure streaks, across restarts
   pacing.py      monotonic, budget-derived cadence, human-shaped pauses
   anchors.py     the selector oracle + drift reporting
@@ -308,7 +308,7 @@ docker-compose.yml  bind-mounted config and artifacts, env_file for the secret
 ## Development
 
 ```bash
-.venv\Scripts\python -m pytest              # 1251 tests, offline
+.venv\Scripts\python -m pytest              # 1266 tests, offline
 .venv\Scripts\python -m pytest -m "not static"   # skip pyflakes + mypy
 .venv\Scripts\python -m pytest -m "not browser"   # skip the Chromium tests
 ```
@@ -583,6 +583,33 @@ old file or the new one, never a truncated one. The save is best effort — if
 it fails, the run warns and keeps its own result, because the checkpoint, not
 this file, owns the question of what was dispatched. A dry run writes nothing
 at all.
+
+## A ramp before the full budget
+
+A brand-new identity should not spend its first day like an established one's
+tenth. So the daily budget has two numbers now: the ceiling you configure
+(`daily_budget`, still default 20) and what today's budget actually *is* —
+
+- **The ramp is `min(ceiling, floor + lifetime)`**, where *lifetime* is what
+  the account has ever filed **through this tool**, counted before today. A
+  fresh account starts the day at `warmup_floor` (default 3) and earns one
+  report of headroom per report filed; with the defaults it reaches the
+  ceiling on day four (3 → 6 → 12 → 20). Mid-day the figure cannot move — the ramp keys on
+  lifetime at day start, because a cap that grew with its own spending
+  would gate nothing.
+- **Self-imposed, like every other budget here.** Nothing claims 3/day is
+  Instagram's limit; it is this tool refusing to spend a new account's
+  first day like an old one's. And no provenance claim beats a record: an
+  account with a long life elsewhere still starts at the floor here,
+  because the only history the gate can trust is the one this tool kept —
+  which is also why a deleted reputation file restarts the ramp, honestly
+  rather than silently.
+- **One knob, one truth.** `[accounts.<ref>] warmup_floor`, default 3; `0`
+  disables the ramp for operators who know their accounts and do not want
+  the gate. Every layer reads the same effective figure — the eligibility
+  gate, the reason an account gives when it stops (`daily budget spent
+  (3/3), warming toward 20`), and the budget the pacer is fed — so no layer
+  can spend what the ramp refused.
 
 ## Legacy
 

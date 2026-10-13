@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 
 import pytest
 
-from insta_report.accounts import Account, AccountPool
+from insta_report.accounts import Account, AccountPool, Lease
 from insta_report.checkpoint import CheckpointStore
 from insta_report.doctor import ChannelProbe
 from insta_report.errors import (
@@ -55,6 +55,7 @@ from insta_report.runner import (
     NoChannelsAvailable,
     RunOptions,
     Runner,
+    _Slot,
 )
 from insta_report.targets import Target, TargetList
 
@@ -728,6 +729,56 @@ class TestTheDispatchBoundary:
         await runner.run()
         assert observed == [0], "the account was billed before the click"
         assert pool.get("alpha").used_today == 1
+
+    async def test_the_warming_floor_caps_a_run_the_ceiling_would_allow(
+        self, tmp_path
+    ):
+        """End to end: five targets, ceiling 20, warming floor 3.
+
+        The run stops after three dispatches -- not because the ceiling was
+        spent, which it was not, but because the ramp holds a fresh account
+        at its floor. Every layer reads the same effective figure: the
+        account's gate, the slot the pacer is fed from, and the ledger that
+        ends up recording three, so no layer can spend what the ramp
+        refused.
+        """
+        clock = Clock()
+        pool = make_pool("alpha", clock=clock, budget=20, warmup_floor=3)
+        channel = FakeChannel("browser")
+        runner, _, _ = a_runner(
+            tmp_path,
+            channels=[channel],
+            pool=pool,
+            targets=make_targets("a", "b", "c", "d", "e"),
+            clock=clock,
+        )
+        report = await runner.run()
+        assert len(channel.calls) == 3, "the ramp, not the ceiling, stopped the run"
+        assert report.aborted, "the run must say it stopped early, not imply five went out"
+        assert "no eligible account" in report.abort_reason.lower()
+        account = pool.get("alpha")
+        assert account.used_today == 3
+        assert account.total_reports == 3
+        assert account.budget_spent
+        assert account.effective_budget == 3
+
+    def test_the_slot_paces_from_the_effective_budget_not_the_ceiling(self):
+        """The slot is what feeds the pacer (``budget_remaining`` /
+        ``budget_total``). If it still read the ceiling, a warming account's
+        gaps would be sized for twenty reports while eligibility gates at
+        three -- dispatched and paced by two different budgets, with the
+        pacing half claiming headroom that does not exist.
+        """
+        clock = Clock()
+        pool = make_pool("alpha", clock=clock, budget=20, warmup_floor=3)
+        slot = _Slot(0, pool=pool, proxies=None, held=set(), monotonic=clock)
+        slot.lease = Lease(lease_id="l-1", account_ref="alpha", proxy=None)
+
+        assert slot.budget_total() == 3
+        assert slot.budget_remaining() == 3
+        pool.get("alpha").count_dispatch()
+        assert slot.budget_remaining() == 2
+        assert slot.budget_total() == 3, "mid-day the total does not creep up"
 
     async def test_one_intent_produces_exactly_one_outcome(self, tmp_path):
         # The invariant --resume depends on. Checked by reading the ledger, not

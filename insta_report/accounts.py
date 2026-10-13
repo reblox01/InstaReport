@@ -78,6 +78,11 @@ class Account:
     username: str
     sessionid: str = field(repr=False, default="")
     daily_budget: int = 20
+    #: Day-one floor of the warming ramp; 0 disables it. The product default
+    #: of 3 lives in config parsing (``[accounts.<ref>] warmup_floor``) -- a
+    #: hand-built account runs exactly what it was configured with, and the
+    #: ramp is a product decision, not a component one.
+    warmup_floor: int = 0
     enabled: bool = True
 
     # -- runtime state -------------------------------------------------
@@ -106,12 +111,56 @@ class Account:
         return True
 
     @property
+    def lifetime_at_day_start(self) -> int:
+        """Reports this account has ever filed, counted before today's.
+
+        ``total_reports`` grows with every dispatch and never resets;
+        ``used_today`` resets at the rollover. Their difference is the
+        lifetime total as it stood when the calendar day began -- constant
+        for the whole day (both increment together), which is precisely the
+        snapshot the warming ramp needs, derived rather than stored: nothing
+        can desynchronise a value that is not kept.
+        """
+        return max(0, self.total_reports - self.used_today)
+
+    @property
+    def effective_budget(self) -> int:
+        """What today's budget actually is: the configured ceiling, or the
+        warming ramp's smaller figure while the account is still earning it.
+
+        ``min(ceiling, floor + lifetime)`` -- one more report of headroom per
+        report the account has ever filed through this tool. A fresh account
+        starts the day at ``warmup_floor`` and reaches ``daily_budget`` on
+        its own history alone; mid-day the figure cannot move, because
+        lifetime-at-day-start ignores today's dispatches (a cap that grew
+        with its own spending would not gate anything). Floor 0 returns the
+        ceiling unchanged.
+
+        This is the tool's own restraint, not Instagram's limit: a
+        self-imposed budget that refuses to spend a brand-new identity's
+        first day like an established one's tenth. The ramp key is history
+        this tool kept -- an account with a long life elsewhere still starts
+        at the floor here, because no provenance claim beats a record.
+        """
+        if self.warmup_floor <= 0:
+            return self.daily_budget
+        return min(
+            self.daily_budget,
+            self.warmup_floor + self.lifetime_at_day_start,
+        )
+
+    @property
+    def warming(self) -> bool:
+        """Whether the ramp is holding today's budget below the ceiling."""
+        return self.effective_budget < self.daily_budget
+
+    @property
     def remaining(self) -> int:
-        return max(0, self.daily_budget - self.used_today)
+        return max(0, self.effective_budget - self.used_today)
 
     @property
     def budget_spent(self) -> bool:
-        return self.used_today >= self.daily_budget
+        return self.used_today >= self.effective_budget
 
     # -- eligibility ---------------------------------------------------
 
@@ -140,7 +189,10 @@ class Account:
         if not self.enabled:
             return "disabled in config"
         if self.budget_spent:
-            return f"daily budget spent ({self.used_today}/{self.daily_budget})"
+            message = f"daily budget spent ({self.used_today}/{self.effective_budget})"
+            if self.warming:
+                message += f", warming toward {self.daily_budget}"
+            return message
         if self.quarantined_at(now):
             return f"quarantined for another {self.quarantine_remaining(now):.0f}s"
         return None
@@ -200,7 +252,9 @@ class Account:
             "username": self.username,
             "enabled": self.enabled,
             "used_today": self.used_today,
-            "daily_budget": self.daily_budget,
+            "daily_budget": self.effective_budget,
+            "daily_budget_ceiling": self.daily_budget,
+            "warming": self.warming,
             "remaining": self.remaining,
             "total_reports": self.total_reports,
             "total_acked": self.total_acked,

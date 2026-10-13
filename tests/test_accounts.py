@@ -238,6 +238,113 @@ def test_rolled_account_becomes_eligible_again_uses_pool_clock():
     assert pool.lease() is not None
 
 
+# --- warming ramp -----------------------------------------------------------
+
+
+def test_a_fresh_account_starts_the_ramp_at_the_floor():
+    """The gate itself: a never-used identity does not get day one at the ceiling."""
+    account = make_account(budget=20, warmup_floor=3)
+    assert account.effective_budget == 3
+    assert account.remaining == 3
+    assert account.warming
+    assert not account.budget_spent
+
+
+def test_floor_zero_is_the_library_default_and_leaves_the_ceiling_alone():
+    """The documented split, pinned: the component runs what it was given.
+
+    The product default of 3 lives in config parsing; a hand-built account --
+    every fixture, every seeded replay -- behaves exactly as configured, so
+    the ramp cannot silently rewrite the arithmetic of a test that never
+    asked for it.
+    """
+    account = make_account(budget=20)
+    assert account.warmup_floor == 0
+    assert account.effective_budget == 20
+    assert not account.warming
+    assert account.remaining == 20
+
+
+def test_the_ramp_earns_one_report_of_headroom_per_report_filed():
+    """Day 1 files its floor; each rollover the budget has grown by exactly
+    what the account actually filed, until the ceiling stops it."""
+    account = make_account(budget=20, warmup_floor=3)
+
+    for _ in range(3):
+        account.count_dispatch()
+    assert account.budget_spent, "day one stops at the floor (3/3)"
+
+    account.roll_day_if_needed(account.day + timedelta(days=1))
+    assert account.effective_budget == 6, "3 of floor plus 3 filed yesterday"
+    for _ in range(6):
+        account.count_dispatch()
+    assert account.budget_spent, "day two stops at 9 lifetime / cap 6+3"
+
+    account.roll_day_if_needed(account.day + timedelta(days=1))
+    assert account.effective_budget == 12  # 3 + 9 filed
+    for _ in range(12):
+        account.count_dispatch()
+
+    account.roll_day_if_needed(account.day + timedelta(days=1))
+    assert account.effective_budget == 20, "3 + 21 is past the ceiling; cap it"
+    assert not account.warming, "the ramp is finished and must say so"
+
+
+def test_the_cap_never_moves_within_its_own_day():
+    """A cap that grew with its own spending would gate nothing.
+
+    File one report and the naive ``floor + total_reports`` figure rises
+    with you -- remaining never drops below the floor, and the account can
+    file forever inside a single day. The ramp keys on lifetime *at day
+    start*, so today's dispatches cannot buy today's headroom.
+    """
+    account = make_account(budget=20, warmup_floor=3)
+    for _ in range(3):
+        account.count_dispatch()
+    assert account.effective_budget == 3, "day one's cap is frozen at its start"
+    assert account.remaining == 0
+    assert account.budget_spent
+
+
+def test_history_this_tool_cannot_see_does_not_skip_the_ramp():
+    """No provenance claim beats a record: an account with a long life
+    elsewhere still starts at the floor here, because the only history the
+    gate can trust is the one this tool kept."""
+    account = make_account(budget=20, warmup_floor=3)
+    assert account.effective_budget == 3  # fresh record, no matter the age
+
+
+def test_budget_spent_reports_the_warming_figure_and_says_why():
+    """The operator must not read "3/3" and wonder where the 20 went."""
+    account = make_account(budget=20, warmup_floor=3)
+    for _ in range(3):
+        account.count_dispatch()
+    message = account.why_ineligible(0.0)
+    assert message is not None
+    assert "(3/3)" in message
+    assert "warming toward 20" in message
+
+
+def test_an_unwarmed_account_spends_with_the_plain_message():
+    """Floor 0: same words the operator has always seen, byte for byte."""
+    account = make_account(budget=2)
+    account.count_dispatch()
+    account.count_dispatch()
+    assert account.why_ineligible(0.0) == "daily budget spent (2/2)"
+
+
+def test_status_shows_the_ceiling_the_ramp_and_what_is_enforced():
+    """Three keys, one story: ceiling 20, enforced 3, warming true -- the
+    inconsistency a reader would otherwise spot between daily_budget and
+    remaining has a name in the same row."""
+    account = make_account(budget=20, warmup_floor=3)
+    row = account.status(0.0)
+    assert row["daily_budget"] == 3
+    assert row["daily_budget_ceiling"] == 20
+    assert row["warming"] is True
+    assert row["remaining"] == 3
+
+
 # --- eligibility ------------------------------------------------------------
 
 

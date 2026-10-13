@@ -86,12 +86,16 @@ username = "reporter.one"
 sessionid_env = "IG_SESSIONID_ALPHA"
 user_id = "555000111"
 daily_budget = 20
+# Ramp off; this config pins channel-building and dispatch at a known
+# budget. The ramp is covered by its own tests.
+warmup_floor = 0
 
 [accounts.bravo]
 username = "reporter.two"
 sessionid_env = "IG_SESSIONID_BRAVO"
 user_id = "555000222"
 daily_budget = 20
+warmup_floor = 0
 
 [proxies]
 source = "file"

@@ -44,6 +44,12 @@ username = "your.reporting.account"
 # written to disk in this file.
 sessionid_env = "IG_SESSIONID_ALPHA"
 daily_budget = 20                    # reports per 24h before cooldown (D4)
+# The warming ramp: a fresh account starts each day at this floor and earns
+# +1 of headroom for every report it has ever filed through this tool, until
+# it reaches daily_budget (3 -> 6 -> 12 -> 20 with these numbers). Self-imposed
+# like the budget itself -- nothing here claims to be Instagram's limit. Set
+# 0 to hand a known account its full ceiling from day one.
+warmup_floor = 3
 # The account's own numeric ds_user_id. Not a secret, so unlike sessionid it lives
 # here rather than in the environment.
 #
@@ -62,6 +68,7 @@ username = "your.second.account"
 sessionid_env = "IG_SESSIONID_BRAVO"
 user_id = "00000000001"
 daily_budget = 20
+warmup_floor = 3
 enabled = true
 
 # ---------------------------------------------------------------------------

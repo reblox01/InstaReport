@@ -118,6 +118,10 @@ anchors_path = "anchors.toml"
 username = "reporter.one"
 sessionid_env = "IG_SESSIONID_ALPHA"
 daily_budget = 20
+# The warming ramp is off: these tests exercise budget arithmetic and
+# dispatch machinery against a known ceiling. The ramp itself is pinned by
+# dedicated tests in test_accounts, test_config, and test_runner.
+warmup_floor = 0
 
 [proxies]
 source = "file"

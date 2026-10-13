@@ -50,6 +50,13 @@ class AccountConfig:
     sessionid: str
     enabled: bool = True
     daily_budget: int = 20
+    #: Day-one floor of the warming ramp: a fresh reputation store starts an
+    #: account at this many reports a day, earning +1 of headroom per report
+    #: it has ever filed through the tool, until it reaches ``daily_budget``.
+    #: Self-imposed like every other budget here -- nothing claims it is
+    #: Instagram's. 0 disables the ramp for operators who run accounts whose
+    #: history this tool cannot see and do not want the gate.
+    warmup_floor: int = 3
     #: The account's own numeric ``ds_user_id``.
     #:
     #: Optional, and deliberately so. It is needed to address *this* account by id
@@ -377,6 +384,7 @@ def _load_accounts(raw: Mapping[str, Any]) -> tuple[AccountConfig, ...]:
                 sessionid=sessionid,
                 enabled=reader.bool_("enabled", True),
                 daily_budget=reader.int_("daily_budget", 20, minimum=1),
+                warmup_floor=reader.int_("warmup_floor", 3, minimum=0),
                 user_id=reader.str_("user_id"),
             )
         )
