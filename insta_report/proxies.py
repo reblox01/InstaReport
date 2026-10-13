@@ -37,6 +37,17 @@ Three further properties are enforced here rather than left to the runner:
   under a live session -- mid-report, between page load and submit -- is
   indistinguishable from a hijacked session. A lease that would outlive its own
   IP binding is refused at acquire time.
+* **Not every working address is a usable one.** A datacenter exit answers the
+  probe perfectly and is still the fastest way to have every account behind it
+  linked and suspended: the exit's ASN is the tell, and datacenter ranges are
+  mass-flagged. The probe's ISP/ASN is therefore graded into a *trust tier*
+  (mobile > residential > unknown > datacenter), the tier is used to order
+  candidates and to refuse any address the operator has ruled out, and an address
+  below the configured floor is *dismissed* rather than retried -- it is not
+  broken and adding more of them will not help. This check is best-effort by
+  construction: the tier is inferred from the provider's text, an address that
+  reports nothing stays ``UNKNOWN``, and ``UNKNOWN`` is deprioritized but never
+  refused, because a gap in what the probe said is not evidence of a low tier.
 
 Transport is injected as ``fetch(url, proxy) -> ProbeResult``. Nothing in this
 module imports an HTTP client, which is why the whole of it is testable offline
@@ -62,6 +73,7 @@ from .errors import ProxyUnavailable
 
 __all__ = [
     "ProbeVerdict",
+    "TrustTier",
     "ProbeResult",
     "EgressObservation",
     "ProxyEndpoint",
@@ -71,6 +83,9 @@ __all__ = [
     "parse_proxy_file",
     "classify_body",
     "parse_ip_echo",
+    "classify_trust",
+    "coerce_trust",
+    "DEFAULT_PROBE_URL",
     "ProviderAdapter",
     "StaticProvider",
     "HttpJsonProvider",
@@ -81,6 +96,23 @@ __all__ = [
 ]
 
 log = logging.getLogger(__name__)
+
+
+#: The default IP-echo endpoint, used to observe the operator's own address and
+#: to grade a proxy's egress. It reports the ISP as well as the address (``org``
+#: = ASN + name), which is the point: trust tiering reads the ISP, so a default
+#: that reports none would make every address grade ``UNKNOWN`` and leave
+#: ``min_trust`` inert out of the box. A feature that only works when the
+#: operator reads one TOML comment is a decoration.
+#:
+#: The leak surface is unchanged from any other echo service: whoever answers
+#: sees the address the request left from -- the proxy's egress when grading a
+#: lease, this machine's when observing the own address. That was already true
+#: of a bare-IP echo. An operator who wants fewer fields in the response can
+#: point ``probe_url`` at ``https://api.ipify.org?format=json``; the cost is
+#: that with no ISP reported every address grades ``unknown`` and a trust floor
+#: has nothing to act on, which is a deliberate trade rather than an accident.
+DEFAULT_PROBE_URL = "https://ipinfo.io/json"
 
 
 # --- first-failure backoff, matching the account pool's shape ---------------
@@ -143,6 +175,200 @@ _STATUS_HEALTHY_VERDICTS = frozenset(
         ProbeVerdict.UNPARSEABLE,
     }
 )
+
+
+class TrustTier(Enum):
+    """How much a working exit can be trusted with a reporting session.
+
+    The ranking is the entire point, so it is encoded once here rather than at
+    each comparison:
+
+        MOBILE      a carrier-grade (4G/5G) address. Shared with thousands of
+                    real handsets, so it is the most expensive and the least
+                    attributable -- and the one a detector is least able to
+                    pin to a single operator.
+        RESIDENTIAL a consumer ISP address. This is the *presumption* for any
+                    address whose ISP text is neither a known carrier nor a
+                    known host: the datacenter list is the discriminating one,
+                    and the long tail of consumer ISPs is unbounded, so what is
+                    not flagged as hosting is treated as consumer.
+        UNKNOWN     the probe reported no ISP text at all. Not "we do not
+                    recognise it" -- with a reported ISP and no marker that is
+                    RESIDENTIAL -- but "there was nothing to read". Ranked above
+                    datacenter and never refused, because a probe that said
+                    nothing is not evidence of a low tier.
+        DATACENTER  a hosting/cloud/VPN range. Works perfectly, and is exactly
+                    what gets every account behind it linked and flagged.
+
+    ``rank`` is the sort key; higher is better. It is deliberately *not* the
+    declaration order, so a future reordering of the members cannot silently
+    reorder the pool.
+    """
+
+    MOBILE = "mobile"
+    RESIDENTIAL = "residential"
+    UNKNOWN = "unknown"
+    DATACENTER = "datacenter"
+
+    @property
+    def rank(self) -> int:
+        return _TRUST_RANKS[self]
+
+
+_TRUST_RANKS: dict[TrustTier, int] = {
+    TrustTier.MOBILE: 3,
+    TrustTier.RESIDENTIAL: 2,
+    TrustTier.UNKNOWN: 1,
+    TrustTier.DATACENTER: 0,
+}
+
+#: Matched case-insensitively against the probe's ISP text, on a word boundary.
+#: The mobile list is checked *before* the datacenter list, because carriers
+#: routinely carry one of those words ("T-Mobile" contains "mobile"). The lists
+#: are short and conservative on purpose: a wrong positive on MOBILE merely
+#: deprioritizes a usable address, and there is no wrong positive for
+#: RESIDENTIAL (it is the fall-through), but a wrong positive on DATACENTER
+#: would refuse a working residential exit when the operator set a residential
+#: floor -- so the datacenter words are ones a consumer ISP does not use in its
+#: own name.
+_MOBILE_MARKERS = (
+    "mobile",
+    "cellular",
+    "wireless",
+    "t-mobile",
+    "tmobile",
+    "vodafone",
+    "o2",
+    "orange",
+    "airtel",
+    "telefonica",
+    "giffgaff",
+    "lycamobile",
+    "mtn",
+    "telenor",
+    "gsm",
+    "lte",
+    "5g",
+)
+
+_DATACENTER_MARKERS = (
+    "amazon",
+    "aws",
+    "google",
+    "microsoft",
+    "azure",
+    "digitalocean",
+    "ovh",
+    "hetzner",
+    "linode",
+    "akamai",
+    "vultr",
+    "contabo",
+    "leaseweb",
+    "m247",
+    "datacamp",
+    "datacenter",
+    "data center",
+    "colo",
+    "colocrossing",
+    "choopa",
+    "scaleway",
+    "oracle",
+    "alibaba",
+    "tencent",
+    "hosting",
+    "server",
+    "cloud",
+    "vpn",
+    "proxy",
+    # --- The famous ones that were missing, and what their absence cost:
+    # an ipinfo-shaped response carrying "AS13335 Cloudflare, Inc." graded
+    # RESIDENTIAL, which ranked a CDN edge ABOVE every known hoster. This list
+    # is the discriminating half of the classifier, so a giant missing from it
+    # is not a neutral omission -- it promotes that egress past the hosters we
+    # did remember. Still word-boundary matched, still names no consumer ISP.
+    "cloudflare",
+    "ovhcloud",
+    "rackspace",
+    "softlayer",
+    "ibm",
+    "godaddy",
+    "namecheap",
+    "dreamhost",
+    "bluehost",
+    "hostgator",
+    # Consumer VPN brands, same argument. "vpn" only matches as a whole word and
+    # "NordVPN" is one word; these exits are as recognisable as any hoster and
+    # belong on the same side of the floor.
+    "nordvpn",
+    "nord security",
+    "expressvpn",
+    "mullvad",
+    "proton",
+    "windscribe",
+    "surfshark",
+    "ipvanish",
+    "cyberghost",
+    "openvpn",
+    "purevpn",
+)
+
+#: One alternation per tier, compiled once. ``\b`` and not a substring test:
+#: "server" must not match "Observers", and "o2" must not match "o2online".
+_MOBILE_RE = re.compile(r"\b(?:" + "|".join(re.escape(m) for m in _MOBILE_MARKERS) + r")\b")
+_DATACENTER_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(m) for m in _DATACENTER_MARKERS) + r")\b"
+)
+
+
+def classify_trust(egress: EgressObservation | None) -> TrustTier:
+    """Best-effort tier for an observed egress. Never raises.
+
+    Reads the ISP text the probe returned. The datacenter list is the
+    *discriminating* one: an address whose ISP matches neither the carrier nor
+    the hosting list is taken to be ``RESIDENTIAL``, because the universe of
+    consumer ISPs is unbounded and a positive list of them would be an
+    artefact of whoever last edited it. ``UNKNOWN`` is reserved for the case
+    where the probe reported no ISP at all -- nothing to read -- and is ranked
+    above ``DATACENTER``, because "there was nothing to read" must not be
+    treated as "we know it is bad".
+
+    The bias is deliberate and directional: with an ISP present and no marker
+    the answer is residential, so the classifier *prefers to allow*, and the
+    only way a floor refuses a working consumer exit is if a consumer ISP names
+    itself with a hosting word. That is the price of not refusing every real
+    residential address on earth.
+    """
+    if egress is None or not egress.isp:
+        return TrustTier.UNKNOWN
+    haystack = egress.isp.casefold()
+    if _MOBILE_RE.search(haystack):
+        return TrustTier.MOBILE
+    if _DATACENTER_RE.search(haystack):
+        return TrustTier.DATACENTER
+    return TrustTier.RESIDENTIAL
+
+
+def coerce_trust(value: TrustTier | str | None) -> TrustTier:
+    """Turn a config string (or a tier, or nothing) into a :class:`TrustTier`.
+
+    The seam that lets :mod:`insta_report.config` carry a validated *string*
+    without importing this module -- the two modules are deliberately
+    independent, and the lazy import inside the config loader is where a typo is
+    caught. By the time a value reaches here it has already been validated, so
+    anything unrecognised falls back to ``UNKNOWN``'s sibling, the permissive
+    ``DATACENTER``, rather than raising in a constructor that is called from a
+    dozen places. ``None`` means "not configured", which is the permissive
+    default and not an error.
+    """
+    if value is None:
+        return TrustTier.DATACENTER
+    if isinstance(value, TrustTier):
+        return value
+    try:
+        return TrustTier(str(value).strip().casefold())
+    except ValueError:
+        return TrustTier.DATACENTER
 
 
 #: Markers of a refusal page. A heuristic list, not an oracle -- it is here to
@@ -237,6 +463,11 @@ class EgressObservation:
     def has_asn(self) -> bool:
         return self.asn is not None
 
+    @property
+    def trust(self) -> TrustTier:
+        """The tier this observation implies. See :func:`classify_trust`."""
+        return classify_trust(self)
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "ip": self.ip,
@@ -244,6 +475,7 @@ class EgressObservation:
             "asn": self.asn,
             "isp": self.isp,
             "is_documentation_range": self.is_documentation_range,
+            "trust": self.trust.value,
         }
 
 
@@ -880,6 +1112,7 @@ class ProxyHealth:
                 max(0.0, (self.quarantined_until or now) - now), 1
             ),
             "available": self.available(now),
+            "trust": self.egress.trust.value if self.egress else None,
             "egress": self.egress.as_dict() if self.egress else None,
         }
 
@@ -927,6 +1160,7 @@ class ProxyLease:
             "proxy": self.endpoint.origin,
             "label": self.endpoint.label,
             "sticky_expires_at": round(self.sticky_expires_at, 1),
+            "trust": self.egress.trust.value if self.egress else None,
             "egress": self.egress.as_dict() if self.egress else None,
         }
 
@@ -951,13 +1185,14 @@ class ProxyPool:
         fetch: Fetch,
         monotonic: Callable[[], float] = time.monotonic,
         sticky_ttl: float = 4 * 3600.0,
-        probe_url: str = "https://api.ipify.org?format=json",
+        probe_url: str = DEFAULT_PROBE_URL,
         min_cooldown: float = MIN_PROXY_COOLDOWN_SECONDS,
         quarantine_base: float = DEFAULT_PROXY_QUARANTINE_BASE,
         quarantine_cap: float = DEFAULT_PROXY_QUARANTINE_CAP,
         rng: random.Random | None = None,
         enforce_asn_diversity: bool = True,
         own_ip: str | None = None,
+        min_trust: TrustTier = TrustTier.DATACENTER,
     ) -> None:
         self._fetch = fetch
         self._monotonic = monotonic
@@ -968,6 +1203,13 @@ class ProxyPool:
         self._quarantine_cap = quarantine_cap
         self._rng = rng or random.Random()
         self._enforce_asn_diversity = enforce_asn_diversity
+        #: The floor below which a *known* tier is refused. ``DATACENTER`` is the
+        #: permissive default: it refuses nothing, because every known tier ranks
+        #: at or above it, and an operator who has not asked for a floor must not
+        #: get one. Raising it refuses the recognised low tiers; ``UNKNOWN`` is
+        #: never refused here regardless of the floor, because we cannot prove an
+        #: unrecognised address is bad -- see the module docstring.
+        self._min_trust = min_trust
         self._sequence = 0
         #: The operator's own address, exactly as supplied, kept so the two ways
         #: of not having one -- absent, and present but unparseable -- can be
@@ -981,6 +1223,14 @@ class ProxyPool:
         #: see :meth:`_dismiss_as_own_address`. The address is kept because the
         #: report has to be able to say *which* one it was.
         self._self_egress: dict[str, str] = {}
+        #: Origins proven to egress from a *known* tier below ``min_trust``,
+        #: mapped to the tier they were found to be. Dismissed rather than
+        #: quarantined, exactly like ``_self_egress``: the address works, will
+        #: not recover, and adding more of the same tier will not help. Kept
+        #: separate from ``_self_egress`` because the two refusals have different
+        #: remedies -- one is "remove the wrong address", the other is "raise the
+        #: floor or buy better addresses".
+        self._low_trust: dict[str, TrustTier] = {}
         #: Stable per-address tiebreak, drawn once. See ``_order_key``.
         self._tiebreak: dict[str, float] = {}
 
@@ -1064,6 +1314,7 @@ class ProxyPool:
             h
             for h in self._health.values()
             if h.endpoint.origin not in self._self_egress
+            and h.endpoint.origin not in self._low_trust
             and h.available(now, min_cooldown=self._min_cooldown)
         ]
 
@@ -1179,6 +1430,14 @@ class ProxyPool:
                     # unaffected -- one bad entry costs one entry.
                     self._dismiss_as_own_address(health.endpoint, result.egress)
                     continue
+                if self._below_floor(result.egress.trust):
+                    # Dismissed, not failed, for the same reason as self-egress:
+                    # this address is not broken and will never recover, and a
+                    # quarantine would let `_fallback_ranked` re-select it under
+                    # load -- holding the guard exactly when it matters least.
+                    # One entry below the floor costs one entry.
+                    self._dismiss_low_trust(health.endpoint, result.egress.trust)
+                    continue
                 if want_distinct and result.egress.asn is not None:
                     if result.egress.asn in leased_asns:
                         # Skip WITHOUT recording a failure. The address just
@@ -1221,6 +1480,21 @@ class ProxyPool:
                 + self._exhausted_report(self._monotonic())
             )
 
+        if self._low_trust:
+            # Also its own headline, and for the same reason as self-egress:
+            # these answer perfectly and the generic message would prescribe
+            # "buy more addresses", which buys more of the tier that was just
+            # refused.
+            raise ProxyUnavailable(
+                f"refusing to lease: {len(self._low_trust)} configured "
+                f"address(es) work correctly but are below the configured "
+                f"min_trust of {self._min_trust.value}. Adding more of the same "
+                f"tier will not help.\n"
+                + self._low_trust_report()
+                + "\n"
+                + self._exhausted_report(self._monotonic())
+            )
+
         raise ProxyUnavailable(
             f"no usable proxy after probing {tried} address(es); "
             f"{len(candidates)} were considered"
@@ -1245,6 +1519,20 @@ class ProxyPool:
         lines = ["dismissed (working, but egress from this machine's own address):"]
         for origin in sorted(self._self_egress):
             lines.append(f"  {origin}: {self._self_egress[origin]}")
+        return "\n".join(lines)
+
+    def _low_trust_report(self) -> str:
+        """Name the below-floor origins, for the refusal and for ``summary``.
+
+        Same reason as :meth:`_dismissed_report` for existing at all, and the
+        same reason it is separate from it: the two refusals have different
+        remedies, so they must not read as one list.
+        """
+        lines = [
+            f"dismissed (working, but below min_trust = {self._min_trust.value}):"
+        ]
+        for origin in sorted(self._low_trust):
+            lines.append(f"  {origin}: {self._low_trust[origin].value}")
         return "\n".join(lines)
 
     def _require_own_address(self) -> None:
@@ -1315,6 +1603,34 @@ class ProxyPool:
             egress.ip,
         )
 
+    def _below_floor(self, tier: TrustTier) -> bool:
+        """Whether *tier* is a known tier the operator has ruled out.
+
+        ``UNKNOWN`` is never below the floor. The floor is a statement about
+        tiers we can recognise; an address whose tier we could not read is not
+        evidence of a low tier, so it is ranked low but kept. Refusing it would
+        make a residential-only configuration fail closed on every echo service
+        that returns a bare IP with no ISP -- a footgun dressed as a safety
+        property.
+        """
+        if tier is TrustTier.UNKNOWN:
+            return False
+        return tier.rank < self._min_trust.rank
+
+    def _dismiss_low_trust(self, endpoint: ProxyEndpoint, tier: TrustTier) -> None:
+        """Retire an origin whose known tier is below the operator's floor."""
+        self._low_trust[endpoint.origin] = tier
+        log.error(
+            "[proxies] %s is a %s address, below the configured min_trust of "
+            "%s. It works, so it is not retried, and it will not recover: a "
+            "datacenter exit is the fastest way to have every account behind it "
+            "linked. Remove it from the proxy file, lower min_trust, or supply "
+            "residential/mobile addresses.",
+            endpoint.origin,
+            tier.value,
+            self._min_trust.value,
+        )
+
     def _fallback_ranked(self, now: float) -> list[ProxyHealth]:
         """Every address, least-sideline-first, ignoring cooldown entirely.
 
@@ -1343,6 +1659,7 @@ class ProxyPool:
                 health
                 for health in self._health.values()
                 if health.endpoint.origin not in self._self_egress
+                and health.endpoint.origin not in self._low_trust
             ),
             key=key,
         )
@@ -1371,21 +1688,40 @@ class ProxyPool:
             return []
         return sorted(candidates, key=self._order_key)
 
-    def _order_key(self, health: ProxyHealth) -> tuple[bool, float, float]:
-        """Sort key: has it ever worked, then score, then a stable random tie.
+    def _order_key(self, health: ProxyHealth) -> tuple[float, bool, float, float]:
+        """Sort key: trust, then has it ever worked, then score, then a tie.
 
-        The third component is drawn once at registration and never changes, so
-        the order is a total order that is stable across calls -- which is what
-        makes the ranking reproducible and what stops a tie from always resolving
-        to whichever address happens to sort first by name.
+        Trust is first, and that is a deliberate reversal of the original
+        "proven first" order. A proven datacenter exit is *worse* than an
+        untried residential one: the whole point of the tier is that a working
+        address on a flagged ASN is the liability, and the cost of preferring
+        the untried one is a single probe, paid once per lease rather than once
+        per report. The previous order would have kept reusing the datacenter
+        address precisely because it kept working.
 
-        An earlier version rotated the *whole* ranked list by a random offset to
-        achieve the same spreading, which quietly defeated both earlier keys: the
-        proven address could end up anywhere in the list, so a blip on a
-        validated session could cost more than the spreading ever bought.
-        Tie-breaking inside the key cannot do that.
+        The remaining components are unchanged: among equal trust, a proven
+        address leads (``successes == 0`` is False and sorts first), then the
+        health score, then a fixed random tie.
+
+        The tiebreak is drawn once at registration and never changes, so the
+        order is a total order that is stable across calls -- which is what
+        makes the ranking reproducible and what stops a tie from always
+        resolving to whichever address happens to sort first by name.
+
+        An address that has never been probed has no egress, so it ranks as
+        ``UNKNOWN`` until proven -- which is honest (we do not know its tier)
+        and keeps it above datacenter without pretending it is residential.
+
+        The tie-break component is inside the key rather than achieved by
+        rotating the ranked list, deliberately. An earlier version rotated the
+        whole list by a random offset, which quietly defeated the keys above it:
+        a validated address could end up anywhere, so a blip on a live session
+        could cost more than the spreading ever bought. Tie-breaking inside the
+        key cannot do that.
         """
+        trust_rank = health.egress.trust.rank if health.egress else TrustTier.UNKNOWN.rank
         return (
+            -trust_rank,
             health.successes == 0,
             -health.health_score,
             self._tiebreak[health.endpoint.origin],
@@ -1521,15 +1857,23 @@ class ProxyPool:
 
     def summary(self) -> str:
         now = self._monotonic()
-        lines = [f"{'origin':<28} {'ok':>4} {'fail':>5} {'streak':>7} {'state':<26}"]
-        lines.append("-" * 76)
+        lines = [
+            f"{'origin':<28} {'trust':<11} {'ok':>4} {'fail':>5} {'streak':>7} {'state':<26}"
+        ]
+        lines.append("-" * 88)
         for health in sorted(self._health.values(), key=lambda h: -h.health_score):
             remaining = max(0.0, (health.quarantined_until or now) - now)
             state = f"cooldown {remaining:.0f}s" if remaining > 0 else (
                 "available" if health.available(now) else "reused recently"
             )
+            tier = health.egress.trust.value if health.egress else "untried"
+            origin = health.endpoint.origin
+            if origin in self._self_egress:
+                tier = "own-ip"
+            elif origin in self._low_trust:
+                tier = self._low_trust[origin].value
             lines.append(
-                f"{health.endpoint.origin:<28} {health.successes:>4} {health.failures:>5} "
+                f"{origin:<28} {tier:<11} {health.successes:>4} {health.failures:>5} "
                 f"{health.consecutive_failures:>7} {state:<26}"
             )
         if self._leases:
@@ -1545,6 +1889,9 @@ class ProxyPool:
             # money and changes nothing.
             lines.append("")
             lines.append(self._dismissed_report())
+        if self._low_trust:
+            lines.append("")
+            lines.append(self._low_trust_report())
         return "\n".join(lines)
 
     def __iter__(self) -> Iterator[ProxyHealth]:
@@ -1701,11 +2048,12 @@ def build_pool(
     *,
     fetch: Fetch,
     monotonic: Callable[[], float] = time.monotonic,
-    probe_url: str = "https://api.ipify.org?format=json",
+    probe_url: str | None = None,
     min_cooldown: float = MIN_PROXY_COOLDOWN_SECONDS,
     rng: random.Random | None = None,
     enforce_asn_diversity: bool = True,
     own_ip: str | None = None,
+    min_trust: TrustTier | str | None = None,
     direct_fetch: Callable[[str], ProbeResult] | None = None,
 ) -> ProxyPool:
     """Build a pool from an :class:`~insta_report.config.ProxyConfig`.
@@ -1734,7 +2082,22 @@ def build_pool(
     a run that quietly bypasses the exit it was configured to use is worse than
     a run that refuses to start, because the operator has no way to tell from
     the output that the isolation they paid for was not applied.
+
+    ``min_trust`` is the floor below which a *known* egress tier is refused; it
+    defaults to reading ``config.min_trust`` and, failing that, to the permissive
+    ``datacenter`` (refuse nothing). It is coerced rather than trusted because
+    the config layer carries a validated string, not an enum -- see
+    :func:`coerce_trust`.
+
+    ``probe_url`` follows the same resolution: an explicit argument wins, then
+    ``config.probe_url``, then :data:`DEFAULT_PROBE_URL`. The default reports
+    the ISP, so trust tiering is real on an unconfigured run; an operator who
+    points it at a bare-IP echo gets a pool where every address grades
+    ``unknown`` and no floor can act -- see the constant's comment.
     """
+    resolved_probe_url = (
+        probe_url or getattr(config, "probe_url", None) or DEFAULT_PROBE_URL
+    )
     source = getattr(config, "source", "file")
     label = "operator file"
     skipped: list[str] = []
@@ -1799,12 +2162,15 @@ def build_pool(
         fetch=fetch,
         monotonic=monotonic,
         sticky_ttl=float(getattr(config, "sticky_ttl_minutes", 240)) * 60.0,
-        probe_url=probe_url,
+        probe_url=resolved_probe_url,
         min_cooldown=min_cooldown,
         rng=rng,
         enforce_asn_diversity=enforce_asn_diversity,
         own_ip=own_ip if own_ip is not None else _observe_own_address(
-            probe_url, direct_fetch
+            resolved_probe_url, direct_fetch
+        ),
+        min_trust=coerce_trust(
+            min_trust if min_trust is not None else getattr(config, "min_trust", None)
         ),
     )
 

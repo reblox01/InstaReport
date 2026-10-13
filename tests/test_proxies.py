@@ -22,6 +22,7 @@ import pytest
 
 from insta_report.errors import ProxyUnavailable
 from insta_report.proxies import (
+    DEFAULT_PROBE_URL,
     EgressObservation,
     HttpJsonProvider,
     ProbeResult,
@@ -30,7 +31,10 @@ from insta_report.proxies import (
     ProxyLease,
     ProxyPool,
     StaticProvider,
+    TrustTier,
     classify_body,
+    classify_trust,
+    coerce_trust,
     extract_common_shapes,
     parse_ip_echo,
     parse_proxy_file,
@@ -56,6 +60,18 @@ def ok(ip: str = "203.0.113.7", asn: int = 64500, country: str = "US") -> ProbeR
         status=200,
         body=json.dumps({"ip": ip, "asn": asn, "country": country}),
         egress=EgressObservation(ip=ip, asn=asn, country=country),
+    )
+
+
+def tiered_ok(
+    ip: str = "203.0.113.7", isp: str | None = None, asn: int = 64500
+) -> ProbeResult:
+    """A healthy probe whose egress carries an ISP, so a tier can be read from it."""
+    return ProbeResult(
+        verdict=ProbeVerdict.OK,
+        status=200,
+        body=json.dumps({"ip": ip, "isp": isp}),
+        egress=EgressObservation(ip=ip, isp=isp, asn=asn),
     )
 
 
@@ -1676,7 +1692,7 @@ def test_build_pool_observes_the_own_address_once_at_startup(tmp_path):
     pool.release(first)
     second = pool.acquire()
 
-    assert calls == ["https://api.ipify.org?format=json"], calls
+    assert calls == ["https://ipinfo.io/json"], calls
     assert first.endpoint.origin == "10.0.0.1:8080"
     assert second.endpoint.origin == "10.0.0.1:8080"
 
@@ -1742,3 +1758,307 @@ def test_an_unreachable_echo_service_still_builds_a_pool_that_refuses_to_lease(t
     assert "own_ip" in errors, errors
     # Still inspectable.
     assert "10.0.0.1:8080" in pool.summary()
+
+
+# --- proxy trust tiering ----------------------------------------------------
+#
+# The tier exists because a working address is not automatically a usable one:
+# a datacenter exit answers every probe and is still the fastest way to have
+# every account behind it linked. These tests pin the classifier, the ordering
+# reversal, and the floor -- and, just as importantly, the one thing the floor
+# must NOT do: refuse an address it simply could not classify.
+
+
+def test_trust_tier_ranks_mobile_above_residential_above_unknown_above_datacenter():
+    assert TrustTier.MOBILE.rank > TrustTier.RESIDENTIAL.rank
+    assert TrustTier.RESIDENTIAL.rank > TrustTier.UNKNOWN.rank
+    assert TrustTier.UNKNOWN.rank > TrustTier.DATACENTER.rank
+
+
+@pytest.mark.parametrize(
+    ("isp", "expected"),
+    [
+        ("T-Mobile USA, Inc.", TrustTier.MOBILE),
+        ("Vodafone Group", TrustTier.MOBILE),
+        ("MTS ALLSTREAM WIRELESS", TrustTier.MOBILE),
+        ("DigitalOcean, LLC", TrustTier.DATACENTER),
+        ("Amazon.com, Inc.", TrustTier.DATACENTER),
+        ("Hetzner Online GmbH", TrustTier.DATACENTER),
+        ("LeaseWeb Netherlands B.V.", TrustTier.DATACENTER),
+        # The miss that shipped: no marker for these, so a CDN edge graded
+        # residential and outranked every hoster we did remember.
+        ("AS13335 Cloudflare, Inc.", TrustTier.DATACENTER),
+        ("Rackspace US, L.P.", TrustTier.DATACENTER),
+        ("NordVPN", TrustTier.DATACENTER),
+        ("Mullvad AB", TrustTier.DATACENTER),
+        # Reported, and matching neither list: the presumption is residential.
+        ("Comcast Cable Communications, LLC", TrustTier.RESIDENTIAL),
+        ("Deutsche Telekom AG", TrustTier.RESIDENTIAL),
+    ],
+)
+def test_an_isp_is_graded_into_the_right_tier(isp, expected):
+    assert classify_trust(EgressObservation(ip="203.0.113.9", isp=isp)) is expected
+
+
+def test_no_isp_at_all_is_unknown_not_a_guess():
+    """A bare-IP echo is the default, and it must read as unknown, not datacenter.
+
+    If this returned anything else, the default configuration would be graded
+    against a tier nobody derived.
+    """
+    assert classify_trust(EgressObservation(ip="203.0.113.9")) is TrustTier.UNKNOWN
+    assert classify_trust(EgressObservation(ip="203.0.113.9", isp="")) is TrustTier.UNKNOWN
+    assert classify_trust(None) is TrustTier.UNKNOWN
+
+
+def test_markers_match_on_a_word_boundary_not_a_substring():
+    """``Observers Inc`` must not be read as a hosting company because of "server".
+
+    A substring match here would be a false DATACENTER, which at a residential
+    floor refuses a working exit -- the one failure this classifier must not have.
+    """
+    assert classify_trust(EgressObservation(ip="1.2.3.4", isp="Observers Inc")) is (
+        TrustTier.RESIDENTIAL
+    )
+    assert classify_trust(EgressObservation(ip="1.2.3.4", isp="Mobilenet Systems")) is (
+        TrustTier.RESIDENTIAL
+    ), "mobile must not match inside mobilenet"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, TrustTier.DATACENTER),
+        (TrustTier.MOBILE, TrustTier.MOBILE),
+        ("residential", TrustTier.RESIDENTIAL),
+        ("  MOBILE  ", TrustTier.MOBILE),
+        ("nonsense", TrustTier.DATACENTER),
+    ],
+)
+def test_coerce_trust_never_raises_and_defaults_permissive(value, expected):
+    assert coerce_trust(value) is expected
+
+
+def test_the_default_probe_response_produces_a_real_tier():
+    """The tier must come alive on an *unconfigured* run -- the point of the default.
+
+    A default probe that reports no ISP would grade every address ``unknown`` and
+    leave ``min_trust`` with nothing to refuse: a feature that exists in the code
+    and nowhere in a run. This feeds an ipinfo-shaped body (``org`` = ASN + name,
+    exactly what ``DEFAULT_PROBE_URL`` answers with) through the real parser and
+    asserts the grade is a real one, floor-usable end to end.
+    """
+    observation = parse_ip_echo(
+        json.dumps(
+            {
+                "ip": "104.28.7.9",
+                "hostname": "edge.example.net",
+                "city": "Los Angeles",
+                "region": "California",
+                "country": "US",
+                "org": "AS13335 Cloudflare, Inc.",
+                "postal": "90012",
+            }
+        )
+    )
+    assert observation is not None
+    assert observation.isp == "AS13335 Cloudflare, Inc."
+    assert observation.trust is TrustTier.DATACENTER
+
+
+def test_an_untried_residential_outranks_a_proven_datacenter():
+    """The deliberate reversal, pinned.
+
+    A datacenter exit that has proven itself is *worse* than an untried
+    residential one -- the whole tier exists because "it works" is not the
+    question. This asserts the pool orders by trust ahead of provenness, so the
+    address that keeps succeeding on the wrong ASN stops being reused.
+    """
+    pool = make_pool(
+        endpoints=[
+            ProxyEndpoint("http://10.0.0.1:8080", label="dc"),
+            ProxyEndpoint("http://10.0.0.2:8080", label="resi"),
+        ]
+    )
+    proven_dc = pool["10.0.0.1:8080"]
+    proven_dc.egress = EgressObservation(ip="1.1.1.1", isp="DigitalOcean, LLC")
+    proven_dc.successes = 9
+    untried_resi = pool["10.0.0.2:8080"]
+    untried_resi.egress = EgressObservation(ip="2.2.2.2", isp="Comcast Cable")
+
+    ranked = pool._ranked(pool._monotonic())
+    assert ranked[0] is untried_resi, "trust must outrank provenness"
+    assert ranked[-1] is proven_dc
+
+
+def test_a_datacenter_floor_refuses_a_working_datacenter_address():
+    """Working, and still refused -- that is the entire point.
+
+    The refusal has its own headline, naming the tier, because the generic
+    "no usable proxy" message would send the operator to buy more of exactly
+    the tier that was just refused.
+    """
+    pool = make_pool(
+        endpoints=[ProxyEndpoint("http://10.0.0.1:8080", label="dc")],
+        fetch=lambda url, proxy: tiered_ok(isp="DigitalOcean, LLC"),
+        min_trust=TrustTier.RESIDENTIAL,
+    )
+    with pytest.raises(ProxyUnavailable, match="min_trust"):
+        pool.acquire()
+
+
+def test_a_floor_never_refuses_an_address_it_could_not_classify():
+    """The footgun this design refuses to ship.
+
+    ``unknown`` means the probe reported no ISP. Refusing it would make a
+    residential floor fail closed on every bare-IP echo -- including the default
+    one -- and the operator would meet a flat refusal they cannot act on. So
+    unknown is ranked last and kept, never dismissed.
+    """
+    pool = make_pool(
+        endpoints=[ProxyEndpoint("http://10.0.0.1:8080", label="bare")],
+        fetch=lambda url, proxy: tiered_ok(isp=None),
+        min_trust=TrustTier.RESIDENTIAL,
+    )
+    lease = pool.acquire()
+    assert lease.endpoint.origin == "10.0.0.1:8080"
+
+
+def test_a_floor_skips_the_flagged_tier_and_binds_the_one_above_it():
+    """The floor is a filter, not a wall: a good address behind a bad one is used."""
+    pool = make_pool(
+        endpoints=[
+            ProxyEndpoint("http://10.0.0.1:8080", label="dc"),
+            ProxyEndpoint("http://10.0.0.2:8080", label="resi"),
+        ],
+        fetch=lambda url, proxy: (
+            tiered_ok(isp="Amazon.com, Inc.")
+            if host_of(proxy) == "10.0.0.1"
+            else tiered_ok(isp="Comcast Cable", ip="198.51.100.4")
+        ),
+        min_trust=TrustTier.RESIDENTIAL,
+    )
+    lease = pool.acquire()
+    assert lease.endpoint.origin == "10.0.0.2:8080"
+    assert lease.egress is not None and lease.egress.trust is TrustTier.RESIDENTIAL
+
+
+def test_a_dismissed_datacenter_address_is_never_re_tried():
+    """Dismissed, not quarantined -- so the load path cannot resurrect it.
+
+    A quarantine expires; this address is not broken and never will recover, so
+    it must not come back through ``_fallback_ranked`` when the pool is short.
+    """
+    pool = make_pool(
+        endpoints=[
+            ProxyEndpoint("http://10.0.0.1:8080", label="dc"),
+            ProxyEndpoint("http://10.0.0.2:8080", label="resi"),
+        ],
+        fetch=lambda url, proxy: (
+            tiered_ok(isp="Hetzner Online GmbH")
+            if host_of(proxy) == "10.0.0.1"
+            else tiered_ok(isp="Deutsche Telekom AG", ip="198.51.100.4")
+        ),
+        min_trust=TrustTier.RESIDENTIAL,
+    )
+    pool.acquire()
+
+    # The flagged origin is not merely unavailable, it is out of the pool.
+    assert all(
+        h.endpoint.origin != "10.0.0.1:8080" for h in pool.available()
+    )
+    assert "10.0.0.1:8080" not in {
+        h.endpoint.origin for h in pool._fallback_ranked(pool._monotonic())
+    }
+    assert "min_trust" in pool.summary()
+
+
+def test_the_floor_is_read_from_config_and_from_an_explicit_argument(tmp_path):
+    from types import SimpleNamespace
+
+    from insta_report.proxies import build_pool
+
+    listing = tmp_path / "proxies.txt"
+    listing.write_text("10.0.0.1:8080\n", encoding="utf-8")
+
+    def direct(url):
+        return ok("192.0.2.99")
+
+    # From the config object.
+    config = SimpleNamespace(
+        source="file",
+        file_path=listing,
+        sticky_ttl_minutes=240,
+        min_trust="residential",
+        probe_url=None,
+    )
+    pool = build_pool(
+        config,
+        fetch=lambda u, p: tiered_ok(isp="DigitalOcean, LLC"),
+        own_ip="192.0.2.99",
+        direct_fetch=direct,
+    )
+    assert pool._min_trust is TrustTier.RESIDENTIAL
+    with pytest.raises(ProxyUnavailable, match="min_trust"):
+        pool.acquire()
+
+    # An explicit argument wins over the config.
+    relaxed = build_pool(
+        config,
+        fetch=lambda u, p: tiered_ok(isp="DigitalOcean, LLC"),
+        own_ip="192.0.2.99",
+        direct_fetch=direct,
+        min_trust=TrustTier.DATACENTER,
+    )
+    relaxed.acquire()
+
+
+def test_probe_url_resolves_argument_then_config_then_default(tmp_path):
+    from types import SimpleNamespace
+
+    from insta_report.proxies import build_pool
+
+    listing = tmp_path / "proxies.txt"
+    listing.write_text("10.0.0.1:8080\n", encoding="utf-8")
+
+    def direct(url):
+        return ok("192.0.2.99")
+
+    def pool_for(config):
+        return build_pool(
+            config,
+            fetch=lambda u, p: ok("203.0.113.7"),
+            own_ip="192.0.2.99",
+            direct_fetch=direct,
+        )
+
+    base = {"source": "file", "file_path": listing, "sticky_ttl_minutes": 240}
+
+    configured = pool_for(SimpleNamespace(**base, probe_url="https://ipinfo.io/json"))
+    assert configured._probe_url == "https://ipinfo.io/json"
+
+    unset = pool_for(SimpleNamespace(**base, probe_url=None))
+    assert unset._probe_url == DEFAULT_PROBE_URL
+
+    explicit = build_pool(
+        SimpleNamespace(**base, probe_url="https://ipinfo.io/json"),
+        fetch=lambda u, p: ok("203.0.113.7"),
+        own_ip="192.0.2.99",
+        direct_fetch=direct,
+        probe_url="https://ifconfig.co/json",
+    )
+    assert explicit._probe_url == "https://ifconfig.co/json"
+
+
+def test_summary_shows_the_tier_and_the_flagged_origins():
+    pool = make_pool(
+        endpoints=[ProxyEndpoint("http://10.0.0.1:8080", label="dc")],
+        fetch=lambda url, proxy: tiered_ok(isp="Vultr Holdings"),
+        min_trust=TrustTier.RESIDENTIAL,
+    )
+    with pytest.raises(ProxyUnavailable):
+        pool.acquire()
+    summary = pool.summary()
+    assert "datacenter" in summary
+    assert "min_trust" in summary
+

@@ -621,3 +621,44 @@ def test_malformed_toml_reports_the_file(base_config_toml):
 def test_missing_config_file_is_reported(tmp_path):
     with pytest.raises(ConfigError, match="config file not found"):
         load_config(tmp_path / "nope.toml")
+
+
+# --- proxy trust tiering config --------------------------------------------
+
+
+def test_min_trust_defaults_to_the_permissive_floor(base_config_toml, proxy_file, session_env):
+    """Absent must mean "refuse nothing", not "guess a floor for the operator"."""
+    config = load_config(_write(base_config_toml))
+    assert config.proxies.min_trust == "datacenter"
+    assert config.proxies.probe_url is None
+
+
+def test_min_trust_is_read_and_normalised(base_config_toml, proxy_file, session_env):
+    body = base_config_toml.replace(
+        'source = "file"', 'source = "file"\nmin_trust = "  RESIDENTIAL  "'
+    )
+    assert load_config(_write(body)).proxies.min_trust == "residential"
+
+
+def test_an_unknown_min_trust_is_refused_at_load_not_at_acquire(
+    base_config_toml, proxy_file, session_env
+):
+    """A typo must be a config refusal, not a silently-inert floor.
+
+    If an unrecognised floor were accepted, an operator would believe a
+    datacenter refusal was in force while every address passed -- the loudest
+    possible failure mode, and the quietest to detect.
+    """
+    body = base_config_toml.replace(
+        'source = "file"', 'source = "file"\nmin_trust = "residental"'
+    )
+    with pytest.raises(ConfigError, match="min_trust"):
+        load_config(_write(body))
+
+
+def test_probe_url_is_read_when_set(base_config_toml, proxy_file, session_env):
+    body = base_config_toml.replace(
+        'source = "file"', 'source = "file"\nprobe_url = "https://ipinfo.io/json"'
+    )
+    assert load_config(_write(body)).proxies.probe_url == "https://ipinfo.io/json"
+

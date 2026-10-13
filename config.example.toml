@@ -77,6 +77,39 @@ file_path = "~/proxies.txt"          # required when source = "file"
 # provider_key_env = "IG_PROXY_KEY"
 sticky_ttl_minutes = 240             # must exceed your lease length (F10)
 
+# The lowest egress trust tier the pool will use, as a floor:
+#   "datacenter"  refuse nothing (default) -- rank only
+#   "unknown"     refuse known datacenter
+#   "residential" refuse known datacenter
+#   "mobile"      refuse known datacenter and residential; mobile exits only
+#
+# Tiers are inferred from the ISP text the probe reports (mobile > residential >
+# unknown > datacenter) and used first to ORDER candidates, so a residential
+# address is tried before a datacenter one even at the default. Raising the floor
+# additionally REFUSES the recognised low tiers outright, which is the point:
+# a datacenter exit answers every probe perfectly and is still the fastest way to
+# have every account behind it linked and suspended.
+#
+# An address whose probe reported NO ISP text is "unknown". It is ranked above
+# datacenter but never refused at any floor, because "there was nothing to read"
+# is not evidence of a low tier. An address that DID report an ISP matching
+# neither the carrier nor the hosting list is "residential" -- the datacenter
+# list is the discriminating one, since the universe of consumer ISPs is
+# unbounded. So a residential floor never fails closed on a bare-IP echo service.
+min_trust = "datacenter"
+
+# The IP-echo the pool probes through each address -- and, once, directly, to
+# learn this machine's own address. Left unset, the built-in default reports the
+# ISP as well as the address (org = ASN + name), so trust tiering is real on an
+# unconfigured run: a datacenter exit grades as datacenter without anyone
+# configuring anything.
+#
+# Override it to use a different echo, or a bare-IP one when only the own-address
+# question matters -- knowing the cost first: with no ISP reported every address
+# grades as "unknown" and a min_trust floor has nothing to act on.
+#   probe_url = "https://api.ipify.org?format=json"   # bare IP, tiering goes quiet
+# probe_url = "https://ifconfig.co/json"              # alternative ISP reporter
+
 # Every lease is checked against this machine's own IP address, and a lease that
 # egresses from it is refused. That is the one correlation the tool exists to
 # avoid: a report filed from the address Instagram already associates with you

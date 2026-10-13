@@ -32,7 +32,7 @@ success rendering (the opening section), and the absence of an oracle for
 "accepted and discarded".
 
 **No report has ever been filed by this tool against a live Instagram.** The test
-suite is green (1152 tests) and it is green with every channel unable to reach
+suite is green (1186 tests) and it is green with every channel unable to reach
 Instagram. That sentence is the single most important thing on this page.
 
 Items 1–3 need two things that do not exist yet:
@@ -306,7 +306,7 @@ docker-compose.yml  bind-mounted config and artifacts, env_file for the secret
 ## Development
 
 ```bash
-.venv\Scripts\python -m pytest              # 1152 tests, offline
+.venv\Scripts\python -m pytest              # 1186 tests, offline
 .venv\Scripts\python -m pytest -m "not static"   # skip pyflakes + mypy
 .venv\Scripts\python -m pytest -m "not browser"   # skip the Chromium tests
 ```
@@ -443,6 +443,42 @@ Two invariants in the probe are refused rather than checked after the fact,
 because both defects produced output that *looked* like evidence: a probe may not
 issue a non-read method, and a probe URL may not carry an unsubstituted
 placeholder. A 404 nobody can interpret is not a result.
+
+## Egress trust tiering
+
+A working address is not automatically a usable one. A datacenter exit answers
+every probe and is still the fastest way to have every account behind it linked
+and suspended: the exit's ASN is the tell, and hosting ranges are mass-flagged.
+So every observed egress is graded into a trust tier — **mobile > residential >
+unknown > datacenter** — inferred from the ISP text the probe reports, and the
+tier does two things:
+
+- **It orders candidates.** Trust outranks provenness, deliberately: an address
+  that keeps succeeding on the wrong ASN is precisely the one to stop reusing,
+  and the cost of preferring an untried higher-tier address is one probe per
+  lease, not per report.
+- **It refuses, when configured.** `[proxies] min_trust` is a floor. The default
+  (`"datacenter"`) refuses nothing and only orders; `"residential"` refuses
+  known datacenter addresses; `"mobile"` refuses datacenter and residential.
+  A refused address is *dismissed*, not quarantined — it works, will not
+  recover, and must not be resurrected by the fallback pass under load.
+
+The classifier is a short marker list on a word boundary, and it is honest about
+what it cannot do. An ISP matching neither the carrier nor the hosting list is
+treated as residential (the datacenter list is the discriminating one — the
+universe of consumer ISPs is unbounded), and an address whose probe reported no
+ISP at all is `unknown`: ranked last, but **never refused at any floor**, because
+"there was nothing to read" is not evidence of a low tier. The bias is to allow,
+and the only way a floor refuses a working consumer exit is if a consumer ISP
+names itself with a hosting word.
+
+The default IP-echo reports the ISP as well as the address, so the tier is real
+on an unconfigured run — a datacenter exit grades as datacenter and lands last
+without anyone configuring anything, which is the only form of a default that
+counts. Point `[proxies] probe_url` elsewhere to pick a different echo: a bare-IP
+one (`https://api.ipify.org?format=json`) answers the own-address question and
+nothing else, and with it every address grades `unknown` — a trade you make
+knowingly, not a gap you discover on the third attempt to raise a floor.
 
 ## Legacy
 

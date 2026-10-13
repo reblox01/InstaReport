@@ -84,6 +84,38 @@ class ProxyConfig:
     #: field disables the check that keeps reports off your own address while
     #: still looking configured.
     own_ip: str | None = None
+    #: The floor below which a *known* egress tier is refused, as a string.
+    #:
+    #: One of ``mobile``, ``residential``, ``unknown``, ``datacenter``. The
+    #: default, ``datacenter``, refuses nothing: every known tier ranks at or
+    #: above it, so an operator who has not asked for a floor does not get one.
+    #: Raise it to refuse recognised low-trust exits -- ``residential`` is the
+    #: usual choice, and refuses datacenter addresses, which answer the probe
+    #: perfectly and are still the fastest way to have every account behind them
+    #: linked and suspended.
+    #:
+    #: ``unknown`` addresses -- ones whose probe carried no ISP text, or text
+    #: nothing recognises -- are *never* refused at any floor. They are ranked
+    #: last and used only when nothing better is available. Refusing them would
+    #: make a residential-only configuration refuse every echo service that
+    #: returns a bare IP, which is a footgun wearing a safety property's clothes.
+    #:
+    #: Carried as a string, not the enum, because this module deliberately does
+    #: not import :mod:`insta_report.proxies`; the tier names are validated at
+    #: load against a lazily-imported copy of the enum, so a typo here is a
+    #: refusal at config load rather than at the first acquire.
+    min_trust: str = "datacenter"
+    #: The IP-echo endpoint the pool probes through each address, and the one a
+    #: direct request hits once to learn this machine's own address.
+    #:
+    #: Left unset, the built-in default is used: a service that reports the ISP
+    #: as well as the address, so trust tiering is real on an unconfigured run.
+    #: Override it to choose a different echo, or to point at a bare-IP service
+    #: (``https://api.ipify.org?format=json``) when only the own-address
+    #: question matters. The cost of that choice is explicit: with no ISP
+    #: reported every address grades ``unknown`` and a ``min_trust`` floor has
+    #: nothing to act on.
+    probe_url: str | None = None
 
     def resolved_key(self) -> str | None:
         if not self.provider_key_env:
@@ -360,6 +392,27 @@ def _load_proxies(reader: _Reader) -> ProxyConfig:
     if file_path and not file_path.exists():
         raise ConfigError(f"[proxies] file_path does not exist: {file_path}")
 
+    min_trust = (
+        reader.str_("min_trust", default="datacenter") or "datacenter"
+    ).strip().casefold()
+    # Imported here, not at module scope: this module and ``proxies`` are
+    # deliberately independent (``proxies`` types its ``config`` argument as
+    # ``Any`` precisely so neither has to import the other), and the tier names
+    # are the one thing they must agree on. A lazy import keeps the agreement in
+    # one place -- the enum -- without welding the two modules together.
+    from .proxies import TrustTier
+
+    valid_tiers = {tier.value for tier in TrustTier}
+    if min_trust not in valid_tiers:
+        raise ConfigError(
+            f"[proxies] min_trust must be one of {sorted(valid_tiers)}, got "
+            f"{min_trust!r}. It is the floor below which a known egress tier is "
+            "refused: 'datacenter' refuses nothing, 'residential' refuses "
+            "datacenter addresses, 'mobile' refuses both datacenter and "
+            "residential. Addresses whose tier the probe could not read are "
+            "never refused, only ranked last."
+        )
+
     return ProxyConfig(
         source=source,
         file_path=file_path,
@@ -367,6 +420,8 @@ def _load_proxies(reader: _Reader) -> ProxyConfig:
         provider_key_env=reader.str_("provider_key_env"),
         sticky_ttl_minutes=reader.int_("sticky_ttl_minutes", 240, minimum=15),
         own_ip=reader.str_("own_ip"),
+        min_trust=min_trust,
+        probe_url=reader.str_("probe_url"),
     )
 
 
